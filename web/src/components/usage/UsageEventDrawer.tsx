@@ -38,6 +38,7 @@ import {
 } from '../../types/usageEventIdentity';
 import type { PluginOAuthLogos } from '../../types/pluginOAuthProviders';
 import { RequestOverview } from './RequestOverview';
+import { RequestLogTab } from './RequestLogTab';
 import {
   formatEventDuration,
   eventTokensPerSecond,
@@ -626,6 +627,18 @@ export const UsageEventDrawer: React.FC<UsageEventDrawerProps> = ({
                       ]),
                     )}
                   </>
+                ),
+              },
+              {
+                key: 'request-log',
+                label: t('events.raw_log_tab'),
+                children: (
+                  <RequestLogTab
+                    eventId={event.id}
+                    requestId={event.request_id}
+                    hasRequestLog={event.has_request_log}
+                    isActive={tab === 'request-log'}
+                  />
                 ),
               },
             ]}
