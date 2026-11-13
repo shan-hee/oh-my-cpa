@@ -6,6 +6,9 @@ import { ReorderHandle, RowReorder, useReorderRow } from '../../components/commo
 import { SearchInput } from '../../components/common/SearchInput';
 import { ToolButton } from '../../components/common/ToolButton';
 import { AppstoreOutlined, PlusOutlined, ListOutlined } from '../../components/icons';
+import { DropdownCaret } from '@/components/ui/dropdown-caret';
+import { Button } from '@/components/ui/button';
+import { useIsPhoneViewport } from '../../hooks/useIsPhoneViewport';
 import { useT } from '../../i18n';
 import type { PluginOAuthLogos } from '../../types/pluginOAuthProviders';
 import { providerDisplayName } from '../../types/providerMetadata';
@@ -31,6 +34,8 @@ export interface ProviderStripProps {
     onMove: (key: string, target: string, side: DropSide) => void;
     onStep: (key: string, direction: -1 | 1) => void;
   };
+  /** Suppresses opening the provider-picker modal while a page-level overlay is active/loading. */
+  isOverlayBlocked?: boolean;
 }
 
 /**
@@ -44,8 +49,12 @@ export interface ProviderStripProps {
  */
 export function ProviderStrip(props: ProviderStripProps) {
   const t = useT();
-  const { summaries, total, attention, active, onChange, pluginLogos, pluginTitles } = props;
+  const { summaries, total, attention, active, onChange, pluginLogos, pluginTitles, isOverlayBlocked = false } = props;
   const [isOpen, setIsOpen] = React.useState(false);
+  React.useEffect(() => {
+    if (isOverlayBlocked && isOpen) setIsOpen(false);
+  }, [isOverlayBlocked, isOpen]);
+  const isPhone = useIsPhoneViewport();
   const scroller = React.useRef<HTMLDivElement>(null);
   // The tab in scope is kept in view, whichever way the scope changed.
   React.useEffect(() => {
@@ -65,15 +74,63 @@ export function ProviderStrip(props: ProviderStripProps) {
           tab reads one figure, its total. */}
       <span className={styles['tab-mark']}>
         {mark}
-        {needs > 0 && <span className={styles.attention} role="img" aria-label={t('omc.fleet_attention_n', { n: needs })} title={t('omc.fleet_attention_n', { n: needs })} />}
+        {needs > 0 && <span className={styles.attention} role="img" aria-label={t('omc.fleet_attention_n', { n: needs })} data-tip={t('omc.fleet_attention_n', { n: needs })} />}
       </span>
       <span className={styles['tab-name']}>{name}</span>
       <span className={styles['tab-count']}>{count}</span>
     </button>
   );
+  const activeSummary = summaries.find((summary) => summary.provider === active);
+  // A provider whose last credential went stays in scope, named and at zero, rather than reading as all.
+  const isAll = active === 'all';
+  const scopeAttention = isAll ? attention : (activeSummary?.attention ?? 0);
+  const list = (
+    <AppModal open={isOpen && !isOverlayBlocked} title={t('omc.fleet_providers')} size="small" footer={null} destroyOnHidden onCancel={() => setIsOpen(false)}>
+      <ProviderList
+        {...props}
+        onChange={(provider) => {
+          onChange(provider);
+          setIsOpen(false);
+        }}
+        onConnect={() => {
+          setIsOpen(false);
+          props.onConnect();
+        }}
+      />
+    </AppModal>
+  );
+  // A phone has no room for a row of tabs, and a row that slides sideways under the thumb fights the
+  // page's own scroll. The scope is one control there instead: what is in scope, and a tap to change it.
+  if (isPhone) {
+    return (
+      <nav className={styles.strip} aria-label={t('omc.fleet_providers')}>
+        <Button
+          className={styles.scope}
+          onClick={() => { if (!isOverlayBlocked) setIsOpen(true); }}
+          aria-haspopup="dialog"
+          data-testid="oauth-provider-switcher"
+          icon={(
+            <span className={styles['tab-mark']}>
+              {isAll
+                ? <AppstoreOutlined aria-hidden />
+                : <CredentialMark credential={{ provider: active }} pluginLogos={pluginLogos} size={16} />}
+              {scopeAttention > 0 && <span className={styles.attention} role="img" aria-label={t('omc.fleet_attention_n', { n: scopeAttention })} />}
+            </span>
+          )}
+        >
+          <span className={styles['scope-name']}>
+            {isAll ? t('omc.fleet_all_accounts') : providerDisplayName(active, pluginTitles)}
+          </span>
+          <span className={styles['tab-count']}>{isAll ? total : (activeSummary?.total ?? 0)}</span>
+          <span className={styles['scope-caret']}><DropdownCaret /></span>
+        </Button>
+        {list}
+      </nav>
+    );
+  }
   return (
     <nav className={styles.strip} aria-label={t('omc.fleet_providers')}>
-      <div ref={scroller} className={styles.tabs}>
+      <div ref={scroller} className={clsx(styles.tabs, 'scroll-fade-x')}>
         {tab('all', <AppstoreOutlined aria-hidden />, t('omc.fleet_all_accounts'), total, attention, 'oauth-provider-all')}
         {summaries.map((summary) => tab(
           summary.provider,
@@ -91,19 +148,7 @@ export function ProviderStrip(props: ProviderStripProps) {
         aria-haspopup="dialog"
         data-testid="oauth-provider-switcher"
       />
-      <AppModal open={isOpen} title={t('omc.fleet_providers')} size="small" footer={null} destroyOnHidden onCancel={() => setIsOpen(false)}>
-        <ProviderList
-          {...props}
-          onChange={(provider) => {
-            onChange(provider);
-            setIsOpen(false);
-          }}
-          onConnect={() => {
-            setIsOpen(false);
-            props.onConnect();
-          }}
-        />
-      </AppModal>
+      {list}
     </nav>
   );
 }
@@ -186,9 +231,9 @@ function RailItem({ isActive, mark, name, total, attention, onClick, handle, row
       >
         <span className={styles['item-mark']}>
           {mark}
-          {attention > 0 && <span className={styles.attention} role="img" aria-label={t('omc.fleet_attention_n', { n: attention })} title={t('omc.fleet_attention_n', { n: attention })} />}
+          {attention > 0 && <span className={styles.attention} role="img" aria-label={t('omc.fleet_attention_n', { n: attention })} data-tip={t('omc.fleet_attention_n', { n: attention })} />}
         </span>
-        <span className={styles['item-name']} title={name}>{name}</span>
+        <span className={styles['item-name']} data-tip={name} data-tip-overflow="">{name}</span>
         <span className={styles['item-count']}>{total}</span>
       </button>
     </div>

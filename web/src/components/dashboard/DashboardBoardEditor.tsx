@@ -1,7 +1,7 @@
 import type { MessageKey } from '../../i18n/catalog';
 import React from 'react';
 import clsx from 'clsx';
-import { Button } from 'antd';
+import { Button } from '@/components/ui/button';
 import { EyeInvisibleOutlined, HolderOutlined, LeftOutlined, PlusOutlined, RightOutlined } from '../icons';
 import { useT } from '../../i18n';
 import {
@@ -212,7 +212,7 @@ export const DashboardBoardEditor: React.FC<DashboardBoardProps> = ({
               {hidden.map((item) => (
                 <Button
                   key={item.id}
-                  size="small"
+                  size="sm"
                   icon={<PlusOutlined />}
                   data-widget-restore={item.id}
                   onClick={() => onChange(setDashboardWidgetHidden(layout, item.id, false))}
@@ -266,33 +266,33 @@ export const DashboardBoardEditor: React.FC<DashboardBoardProps> = ({
                         </span>
                       </Tooltip>
                     )}
-                    <span className={styles['name']} title={label}>{label}</span>
+                    <span className={styles['name']} data-tip={label} data-tip-overflow="">{label}</span>
                     <Tooltip title={t('dash.layout.move_earlier')}>
                       <Button
-                        size="small"
-                        type="text"
+                        size="sm"
+                        variant="ghost"
                         icon={<LeftOutlined />}
-                        aria-label={`${t('dash.layout.move_earlier')} · ${label}`}
+                        aria-label={t('common.action_on', { action: t('dash.layout.move_earlier'), target: label })}
                         disabled={index === 0}
                         onClick={() => onChange(stepDashboardWidget(layout, item.id, -1, isShown))}
                       />
                     </Tooltip>
                     <Tooltip title={t('dash.layout.move_later')}>
                       <Button
-                        size="small"
-                        type="text"
+                        size="sm"
+                        variant="ghost"
                         icon={<RightOutlined />}
-                        aria-label={`${t('dash.layout.move_later')} · ${label}`}
+                        aria-label={t('common.action_on', { action: t('dash.layout.move_later'), target: label })}
                         disabled={index === ordered.length - 1}
                         onClick={() => onChange(stepDashboardWidget(layout, item.id, 1, isShown))}
                       />
                     </Tooltip>
                     <Tooltip title={t('dash.layout.hide')}>
                       <Button
-                        size="small"
-                        type="text"
+                        size="sm"
+                        variant="ghost"
                         icon={<EyeInvisibleOutlined />}
-                        aria-label={`${t('dash.layout.hide')} · ${label}`}
+                        aria-label={t('common.action_on', { action: t('dash.layout.hide'), target: label })}
                         data-widget-hide={item.id}
                         onClick={() => onChange(setDashboardWidgetHidden(layout, item.id, true))}
                       />
@@ -309,7 +309,7 @@ export const DashboardBoardEditor: React.FC<DashboardBoardProps> = ({
                       type="button"
                       className={clsx(styles['grip'], styles['grip-xy'])}
                       data-resize="xy"
-                      aria-label={`${t('dash.layout.resize')} · ${label}`}
+                      aria-label={t('common.action_on', { action: t('dash.layout.resize'), target: label })}
                       aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown"
                       onPointerDown={(event) => startResize(event, item, 'xy')}
                       onKeyDown={(event) => {

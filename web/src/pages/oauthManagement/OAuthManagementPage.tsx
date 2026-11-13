@@ -1,12 +1,21 @@
 import type { OAuthRecoveryTarget } from '../../types/oauth';
 import React from 'react';
 import { useBlocker } from 'react-router-dom';
-import { App as AntdApp, Button, Checkbox, Dropdown, Select, Space } from 'antd';
+import { Select } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { ButtonGroup } from '@/components/ui/button-group';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Checkbox } from '@/components/ui/checkbox';
+import { DropdownCaret } from '@/components/ui/dropdown-caret';
 import { ListPlaceholder, LoadingRegion } from '../../components/common/Placeholder';
 import {
   BranchesOutlined,
   CloudUploadOutlined,
-  DownOutlined,
   LoginOutlined,
   TimerResetOutlined,
   UploadOutlined,
@@ -17,7 +26,7 @@ import { useT } from '../../i18n';
 import { useDebouncedSearch } from '../../components/usage/useDebouncedSearch';
 import { useOAuthManagementViewState } from './useOAuthManagementViewState';
 import { useVisibleNow } from '../../hooks/useVisibleNow';
-import { isDemoMode } from '../../types/demoMode';
+import { useIsPhoneViewport } from '../../hooks/useIsPhoneViewport';
 import { pluginMultiPortalKeys, pluginOAuthProviderLogos, pluginOAuthProviderTitles } from '../../types/pluginOAuthProviders';
 import { storeListingsByPluginId } from '../../components/plugins/pluginStoreLogic';
 import { BatchActionBar } from '../../components/authFiles/BatchActionBar';
@@ -26,6 +35,7 @@ import { WarmupSettingsDrawer } from '../../components/authFiles/CredentialWarmu
 import { oauthProviderChoices } from '../oauthProviderLogic';
 import { providerDisplayName } from '../../types/providerMetadata';
 import { CredentialQuotaBody } from '../quota/CredentialQuotaBody';
+import { QuotaCapacityScope } from '../quota/QuotaCapacityButton';
 import { buildCredentialSections, credentialOrderKey, orderBySection, providersInSectionOrder, type QuotaColumnSort } from './credentialSections';
 import { useCredentialOrder } from './useCredentialOrder';
 import { useOAuthSectionOrder } from './useOAuthSectionOrder';
@@ -55,13 +65,14 @@ import type { CredentialActions, DetailSection } from './CredentialParts';
 import styles from './OAuthManagementPage.module.css';
 import { CredentialMark } from '../../components/LobeIcon';
 import { PageHeader } from '../../components/common/PageHeader';
-import { LoadFailure, Notice, useToast } from '../../components/feedback';
+import { LoadFailure, Notice, useConfirmModal, useToast } from '../../components/feedback';
 import { EmptyState } from '../../components/common/EmptyState';
-import { ToolButton } from '../../components/common/ToolButton';
+import { ActionMenu } from '../../components/common/ActionMenu';
 import { Pager } from '../../components/common/Pager';
 import { DeferredMount } from '../../components/common/DeferredMount';
 import { createRouteLoader } from '../../utils/routeLoader';
 import { pickRows, type SelectionAnchor } from '../../types/rowSelection';
+import { invalidateQueriesSilently } from '../../utils/progressSources';
 
 const AuthFileDetailDrawer = React.lazy(createRouteLoader(() =>
   import('../../components/authFiles/AuthFileDetailDrawer').then(module => ({ default: module.AuthFileDetailDrawer }))));
@@ -96,13 +107,13 @@ interface SelectedIdentity {
 
 export const OAuthManagementPage: React.FC = () => {
   const t = useT();
-  const { modal } = AntdApp.useApp();
+  const modal = useConfirmModal();
   const toast = useToast();
   const queryClient = useQueryClient();
   const { searchParams, setSearchParams, queryState, setSearch, isViewLoaded } = useOAuthManagementViewState();
   const visibleNow = useVisibleNow();
   const [isConnectOpen, setIsConnectOpen] = React.useState(false);
-  const isDemo = isDemoMode();
+  const isPhone = useIsPhoneViewport();
 
   const filesQuery = useQuery({
     queryKey: ['management-auth-files'],
@@ -419,7 +430,9 @@ export const OAuthManagementPage: React.FC = () => {
   }, [selectedIdentity, selectedRecord]);
 
   const [isWarmupSettingsOpen, setIsWarmupSettingsOpen] = React.useState(false);
- const [isModelRulesOpen, setIsModelRulesOpen] = React.useState(false);
+  const [isModelRulesOpen, setIsModelRulesOpen] = React.useState(false);
+  // Reached from a provider tab or one credential, the rules open at that provider.
+  const [modelRulesProvider, setModelRulesProvider] = React.useState<string>();
   const [isVertexImportOpen, setIsVertexImportOpen] = React.useState(false);
   const [isUploadOpen, setIsUploadOpen] = React.useState(false);
   const fileNames = React.useMemo(() => new Set(records.map((record) => record.fileName)), [records]);
@@ -454,7 +467,16 @@ export const OAuthManagementPage: React.FC = () => {
     records.find((record) => record.authorizationProviderId === providerId)?.displayProvider ?? providerId
   ), [records]);
 
+  const hasActiveOverlay = Boolean(selectedRecord)
+    || isConnectOpen
+    || isUploadOpen
+    || isVertexImportOpen
+    || Boolean(siwcRecord)
+    || isWarmupSettingsOpen
+    || isModelRulesOpen;
+
   const openConnect = () => {
+    if (hasActiveOverlay) return;
     setConnectRecoveryTarget(undefined);
     for (const provider of Object.keys(sessions.states)) { if (!sessions.activeProviders.includes(provider)) sessions.reset(provider); }
     const selectedProvider = queryState.provider !== 'all'
@@ -465,6 +487,7 @@ export const OAuthManagementPage: React.FC = () => {
   };
 
   const openCredential = (record: OAuthWorkspaceRecord, section: DetailSection = 'overview') => {
+    if (hasActiveOverlay) return;
     setDrawerSection(section);
     setSelectedIdentity({ key: record.key, name: record.fileName, authIndex: record.authIndex });
   };
@@ -515,7 +538,7 @@ export const OAuthManagementPage: React.FC = () => {
         : t('omc.oauth_success_refresh_failed');
     const actions = (
       <Button
-        size="small"
+        size="sm"
         onClick={() => {
           toast.dismiss(key);
           revealCompletedCredential(result.providerId, result);
@@ -540,7 +563,7 @@ export const OAuthManagementPage: React.FC = () => {
           credentialLabel={maskedCredentialLabel(record)}
           credentialMark={<CredentialMark credential={{ provider: record.displayProvider, hint: record.file.name }} pluginLogos={pluginLogos} size={22} />}
           nowMS={visibleNow}
-          isDemo={isDemo}
+          isDemo={false}
           isRefreshing={isRefreshing}
           onRefresh={() => void actions.refreshQuotaForRecord(record)}
           onClearCooldown={() => void actions.clearCooldown(record)}
@@ -558,7 +581,7 @@ export const OAuthManagementPage: React.FC = () => {
         tone={record.quotaMatch === 'missing-quota' ? 'info' : 'warning'}
         title={quotaMessage}
         action={record.canRefreshQuota ? (
-          <Button size="small" onClick={() => void actions.refreshQuotaForRecord(record)}>
+          <Button size="sm" onClick={() => void actions.refreshQuotaForRecord(record)}>
             {t('quota.btn_refresh_quota')}
           </Button>
         ) : undefined}
@@ -572,6 +595,8 @@ export const OAuthManagementPage: React.FC = () => {
     .map((section) => ({ ...section, title: providerDisplayName(section.provider, pluginTitles) }));
   const credentialActions: CredentialActions = {
     isBusy: (record) => actions.isRecordBusy(record),
+    isFileBusy: (record) => actions.isFileBusy(record),
+    isTogglingStatus: (record) => actions.isTogglingStatus(record),
     isRefreshingQuota: (record) => Boolean(record.authIndex && actions.busyQuotaIndexes.has(record.authIndex)),
     siwcBadge: (record) => siwcBadgeState(record.file, siwcBindings.sessions[siwcTargetKey(record.file)]),
     onSelect: (targets, isSelected) => {
@@ -598,7 +623,15 @@ export const OAuthManagementPage: React.FC = () => {
     onClearCooldown: (record) => void actions.clearCooldown(record),
     onRedeemCredit: (record) => void actions.redeemCredit(record),
     onReauthenticate: openConnectForRecord,
-    onOpenSIWC: (record) => setSIWCRecordKey(record.key),
+    onOpenSIWC: (record) => {
+      if (hasActiveOverlay) return;
+      setSIWCRecordKey(record.key);
+    },
+    onOpenModelRules: (record) => {
+      if (hasActiveOverlay) return;
+      setModelRulesProvider(record.displayProvider);
+      setIsModelRulesOpen(true);
+    },
   };
 
   const selectablePage = pagedRecords.filter((record) => record.canSelectForFileBatch);
@@ -615,7 +648,18 @@ export const OAuthManagementPage: React.FC = () => {
     pluginLogos,
     pluginTitles,
     reorder: sectionOrder.reorder,
+    isOverlayBlocked: hasActiveOverlay,
   };
+  const pageSelection = (
+    <Checkbox
+      checked={selectablePage.length > 0 && selectedOnPage === selectablePage.length}
+      indeterminate={selectedOnPage > 0 && selectedOnPage < selectablePage.length}
+      disabled={!isViewLoaded || selectablePage.length === 0}
+      onCheckedChange={(checked) => credentialActions.onSelect(selectablePage, checked)}
+      aria-label={t('omc.fleet_select_page')}
+      data-testid="oauth-select-page"
+    />
+  );
   const allRefreshCount = new Set(records.filter((record) => record.canRefreshQuota).map((record) => record.authIndex)).size;
   const viewProps = {
     groups,
@@ -625,32 +669,77 @@ export const OAuthManagementPage: React.FC = () => {
     actions: credentialActions,
   };
 
+  const modelRulesButton = (
+    <Button
+      icon={<BranchesOutlined />}
+      disabled={actions.isOperating}
+      onClick={() => {
+        if (hasActiveOverlay) return;
+        setModelRulesProvider(scopeProvider === 'all' ? undefined : scopeProvider);
+        setIsModelRulesOpen(true);
+      }}
+      data-testid="oauth-model-rules"
+    >
+      {t('af.rules_open')}
+    </Button>
+  );
+  const warmupButton = (
+    <Button icon={<TimerResetOutlined />} onClick={() => { if (!hasActiveOverlay) setIsWarmupSettingsOpen(true); }} data-testid="oauth-warmup-settings">
+      {t('warmup.settings')}
+    </Button>
+  );
+  // Signing in is how a credential usually arrives, so it is the button; a file or a Vertex key are
+  // the other ways in, under its caret.
+  const connectButton = (
+    <ButtonGroup>
+      <Button variant="primary" icon={<LoginOutlined />} onClick={openConnect}>{t('omc.connect_account')}</Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button variant="primary" data-split-caret="" icon={<DropdownCaret />} aria-label={t('omc.fleet_add_other')} data-testid="oauth-add-menu" />
+          }
+        />
+        <DropdownMenuContent placement="bottomRight">
+          <DropdownMenuItem
+            icon={<UploadOutlined />}
+            disabled={actions.isOperating}
+            onClick={() => { if (!hasActiveOverlay) setIsUploadOpen(true); }}
+          >
+            {t('af.upload')}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            icon={<CloudUploadOutlined />}
+            disabled={actions.isOperating}
+            onClick={() => { if (!hasActiveOverlay) setIsVertexImportOpen(true); }}
+          >
+            {t('af.vertex_open')}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </ButtonGroup>
+  );
+
   return (
     <div className={`terminal-page oauth-management-page ${styles.page} ${selectedKeys.length > 0 ? 'has-fleet-selection' : ''}`}>
       <PageHeader
         title={t('nav.auth_files')}
         actions={(
           <>
-            <ToolButton icon={<BranchesOutlined />} label={t('af.rules_open')} disabled={actions.isOperating} onClick={() => setIsModelRulesOpen(true)} data-testid="oauth-model-rules" />
-            <ToolButton icon={<TimerResetOutlined />} label={t('warmup.settings')} onClick={() => setIsWarmupSettingsOpen(true)} data-testid="oauth-warmup-settings" />
-            {/* Signing in is how a credential usually arrives, so it is the button; a file or a
-                Vertex key are the other ways in, under its caret. */}
-            <Space.Compact>
-              <Button type="primary" icon={<LoginOutlined />} onClick={openConnect}>{t('omc.connect_account')}</Button>
-              <Dropdown
-                trigger={['click']}
-                placement="bottomRight"
-                menu={{
-                  items: [
-                    { key: 'upload', icon: <UploadOutlined />, label: t('af.upload'), disabled: isDemo || actions.isOperating },
-                    { key: 'vertex', icon: <CloudUploadOutlined />, label: t('af.vertex_open'), disabled: isDemo || actions.isOperating },
-                  ],
-                  onClick: ({ key }) => (key === 'upload' ? setIsUploadOpen(true) : setIsVertexImportOpen(true)),
-                }}
-              >
-                <Button type="primary" icon={<DownOutlined />} aria-label={t('omc.fleet_add_other')} data-testid="oauth-add-menu" />
-              </Dropdown>
-            </Space.Compact>
+            {/* Disabling a model and warming windows up are routine tasks, so both entries carry words. */}
+            {modelRulesButton}
+            {warmupButton}
+            {connectButton}
+          </>
+        )}
+        // A phone's head row holds the scope, the two settings behind a menu, and the way in.
+        mobileActions={(
+          <>
+            <ProviderStrip {...railProps} />
+            <ActionMenu>
+              {modelRulesButton}
+              {warmupButton}
+            </ActionMenu>
+            {connectButton}
           </>
         )}
       />
@@ -659,6 +748,7 @@ export const OAuthManagementPage: React.FC = () => {
         sessions={sessions}
         choices={choices}
         onOpen={(providerId, recoveryTarget) => {
+          if (hasActiveOverlay) return;
           setConnectRecoveryTarget(recoveryTarget);
           setConnectProviderId(providerId);
           setIsConnectOpen(true);
@@ -679,7 +769,7 @@ export const OAuthManagementPage: React.FC = () => {
               missingIndexes: projection.missingAuthIndexCount,
               quotaOnly: projection.quotaOnly.length,
             })}
-            action={<Button size="small" onClick={reloadWorkspace}>{t('common.retry')}</Button>}
+            action={<Button size="sm" onClick={reloadWorkspace}>{t('common.retry')}</Button>}
           />
         )}
 
@@ -700,19 +790,8 @@ export const OAuthManagementPage: React.FC = () => {
       )}
 
       <div className={styles.workspace}>
-        <ProviderStrip {...railProps} />
+        {!isPhone && <ProviderStrip {...railProps} />}
         <FleetToolbar
-          leading={(
-            <Checkbox
-              className={styles['select-all']}
-              checked={selectablePage.length > 0 && selectedOnPage === selectablePage.length}
-              indeterminate={selectedOnPage > 0 && selectedOnPage < selectablePage.length}
-              disabled={!isViewLoaded || selectablePage.length === 0}
-              onChange={(event) => credentialActions.onSelect(selectablePage, event.target.checked)}
-              aria-label={t('omc.fleet_select_page')}
-              data-testid="oauth-select-page"
-            />
-          )}
           search={searchValue}
           onSearch={setSearchValue}
           counts={scopeCounts}
@@ -755,9 +834,11 @@ export const OAuthManagementPage: React.FC = () => {
             </div>
           ) : (
             <>
-              {queryState.layout === 'cards'
-                ? <CredentialCards {...viewProps} hasGroupHeads={scopeProvider === 'all'} />
-                : <CredentialList {...viewProps} onReorder={credentialOrder.loaded && !quotaDirection ? reorderCredential : undefined} />}
+              <QuotaCapacityScope isBlocked={hasActiveOverlay}>
+                {queryState.layout === 'cards'
+                  ? <CredentialCards {...viewProps} pageSelection={pageSelection} />
+                  : <CredentialList {...viewProps} pageSelection={pageSelection} onReorder={credentialOrder.loaded && !quotaDirection ? reorderCredential : undefined} />}
+              </QuotaCapacityScope>
               <div className={styles.pagination}>
                 <span>{t('omc.result_count', { n: visibleRecords.length, total: records.length })}</span>
                 <Select
@@ -803,8 +884,7 @@ export const OAuthManagementPage: React.FC = () => {
             onEnable={() => void actions.batchStatus(false, selectedRecords)}
             onDisable={() => void actions.batchStatus(true, selectedRecords)}
             onRefresh={() => void actions.batchRefresh(selectedRecords)}
-            // The demonstration never contacts a provider, so it refuses a refresh.
-            canRefresh={!isDemo}
+            canRefresh
             onDelete={() => void actions.batchDelete(selectedRecords)}
           />
         </div>
@@ -881,13 +961,12 @@ export const OAuthManagementPage: React.FC = () => {
         <OAuthModelRulesDrawer
           open={isModelRulesOpen}
           onClose={() => setIsModelRulesOpen(false)}
+          initialProvider={modelRulesProvider}
           onSaved={() => {
             void Promise.all([
-              queryClient.invalidateQueries({ queryKey: ['management-oauth-model-aliases'] }),
-              queryClient.invalidateQueries({ queryKey: ['management-oauth-excluded-models'] }),
-              queryClient.invalidateQueries({ queryKey: ['auth-file-models'] }),
-              queryClient.invalidateQueries({ queryKey: ['model-square'] }),
-              queryClient.invalidateQueries({ queryKey: ['management-overview'] }),
+              invalidateQueriesSilently(queryClient, { queryKey: ['auth-file-models'] }),
+              invalidateQueriesSilently(queryClient, { queryKey: ['model-square'] }),
+              invalidateQueriesSilently(queryClient, { queryKey: ['management-overview'] }),
             ]);
           }}
           providerOptions={providerOptions.filter((provider) => provider !== 'all')}

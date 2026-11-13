@@ -2,11 +2,6 @@ package quota
 
 import "math"
 
-// capacityMinPricedShare is the share of measured requests that must carry a cost
-// before a dollar figure is given. Unpriced requests add nothing to the cost sum,
-// so a lower share would understate it; the token figure does not depend on prices.
-const capacityMinPricedShare = 0.95
-
 // capacityResetTolerancePercent absorbs upstream rounding when two readings of
 // the same cycle are compared: only a larger drop is a reset.
 const capacityResetTolerancePercent = 1.0
@@ -15,8 +10,12 @@ const capacityResetTolerancePercent = 1.0
 // most a rounded reading can differ from the share it stands for.
 const usedPercentHalfStep = 0.5
 
-// Reasons a window carries no capacity estimate yet. They are wire values the
-// console maps to its own copy, each naming what starts an estimate.
+// maxDisplayedCacheRate matches the console and dashboard presentation ceiling:
+// any nonzero uncached prompt keeps a rounded reading below 100%.
+const maxDisplayedCacheRate = 99.9
+
+// Reasons a window carries no model forecast yet. They are wire values the
+// console maps to its own copy, each naming the missing evidence.
 const (
 	// CapacityReasonScopeUnknown: a scoped window's requests all used models
 	// with no known family, so none of them can be counted against it.
@@ -32,7 +31,8 @@ const (
 	CapacityReasonNoReading = "no_reading"
 	// CapacityReasonLowUsage: too little of the window has been used for its
 	// rounded share to support a figure.
-	CapacityReasonLowUsage = "low_usage"
+	CapacityReasonLowUsage    = "low_usage"
+	CapacityReasonMixedModels = "mixed_models"
 	// CapacityReasonNoTraffic: quota was used but this gateway recorded no
 	// request while it moved, so it was spent elsewhere.
 	CapacityReasonNoTraffic = "no_traffic"
@@ -43,35 +43,61 @@ const (
 
 // WindowUsage is what this deployment recorded for a credential in [FromMS, ToMS).
 type WindowUsage struct {
-	FromMS         int64 `json:"from_ms"`
-	ToMS           int64 `json:"to_ms"`
-	Requests       int64 `json:"requests"`
-	PricedRequests int64 `json:"priced_requests"`
-	Tokens         int64 `json:"tokens"`
-	CostNanos      int64 `json:"cost_nanos"`
-	// UnmatchedRequests are scoped-window requests whose model has no known
-	// family. They are left out of the numerator and only explain an empty one.
-	UnmatchedRequests int64 `json:"-"`
+	FromMS               int64    `json:"from_ms"`
+	ToMS                 int64    `json:"to_ms"`
+	Requests             int64    `json:"requests"`
+	PricedRequests       int64    `json:"priced_requests"`
+	Tokens               int64    `json:"tokens"`
+	PromptTokens         int64    `json:"prompt_tokens,omitempty"`
+	CachedTokens         int64    `json:"cached_tokens,omitempty"`
+	CacheRate            *float64 `json:"cache_rate,omitempty"`
+	CostNanos            int64    `json:"cost_nanos"`
+	PricedTokens         int64    `json:"-"`
+	BreakdownRequests    int64    `json:"-"`
+	CacheWriteTokens     int64    `json:"-"`
+	OutputTokens         int64    `json:"-"`
+	MinInputTokens       int64    `json:"-"`
+	MaxInputTokens       int64    `json:"-"`
+	HasInputBounds       bool     `json:"-"`
+	ServiceTier          string   `json:"-"`
+	HasMixedServiceTiers bool     `json:"-"`
+	UnmatchedRequests    int64    `json:"-"`
 }
 
-// WindowCapacity is the size of a whole quota window in the recorded workload's
-// tokens and API-equivalent cost, with what is left of it at the reading.
-type WindowCapacity struct {
-	// Requests is how many requests of the recorded workload the window holds.
-	Requests     int64  `json:"requests"`
-	Tokens       int64  `json:"tokens"`
-	Basis        string `json:"basis"`
-	ObservedAtMS int64  `json:"observed_at_ms"`
-	FromMS       int64  `json:"from_ms"`
-	ResetAtMS    int64  `json:"reset_at_ms"`
-	// CostNanos is nil when too much of the sample is unpriced to state a cost.
-	CostNanos *int64 `json:"cost_nanos,omitempty"`
-	// Remaining amounts are given only with a live reading of the used share.
-	RemainingTokens    *int64 `json:"remaining_tokens,omitempty"`
-	RemainingCostNanos *int64 `json:"remaining_cost_nanos,omitempty"`
-	// ErrorPercent is the relative effect of upstream's whole-point rounding on
-	// the estimate; the console rounds the figure to the digits it supports.
-	ErrorPercent float64 `json:"error_percent"`
+func (usage WindowUsage) hasTokenBreakdown() bool {
+	if usage.BreakdownRequests > 0 {
+		return usage.BreakdownRequests == usage.Requests && (usage.PromptTokens > 0 || usage.OutputTokens > 0)
+	}
+	return usage.Requests > 0 && (usage.PromptTokens > 0 || usage.OutputTokens > 0)
+}
+
+func (usage WindowUsage) inputBounds() (minInput, maxInput int64, ok bool) {
+	if !usage.hasTokenBreakdown() {
+		return 0, 0, false
+	}
+	if usage.HasInputBounds || usage.MinInputTokens > 0 || usage.MaxInputTokens > 0 {
+		return max(usage.MinInputTokens, 0), max(usage.MaxInputTokens, 0), true
+	}
+	if usage.Requests == 1 {
+		single := max(usage.PromptTokens, usage.CachedTokens+usage.CacheWriteTokens)
+		return single, single, true
+	}
+	return 0, 0, false
+}
+
+// ComputeCacheRate returns prompt cache reads as a percentage of prompt tokens,
+// rounded to one decimal and bounded by maxDisplayedCacheRate, or nil when no
+// prompt tokens were recorded.
+func ComputeCacheRate(cachedTokens, promptTokens int64) *float64 {
+	if promptTokens <= 0 {
+		return nil
+	}
+	cached := min(max(cachedTokens, 0), promptTokens)
+	rate := math.Round(float64(cached)/float64(promptTokens)*1000) / 10
+	if rate > maxDisplayedCacheRate {
+		rate = maxDisplayedCacheRate
+	}
+	return &rate
 }
 
 // SupportsWindowCapacity identifies supported global or model-metered windows.
@@ -127,23 +153,4 @@ func WindowUsedPercent(window QuotaWindow) (float64, bool) {
 		return 0, false
 	}
 	return *used, true
-}
-
-// AttachRemainingCapacity sizes what is left of the window from a live reading.
-func AttachRemainingCapacity(capacity *WindowCapacity, window QuotaWindow, isLive bool) {
-	if capacity == nil {
-		return
-	}
-	capacity.RemainingTokens, capacity.RemainingCostNanos = nil, nil
-	used, hasReading := WindowUsedPercent(window)
-	if !isLive || !hasReading {
-		return
-	}
-	remaining := (100 - used) / 100
-	tokens := int64(math.Round(float64(capacity.Tokens) * remaining))
-	capacity.RemainingTokens = &tokens
-	if capacity.CostNanos != nil {
-		cost := int64(math.Round(float64(*capacity.CostNanos) * remaining))
-		capacity.RemainingCostNanos = &cost
-	}
 }

@@ -1,13 +1,10 @@
 import type { MessageKey } from '../i18n/catalog';
 import { useTimeZone } from '../utils/TimeZoneProvider';
 import React from 'react';
-import {
-  Badge,
-  Button,
-  Popover,
-} from 'antd';
+import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover';
+import { Button } from '@/components/ui/button';
+import { StatusDot } from '@/components/ui/badge';
 import clsx from 'clsx';
-import { Switch } from '../components/common/Switch';
 import { TablePlaceholder } from '../components/common/ContentPlaceholder';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import dayjs from '../utils/time';
@@ -69,7 +66,6 @@ import { CheckSquareOutlined } from '../components/icons';
 import { LoadFailure, Notice } from '../components/feedback';
 import { EmptyState } from '../components/common/EmptyState';
 import { FactList } from '../components/common/FactList';
-import { Tooltip } from '../components/common/Tooltip';
 
 export const UsageEventsPage: React.FC = () => {
   useTimeZone();
@@ -85,8 +81,6 @@ export const UsageEventsPage: React.FC = () => {
     setSearch,
     grouping,
     changeGrouping,
-    isAutoRefresh,
-    toggleAutoRefresh,
     commit,
     setFilter,
     removeFilterValue,
@@ -132,21 +126,17 @@ export const UsageEventsPage: React.FC = () => {
     facetRevision,
     refresh,
     liveRevision,
-    liveState,
     notifySettled,
     handleManualRefresh,
-  } = useUsageEventSync({ query, isAutoRefresh, isFetchingRef });
-  // Pushed or polled is told by the dot's colour and tooltip, so the dot also names it for
-  // a reader who has neither: a keyboard, a screen reader, or a finger with no hover.
-  const liveLabel = t(liveState === 'live' ? 'events.live_pushed' : 'events.live_polling');
-  // The header's estimate of the window, re-read on every poll. It is display only:
+  } = useUsageEventSync({ query, isFetchingRef });
+  // The header's estimate of the window, re-read on every live update. It is display only:
   // the reads below send the window unresolved, so the server decides what "now" is.
   const displayWindow = React.useMemo(() => eventWindow(query, Date.now()), [query, refresh]);
 
 
   // viewScope identifies the view the reader is looking at: the filters and
-  // window they picked, plus which page of it. The auto-refresh counter is
-  // deliberately absent. It used to be part of this scope, so every poll looked
+  // window they picked, plus which page of it. The live-refresh counter is
+  // deliberately absent. It used to be part of this scope, so every refresh looked
   // like a brand-new view: pagination fell back to page one and the list was
   // remounted by its key, which threw a reader who was halfway down the list
   // back to the top every few seconds.
@@ -599,28 +589,18 @@ export const UsageEventsPage: React.FC = () => {
               </p>
             </div>
             <div className="request-actions">
-              <label className="req-auto-refresh-control" htmlFor="req-auto-refresh">
-                {/* The pulse only appears while the poll is actually running, so it
-                    means "this list is moving" rather than "this page has a
-                    setting". */}
-                {isAutoRefresh && (
-                  <Tooltip title={liveLabel}>
-                    <span role="img" aria-label={liveLabel} className={clsx('req-live-pulse-dot', liveState !== 'live' && 'is-polling')} />
-                  </Tooltip>
-                )}
-                <span className="req-auto-refresh-label">{t('events.auto_refresh')}</span>
-                <Switch
-                  id="req-auto-refresh"
-                  size="small"
-                  checked={isAutoRefresh}
-                  onChange={toggleAutoRefresh}
-                  aria-label={t('events.auto_refresh')}
+              <Popover>
+                <PopoverTrigger
+                  render={
+                    <Button variant="ghost">
+                      <StatusDot status={ingestTone} text={t(ingestLabel)} />
+                    </Button>
+                  }
                 />
-              </label>
-              <Popover
-                trigger="click"
-                title={t('events.ingest_status')}
-                content={
+                <PopoverContent placement="bottomRight">
+                  <PopoverTitle className="m-0 mb-2 text-base font-semibold text-foreground">
+                    {t('events.ingest_status')}
+                  </PopoverTitle>
                   <div className="request-ingest">
                     <FactList
                       emphasis="quiet"
@@ -634,16 +614,12 @@ export const UsageEventsPage: React.FC = () => {
                     <p>{t('events.delivery_semantics_hint')}</p>
                     {status?.collector?.last_error && <p>{status.collector.last_error}</p>}
                   </div>
-                }
-              >
-                <Button type="text">
-                  <Badge status={ingestTone} text={t(ingestLabel)} />
-                </Button>
+                </PopoverContent>
               </Popover>
               {hasCustomWidths && (
                 <Button
-                  size="small"
-                  type="text"
+                  size="sm"
+                  variant="ghost"
                   className="req-reset-columns-btn"
                   onClick={handleResetAllColumns}
                 >
@@ -653,8 +629,7 @@ export const UsageEventsPage: React.FC = () => {
               <ToolButton
                 icon={<CheckSquareOutlined />}
                 label={t('events.select_requests')}
-                type={isSelecting ? 'primary' : 'default'}
-                ghost={isSelecting}
+                variant={isSelecting ? 'active' : 'secondary'}
                 aria-pressed={isSelecting}
                 onClick={() => (isSelecting ? clearSelection() : setIsSelectMode(true))}
               />

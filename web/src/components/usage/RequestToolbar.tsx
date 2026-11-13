@@ -1,7 +1,9 @@
 
 import React from 'react';
 import type { MessageKey } from '../../i18n/catalog';
-import { Button, Segmented, Select } from 'antd';
+import { Select } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { Segmented } from '@/components/ui/segmented';
 import { FilterOutlined } from '../icons';
 
 import { useT } from '../../i18n';
@@ -118,7 +120,7 @@ export const RequestToolbar = React.memo(function RequestToolbar({
             key === 'provider'
               ? resolveProviderName(value)
               : key === 'auth_index'
-                ? `${credentialOptionLabel(credentials.get(value)) || value} · ${value}`
+                ? (credentialOptionLabel(credentials.get(value)) ? `${credentialOptionLabel(credentials.get(value))} (${value})` : value)
                 : value,
         )}
         notFoundContent={facetsFailed ? t('events.facets_error') : undefined}
@@ -185,7 +187,7 @@ export const RequestToolbar = React.memo(function RequestToolbar({
     </span>
   );
   const resetFilters = hasActiveFilter && (
-    <Button type="text" className="req-reset-filters" onClick={onClearFilters}>
+    <Button variant="ghost" className="req-reset-filters" onClick={onClearFilters}>
       {t('events.reset')}
       <span className="req-reset-count">{activeFilterCount || 1}</span>
     </Button>
@@ -214,8 +216,10 @@ export const RequestToolbar = React.memo(function RequestToolbar({
     />
   );
 
-  // A phone gets the same controls in two rows instead of five: what is typed or opened stays
-  // put, and every choice that is a single tap swipes in one strip.
+  // A phone gets the same controls in three fixed rows, each filling the width: what is typed and
+  // the way into every filter; the window and the verdict; how the list is grouped and named. The
+  // model and provider facets are in the filter panel there, beside the other facets. Nothing slides
+  // sideways under the thumb, which fought the list's own scroll.
   if (isPhone) {
     return (
       <section className="request-toolbar is-phone" aria-label={t('events.filters')}>
@@ -223,15 +227,15 @@ export const RequestToolbar = React.memo(function RequestToolbar({
           {searchInput}
           {moreFilters}
         </div>
-        <div className="request-filter-strip">
+        <div className="request-phone-row">
           {timeWindow}
           {resultFilter}
-          {facetMulti('model', 'events.col_model', facets?.models)}
-          {facetMulti('provider', 'events.provider', facets?.providers)}
+        </div>
+        <div className="request-phone-row">
           {groupingSelect}
           {modelViewToggle}
-          {resetFilters}
         </div>
+        {resetFilters}
         {facetsNote}
       </section>
     );

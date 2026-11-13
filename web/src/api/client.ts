@@ -7,7 +7,9 @@ import type { WarmupRunResponse, WarmupStateView, WarmupTaskInput } from '../typ
 import type { ModelCatalogRefreshResult, ModelSquareDirectory } from '../types/modelSquare';
 import type { CustomIcon } from '../types/customIcons';
 import type { InstalledFont } from '../types/fonts';
+import type { SafeProjectedStateSnapshot, StateEnvelope } from './stateLive';
 import { getAppConfig } from '../types/config';
+import { readSSE } from '../agent/sse';
 import { isDemoMode } from '../types/demoMode';
 import {
   DiscoveredResource,
@@ -99,6 +101,14 @@ export interface LogsStatus {
 }
 import type { UsageRoutingResponse } from '../types/usageRouting';
 import { UsageEventPage, UsageEventDetail, UsageFacetsResponse, parseUsageIngestRefresh, type UsageIngestRefresh } from '../types/usageEvents';
+
+/** A batch quota refresh stream that ended before the server's closing frame; the caller names it in the reader's language. */
+export class QuotaRefreshStreamCut extends Error {
+  constructor() {
+    super('quota refresh stream ended before done');
+    this.name = 'QuotaRefreshStreamCut';
+  }
+}
 
 export class ApiError extends Error {
   status: number;
@@ -277,12 +287,33 @@ export function isRetryableWriteFailure(err: unknown): boolean {
 async function downloadBlob(url: string): Promise<Blob> {
   let response: Response;
   try {
+    if (isDemoMode()) {
+      const { interceptDemoRequest } = await import('../demo/sandbox');
+      const urlObj = new URL(url, window.location.origin);
+      const { apiBaseUrl } = getAppConfig();
+      const relativePath = urlObj.pathname.startsWith(apiBaseUrl)
+        ? urlObj.pathname.slice(apiBaseUrl.length) || '/'
+        : urlObj.pathname;
+      const intercepted = await interceptDemoRequest(
+        `${relativePath.startsWith('/') ? relativePath : `/${relativePath}`}${urlObj.search}`,
+        { method: 'GET' },
+        (p, o) => fetch(p.startsWith('/api') ? p : `${apiBaseUrl}${p}`, { ...o, credentials: 'same-origin' }),
+      );
+      if (intercepted) {
+        if (!intercepted.ok) {
+          const error = await readError(intercepted);
+          throw new ApiError(error.message, intercepted.status, error.data, error.demoBlocked);
+        }
+        return intercepted.blob();
+      }
+    }
     response = await fetch(url, {
       method: 'GET',
       credentials: 'same-origin',
       headers: { Accept: 'application/json, text/plain, application/octet-stream' },
     });
   } catch (err: unknown) {
+    if (err instanceof ApiError) throw err;
     const errorMsg = err instanceof Error ? err.message : String(err);
     throw new ApiError(`Network request failed (${errorMsg}); check that the backend is running`, 0);
   }
@@ -301,20 +332,53 @@ export async function requestResponse(path: string, options: RequestInit = {}): 
   const { apiBaseUrl } = getAppConfig();
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
   const authBaseUrl = `${apiRoot()}/api/auth`;
-  const url = cleanPath.startsWith(apiBaseUrl) || cleanPath.startsWith(authBaseUrl)
-    ? cleanPath
-    : `${apiBaseUrl}${cleanPath}`;
-  const headers: Record<string, string> = {
-    Accept: 'application/json',
-    ...(options.headers as Record<string, string> || {}),
+  const resolveUrl = (candidatePath: string) =>
+    candidatePath.startsWith(apiBaseUrl) || candidatePath.startsWith(authBaseUrl)
+      ? candidatePath
+      : `${apiBaseUrl}${candidatePath}`;
+  const url = resolveUrl(cleanPath);
+
+  const rawFetch = async (targetPath: string, targetOptions: RequestInit = {}): Promise<Response> => {
+    const normalized = targetPath.startsWith('/') ? targetPath : `/${targetPath}`;
+    const targetUrl = resolveUrl(normalized);
+    const targetHeaders: Record<string, string> = {
+      Accept: 'application/json',
+      ...(targetOptions.headers as Record<string, string> || {}),
+    };
+    if (targetOptions.body && typeof targetOptions.body === 'string' && !targetHeaders['Content-Type']) {
+      targetHeaders['Content-Type'] = 'application/json';
+    }
+    return fetch(targetUrl, { ...targetOptions, credentials: 'same-origin', headers: targetHeaders });
   };
-  if (options.body && typeof options.body === 'string' && !headers['Content-Type']) {
-    headers['Content-Type'] = 'application/json';
-  }
 
   let response: Response;
+  const method = (options.method ?? 'GET').toUpperCase();
   try {
-    response = await fetch(url, { ...options, credentials: 'same-origin', headers });
+    if (isDemoMode() && !url.startsWith(authBaseUrl)) {
+      const { interceptDemoRequest } = await import('../demo/sandbox');
+      const intercepted = await interceptDemoRequest(cleanPath, options, rawFetch);
+      if (intercepted) {
+        response = intercepted;
+      } else if (method === 'GET' || method === 'HEAD') {
+        response = await rawFetch(cleanPath, options);
+      } else {
+        response = new Response(
+          JSON.stringify({
+            code: 'demo_operation_refused',
+            error: 'this operation is disabled in the demonstration',
+          }),
+          {
+            status: 403,
+            headers: {
+              'Content-Type': 'application/json; charset=utf-8',
+              'X-OMCPA-Demo': 'active',
+            },
+          },
+        );
+      }
+    } else {
+      response = await rawFetch(cleanPath, options);
+    }
   } catch (err: unknown) {
     // A deliberate cancellation is rethrown as itself: wrapping it in the
     // transport-failure message would hide why the request ended.
@@ -322,17 +386,17 @@ export async function requestResponse(path: string, options: RequestInit = {}): 
     const errorMsg = err instanceof Error ? err.message : String(err);
     throw new ApiError(`Network request failed (${errorMsg}); check that the backend is running`, 0);
   }
-  const method = (options.method ?? 'GET').toUpperCase();
   if (!response.ok) {
     const error = await readError(response);
     if (response.status === 401) unauthorizedHandler?.();
     throw new ApiError(error.message, response.status, error.data, error.demoBlocked);
   }
-  // A write that succeeded on a demo is not durable. Reporting it here rather than in
-  // each form means no write can be added later that forgets to - and the auth endpoints
-  // are excluded, because signing in is not a write: a notice beside "Signed in" would
-  // say the sign-in had not been kept, which is the opposite of what happened.
-  if (isDemoMode() && method !== 'GET' && method !== 'HEAD' && !url.startsWith(authBaseUrl)) demoNoticeHandler?.();
+  // Sandbox-handled mutations persist in the visitor's browser session; only server-side
+  // non-persisted demo writes trigger the ephemeral warning.
+  const isSandboxHandled = response.headers.get('X-OMCPA-Demo-Sandbox') === 'browser';
+  if (isDemoMode() && !isSandboxHandled && method !== 'GET' && method !== 'HEAD' && !url.startsWith(authBaseUrl)) {
+    demoNoticeHandler?.();
+  }
   return response;
 }
 
@@ -401,6 +465,10 @@ export const api = {
     return request(`/fonts/${encodeURIComponent(id)}`, { method: 'DELETE' });
   },
   customIconURL(id: string, revision: number): string {
+    if (isDemoMode() && typeof window !== 'undefined') {
+      const lookup = (window as unknown as { __OMCPA_DEMO_ICON_URLS__?: Record<string, string> }).__OMCPA_DEMO_ICON_URLS__;
+      if (lookup?.[id]) return lookup[id];
+    }
     return `${getAppConfig().apiBaseUrl}/custom-icons/${encodeURIComponent(id)}/content?revision=${revision}`;
   },
   async login(password: string, remember = false): Promise<AuthSession> {
@@ -468,7 +536,7 @@ export const api = {
 
   /**
    * getDashboardModels reads the per-model breakdown behind the dashboard's token trend and
-   * model-usage ring.
+   * model-usage ranking.
    *
    * Its own call, for the reason the heatmap has one: it answers for the window the picker selected
    * but on its own cadence, and it walks the detail rows rather than the aggregation rollup, so
@@ -540,12 +608,16 @@ export const api = {
     return request<LogsResponse>(`/management/logs?${search.toString()}`, { method: 'GET' });
   },
 
+  async getProjectedState(): Promise<StateEnvelope<SafeProjectedStateSnapshot>> {
+    return request<StateEnvelope<SafeProjectedStateSnapshot>>('/management/state', { method: 'GET' });
+  },
+
   async getConfigScalars(): Promise<ConfigScalarsResponse> {
     return request<ConfigScalarsResponse>('/management/config', { method: 'GET' });
   },
 
-  async updateConfigScalar(key: string, value: unknown): Promise<{ status: string; key: string; value: unknown }> {
-    return request<{ status: string; key: string; value: unknown }>(`/management/config/${encodeURIComponent(key)}`, {
+  async updateConfigScalar(key: string, value: unknown): Promise<{ status: string; key: string; value: unknown; version?: number }> {
+    return request<{ status: string; key: string; value: unknown; version?: number }>(`/management/config/${encodeURIComponent(key)}`, {
       method: 'PUT',
       body: JSON.stringify({ value }),
     });
@@ -659,15 +731,38 @@ export const api = {
     );
   },
 
-  async createClientAPIKey(key: string): Promise<{ status: string; index: number; key: string }> {
-    return request<{ status: string; index: number; key: string }>('/management/api-keys', {
+  async createClientAPIKey(key: string): Promise<{ status: string; index: number; key: string; fingerprint?: string; usage_fingerprint?: string; version?: number }> {
+    return request<{ status: string; index: number; key: string; fingerprint?: string; usage_fingerprint?: string; version?: number }>('/management/api-keys', {
       method: 'POST',
       body: JSON.stringify({ key }),
     });
   },
 
-  async deleteClientAPIKey(index: number): Promise<{ status: string; deleted: number }> {
-    return request<{ status: string; deleted: number }>(`/management/api-keys/${index}`, { method: 'DELETE' });
+  async updateClientAPIKey(
+    index: number,
+    key: string,
+    expectedFingerprint?: string,
+  ): Promise<{ status: string; index: number; key: string; fingerprint?: string; usage_fingerprint?: string; version?: number }> {
+    return request<{ status: string; index: number; key: string; fingerprint?: string; usage_fingerprint?: string; version?: number }>(`/management/api-keys/${index}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        key,
+        ...(expectedFingerprint ? { expected_fingerprint: expectedFingerprint } : {}),
+      }),
+    });
+  },
+
+  async deleteClientAPIKey(
+    index: number,
+    expectedFingerprint?: string,
+  ): Promise<{ status: string; deleted: number; version?: number }> {
+    const query = expectedFingerprint
+      ? `?expected_fingerprint=${encodeURIComponent(expectedFingerprint)}`
+      : '';
+    return request<{ status: string; deleted: number; version?: number }>(
+      `/management/api-keys/${index}${query}`,
+      { method: 'DELETE' },
+    );
   },
 
   /**
@@ -711,10 +806,13 @@ export const api = {
     );
   },
 
-  async getManagementProviders(includeKeys = false): Promise<{ providers: ProviderItem[]; total: number }> {
+  async getManagementProviders(
+    includeKeys = false,
+    options?: { signal?: AbortSignal },
+  ): Promise<{ providers: ProviderItem[]; total: number }> {
     return request<{ providers: ProviderItem[]; total: number }>(
       `/management/providers${includeKeys ? '?include_keys=true' : ''}`,
-      { method: 'GET' },
+      { method: 'GET', signal: options?.signal },
     );
   },
 
@@ -1276,6 +1374,10 @@ export const api = {
     return `${getAppConfig().apiBaseUrl}/management/system/database-backups/${encodeURIComponent(id)}/download`;
   },
 
+  async downloadDatabaseBackup(id: string): Promise<Blob> {
+    return downloadBlob(this.databaseBackupDownloadUrl(id));
+  },
+
   async inspectDatabaseBackup(file: File, passphrase: string): Promise<DatabaseBackupJob> {
     const body = new FormData();
     body.append('passphrase', passphrase);
@@ -1384,11 +1486,23 @@ export const api = {
     });
   },
 
-  async batchRefreshCredentialQuotas(authIndexes: string[]): Promise<{ status: string; quotas: QuotaItem[] }> {
-    return request<{ status: string; quotas: QuotaItem[] }>('/management/quota/refresh', {
+  /**
+   * Refreshes up to ten credentials, handing each reading to `onQuota` the moment the server has
+   * it rather than when the slowest one is done. A stream that ends before the server's closing
+   * frame was cut, and rejects after every reading it did carry has been handed over.
+   */
+  async batchRefreshCredentialQuotas(authIndexes: string[], onQuota: (quota: QuotaItem) => void): Promise<void> {
+    const response = await requestResponse('/management/quota/refresh', {
       method: 'POST',
+      headers: { Accept: 'text/event-stream' },
       body: JSON.stringify({ auth_indexes: authIndexes }),
     });
+    if (!response.body) throw new QuotaRefreshStreamCut();
+    for await (const frame of readSSE(response.body)) {
+      if (frame.event === 'quota') onQuota(JSON.parse(frame.data) as QuotaItem);
+      else if (frame.event === 'done') return;
+    }
+    throw new QuotaRefreshStreamCut();
   },
 
   async clearCredentialCooldown(authIndex: string): Promise<{ status: string; auth_index: string }> {

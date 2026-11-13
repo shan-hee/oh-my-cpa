@@ -1,4 +1,6 @@
 import { formatCurrency } from '../../types/currencyDisplay';
+import type { TipRow } from '../common/tipCard';
+import { requestTipCard } from './RequestTooltip';
 import { useDisplayCurrency } from '../../types/CurrencyDisplayContext';
 import { tokenAccountingMessage } from './TokenAccountingNote';
 import { useTimeZone } from '../../utils/TimeZoneProvider';
@@ -98,18 +100,21 @@ export const RequestRow = React.memo<RequestRowProps>(
     const hasRoutedModel = isCallView && callModel !== requestModel && Boolean(requestModel);
     const displayModel = (isCallView ? callModel : requestModel) || t('events.not_captured');
 
-    const modelTooltip = React.useMemo(() => {
-      const parts: string[] = [];
-      if (event.model_alias && event.model_alias !== event.model) {
-        parts.push(`${t('events.call_model')}: ${event.model_alias}`);
-        parts.push(`${t('events.request_model')}: ${event.model}`);
-      } else if (event.model) {
-        parts.push(isCallView ? `${t('events.call_model')}: ${event.model}` : `${t('events.request_model')}: ${event.model}`);
+    // The hint earns its place only when the request named more than one model: the call alias, the
+    // model it was sent as and the one that answered, one row each. A single model is the cell's own
+    // text, so it is offered only when the cell cuts it off.
+    const modelTip = React.useMemo(() => {
+      const rows: TipRow[] = [];
+      const isAliased = Boolean(event.model_alias && event.model_alias !== event.model);
+      if (isAliased) {
+        rows.push({ label: t('events.call_model'), value: event.model_alias! });
+        rows.push({ label: t('events.request_model'), value: event.model });
       }
       if (event.response_model && event.model_substituted) {
-        parts.push(`${t('events.served_model')}: ${event.response_model}`);
+        if (!isAliased && event.model) rows.push({ label: t(isCallView ? 'events.call_model' : 'events.request_model'), value: event.model });
+        rows.push({ label: t('events.served_model'), value: event.response_model });
       }
-      return parts.join(' · ');
+      return rows.length > 0 ? requestTipCard({ rows }) : null;
     }, [event.model, event.model_alias, event.response_model, event.model_substituted, isCallView, t]);
 
     const providerInfo = resolveProviderInfo(
@@ -228,16 +233,19 @@ export const RequestRow = React.memo<RequestRowProps>(
           <time dateTime={isoTime} className="req-time-text" data-request-tooltip={fullTime}>
             {formattedTime}
           </time>
-          <div className="req-time-sub" title={event.request_id}>
-            {/* One line, truncated: CPA v8 names each execution with a 36-character UUID, which
-                wrapped at every hyphen and made every row several lines tall. The full id stays in
-                the title, the copy button and the detail drawer. */}
-            <span className="req-time-sub-id">{event.request_id || t('events.no_request_id')}</span>
+          <div className="req-time-sub">
+            <span
+              className="req-time-sub-id"
+              data-request-tooltip={event.request_id || undefined}
+              data-request-tooltip-overflow=""
+            >
+              {event.request_id || t('events.no_request_id')}
+            </span>
             {event.request_id ? (
               <button
                 type="button"
                 className="req-id-quick-copy"
-                title={t('common.copy')}
+                data-request-tooltip={t('common.copy')}
                 aria-label={`${t('common.copy')}: ${event.request_id}`}
                 onClick={(e) => {
                   e.stopPropagation();
@@ -268,7 +276,8 @@ export const RequestRow = React.memo<RequestRowProps>(
           ) : (
             <span
               className={`req-result-pill ${event.failed ? 'is-failed' : 'is-success'}`}
-              title={resultLabel}
+              data-request-tooltip={resultLabel}
+              data-request-tooltip-overflow=""
             >
               <i className="req-result-bullet" />
               {resultLabel}
@@ -283,31 +292,39 @@ export const RequestRow = React.memo<RequestRowProps>(
           </div>
           <div className="req-provider-content">
             <div className="req-provider-title-row">
-              <strong className="req-provider-title" title={providerInfo.title}>
+              <strong
+                className="req-provider-title"
+                data-request-tooltip={providerInfo.title}
+                data-request-tooltip-overflow=""
+              >
                 {providerInfo.title}
               </strong>
               {providerInfo.isOAuth && (
-                <span className="req-badge-oauth" title={t('events.oauth_badge')}>
+                <span className="req-badge-oauth" data-request-tooltip={t('events.oauth_badge')}>
                   OAuth
                 </span>
               )}
-              {/* The printed name is a placeholder while the provider catalog is unread, so the
-                  row says so rather than letting the label pass for a resolution. */}
               {providerInfo.isIdentityUnknown && (
-                <span className="req-badge-unresolved" title={t('events.provider_unresolved')}>
+                <span className="req-badge-unresolved" data-request-tooltip={t('events.provider_unresolved')}>
                   {t('events.provider_unresolved_badge')}
                 </span>
               )}
             </div>
             {providerInfo.isOAuth && providerInfo.credential && (
-              <span className="req-provider-credential" title={providerInfo.credential}>
+              <span
+                className="req-provider-credential"
+                data-request-tooltip={providerInfo.credential}
+                data-request-tooltip-overflow=""
+              >
                 {providerInfo.credential}
               </span>
             )}
             {providerKeyMask && (
-              /* The tooltip repeats the cell's own mask and nothing more: the value
-                 itself is never held by this page. */
-              <span className="req-provider-credential req-provider-key" title={providerKeyMask}>
+              <span
+                className="req-provider-credential req-provider-key"
+                data-request-tooltip={providerKeyMask}
+                data-request-tooltip-overflow=""
+              >
                 {providerKeyMask}
               </span>
             )}
@@ -328,12 +345,12 @@ export const RequestRow = React.memo<RequestRowProps>(
             )}
             <strong
               className="req-model-name"
-              title={modelTooltip || displayModel}
+              {...(modelTip ?? { 'data-request-tooltip': displayModel, 'data-request-tooltip-overflow': '' })}
             >
               {displayModel}
             </strong>
             {!event.generate && (
-              <span className="req-preflight-badge" title={t('events.preflight_hint')}>
+              <span className="req-preflight-badge" data-request-tooltip={t('events.preflight_hint')}>
                 {t('events.preflight')}
               </span>
             )}
@@ -453,20 +470,31 @@ export const RequestRow = React.memo<RequestRowProps>(
         <div className={`req-col req-col-tokens ${requestColumnAlignClass('tokens')}`}>
           <span className="req-mobile-label">{t('events.col_tokens')}</span>
           <div className="req-tokens-total">
-            <strong title={`${formatTokensFull(event.tokens.total)} ${t('dash.unit_tokens')}`}>{formatTokens(event.tokens.total, tokenStyle)}</strong>
+            <strong data-request-tooltip={`${formatTokensFull(event.tokens.total)} ${t('dash.unit_tokens')}`}>{formatTokens(event.tokens.total, tokenStyle)}</strong>
             <small>tokens</small>
           </div>
-          <div className="req-tokens-breakdown">
-            <span title={`${t('events.input_tokens')}: ${formatTokensFull(event.tokens.input)}`}>
+          {/* The line clips an outsized count at the track's edge, so the line itself also
+              carries every exact count; a visible count still answers with its own. */}
+          <div
+            className="req-tokens-breakdown"
+            {...requestTipCard({
+              rows: [
+                { label: t('events.input_tokens'), value: formatTokensFull(event.tokens.input) },
+                { label: t('events.output_tokens'), value: formatTokensFull(event.tokens.output) },
+                ...(event.tokens.reasoning > 0 ? [{ label: t('events.reasoning_tokens'), value: formatTokensFull(event.tokens.reasoning) }] : []),
+              ],
+            })}
+          >
+            <span data-request-tooltip={`${t('events.input_tokens')}: ${formatTokensFull(event.tokens.input)}`}>
               ↑ {formatTokens(event.tokens.input, tokenStyle)}
             </span>
-            <span title={`${t('events.output_tokens')}: ${formatTokensFull(event.tokens.output)}`}>
+            <span data-request-tooltip={`${t('events.output_tokens')}: ${formatTokensFull(event.tokens.output)}`}>
               ↓ {formatTokens(event.tokens.output, tokenStyle)}
             </span>
             {event.tokens.reasoning > 0 && (
               <span
                 className="req-tokens-reasoning"
-                title={`${t('events.reasoning_tokens')}: ${formatTokensFull(event.tokens.reasoning)}`}
+                data-request-tooltip={`${t('events.reasoning_tokens')}: ${formatTokensFull(event.tokens.reasoning)}`}
               >
                 <BulbOutlined className="req-token-icon-reasoning" />
                 {formatTokens(event.tokens.reasoning, tokenStyle)}
@@ -538,7 +566,7 @@ export const RequestRow = React.memo<RequestRowProps>(
             every other auth type falls back to the source fingerprint */}
         <div className={`req-col req-col-key ${requestColumnAlignClass('key')}`}>
           <span className="req-mobile-label">{t('events.col_key')}</span>
-          <span className="req-key-val" title={keyLabel}>
+          <span className="req-key-val" data-request-tooltip={keyLabel} data-request-tooltip-overflow="">
             {keyLabel}
           </span>
         </div>
@@ -547,7 +575,7 @@ export const RequestRow = React.memo<RequestRowProps>(
             at ingestion */}
         <div className={`req-col req-col-ua ${requestColumnAlignClass('ua')}`}>
           <span className="req-mobile-label">{t('events.col_ua')}</span>
-          <span className="req-ua-val" title={uaLabel}>
+          <span className="req-ua-val" data-request-tooltip={uaLabel} data-request-tooltip-overflow="">
             {uaLabel}
           </span>
         </div>

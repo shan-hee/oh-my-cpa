@@ -24,9 +24,9 @@ export interface QuotaWindow {
   description?: string;
   /** What this deployment recorded for the credential in the window's current cycle, up to the observation. */
   usage?: QuotaWindowUsage;
-  /** The estimated size of the whole window and what is left of it; absent when `capacity_unavailable` says why. */
-  capacity?: QuotaWindowCapacity;
-  capacity_unavailable?: QuotaCapacityUnavailableReason;
+  /** Remaining work conditioned on directly observed model and workload samples. */
+  model_forecasts?: QuotaModelForecast[];
+  forecast_unavailable?: QuotaForecastUnavailableReason;
 }
 
 export interface QuotaWindowUsage {
@@ -35,24 +35,27 @@ export interface QuotaWindowUsage {
   requests: number;
   priced_requests: number;
   tokens: number;
+  prompt_tokens?: number;
+  cached_tokens?: number;
+  cache_rate?: number;
   cost_nanos: number;
 }
 
-export interface QuotaWindowCapacity {
-  basis?: 'current_cycle' | 'observed_delta' | 'blended' | 'previous_cycle';
-  observed_at_ms?: number;
-  from_ms?: number;
-  reset_at_ms?: number;
-  /** How many requests of the recorded workload the whole window holds. */
-  requests: number;
-  tokens: number;
-  /** Absent when too much of the sample carries no price. */
-  cost_nanos?: number;
-  /** What is left of the window, given only with a live reading of the used share. */
-  remaining_tokens?: number;
+export interface QuotaModelForecast {
+  model: string;
+  service_tier?: string;
+  sample_requests: number;
+  sample_priced_requests?: number;
+  sample_tokens: number;
+  sample_used_percent: number;
+  cache_rate?: number;
+  from_ms: number;
+  observed_at_ms: number;
+  remaining_requests: number;
+  remaining_tokens: number;
   remaining_cost_nanos?: number;
-  /** Relative effect, in percent, of upstream rounding the used share to whole points. */
-  error_percent: number;
+  /** Meter rounding only; not a confidence bound on future workloads. */
+  rounding_error_percent: number;
 }
 
 /** One cycle of a window as the capacity details state it. */
@@ -65,18 +68,21 @@ export interface QuotaCapacityCycle {
   usage?: QuotaWindowUsage;
 }
 
-/** `GET /management/quota/{authIndex}/capacity?window=`: the cycle being read and the one before it. */
+/** `GET /management/quota/{authIndex}/capacity?window=`: the cycle being read, the one before it, and model-conditioned remaining-work forecasts. */
 export interface QuotaCapacityHistory {
   window_id: string;
   current: QuotaCapacityCycle | null;
   previous: QuotaCapacityCycle | null;
+  model_forecasts?: QuotaModelForecast[];
+  forecast_unavailable?: QuotaForecastUnavailableReason;
 }
 
-export type QuotaCapacityUnavailableReason =
+export type QuotaForecastUnavailableReason =
   | 'boundary_unknown'
   | 'expired'
   | 'no_reading'
   | 'low_usage'
+  | 'mixed_models'
   | 'no_traffic'
   | 'reset_mid_cycle'
   | 'scope_unknown'

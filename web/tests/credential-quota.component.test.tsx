@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+import { act, render, screen, fireEvent, within, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, RouterProvider, createMemoryRouter } from 'react-router-dom';
 import { I18nProvider, makeT } from '../src/i18n';
@@ -10,7 +10,8 @@ import {
 import { buildCredentialQuotaBoard, credentialQuotaRefreshTargets } from '../src/components/dashboard/credentialQuotaLogic';
 import { resolveCredentialMark } from '../src/types/brandMark';
 import { CredentialQuotaBody } from '../src/pages/quota/CredentialQuotaBody';
-import { App as AntdApp } from 'antd';
+import { QuotaCapacityButton, QuotaCapacityScope } from '../src/pages/quota/QuotaCapacityButton';
+import QuotaCapacityDialog from '../src/pages/quota/QuotaCapacityDialog';
 import { CredentialList } from '../src/pages/oauthManagement/CredentialList';
 import { ProviderStrip } from '../src/pages/oauthManagement/ProviderStrip';
 import type { CredentialActions } from '../src/pages/oauthManagement/CredentialParts';
@@ -20,7 +21,12 @@ import { renderWithOmc } from './support/render';
 import { buildCredentialSections } from '../src/pages/oauthManagement/credentialSections';
 import { buildOAuthWorkspaceProjection } from '../src/pages/oauthManagement/oauthWorkspaceLogic';
 import type { ManagementAuthFile } from '../src/types/managementAuthFile';
-import type { QuotaItem, QuotaWindow } from '../src/types/quota';
+import type { QuotaItem, QuotaWindow, QuotaModelForecast } from '../src/types/quota';
+
+vi.mock('../src/components/dashboard/RollingNumber', () => ({
+  RollingNumber: ({ readout }: { readout?: { number: number; prefix?: string; suffix: string; format: Intl.NumberFormatOptions } }) =>
+    <>{readout ? `${readout.prefix ?? ''}${new Intl.NumberFormat('en', readout.format).format(readout.number)}${readout.suffix}` : '—'}</>,
+}));
 
 const NOW_MS = Date.parse('2026-10-10T08:00:00Z');
 const HOUR_MS = 3_600_000;
@@ -223,6 +229,7 @@ describe('credential quota body details', () => {
     expect(screen.getAllByText(/HTTP 401: unauthorized/).length).toBeGreaterThan(0);
     expect(screen.getByText('100%')).toBeTruthy();
   });
+
 });
 
 function renderCredentialRow(
@@ -239,15 +246,13 @@ function renderCredentialRow(
   const actions: CredentialActions = {
     isBusy: () => false, isRefreshingQuota: () => false, siwcBadge: () => undefined,
     onSelect: vi.fn(), onPick: vi.fn(), onToggle: vi.fn(), onDownload: vi.fn(), onDelete: vi.fn(), onOpen, onRename,
-    onRefreshQuota: onRefresh ?? vi.fn(), onClearCooldown: vi.fn(), onRedeemCredit: vi.fn(), onReauthenticate: vi.fn(), onOpenSIWC: vi.fn(),
+    onRefreshQuota: onRefresh ?? vi.fn(), onClearCooldown: vi.fn(), onRedeemCredit: vi.fn(), onReauthenticate: vi.fn(), onOpenSIWC: vi.fn(), onOpenModelRules: vi.fn(),
   };
   if (!onRefresh) section.records = section.records.map((record) => ({ ...record, canRefreshQuota: false }));
   return render(
     <MemoryRouter>
       <I18nProvider>
-        <AntdApp>
-          <CredentialList groups={[{ ...section, title: 'Codex' }]} selectedKeys={new Set()} nowMS={NOW_MS} actions={actions} />
-        </AntdApp>
+        <CredentialList groups={[{ ...section, title: 'Codex' }]} selectedKeys={new Set()} nowMS={NOW_MS} actions={actions} />
       </I18nProvider>
     </MemoryRouter>,
   );
@@ -274,6 +279,76 @@ describe('credential list row', () => {
     expect(within(cells[0]).getByText('100%')).toBeTruthy();
     expect(within(cells[0]).getByText('5h', { exact: true })).toBeTruthy();
     expect(within(cells[1]).getByText('~2d left')).toBeTruthy();
+  });
+
+  it('hides forecast label when a window has no model forecasts and shows predicted amount when forecasts exist', () => {
+    const { container } = renderCredentialRow(quota('codex-forecast-row', [
+      {
+        ...quotaWindow('five_hour', 80, 3),
+        model_forecasts: [{
+          model: 'gpt-6.1-sol', sample_requests: 10, sample_priced_requests: 10, sample_tokens: 100_000, sample_used_percent: 20,
+          from_ms: NOW_MS - HOUR_MS, observed_at_ms: NOW_MS, remaining_requests: 40, remaining_tokens: 400_000,
+          remaining_cost_nanos: 12_340_000_000, rounding_error_percent: 5,
+        }],
+      },
+      {
+        ...quotaWindow('weekly', 95, 48),
+        usage: { from_ms: NOW_MS - HOUR_MS, to_ms: NOW_MS, requests: 2, priced_requests: 2, tokens: 10_000, cost_nanos: 1_000_000 },
+        forecast_unavailable: 'low_usage',
+      },
+    ]));
+    const cells = container.querySelectorAll<HTMLElement>('[data-quota-window-label]');
+    expect(within(cells[0]).getByRole('button', { name: '≈ $12.34' })).toBeTruthy();
+    expect(within(cells[1]).queryByText('Usage details')).toBeNull();
+    expect(within(cells[1]).queryByRole('button')).toBeNull();
+  });
+
+  it('keeps an open row capacity dialog mounted if a refresh removes model forecasts', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/quota/codex-refresh/capacity', () => ({
+      window_id: 'five_hour',
+      current: null,
+      previous: null,
+      forecast_unavailable: 'mixed_models',
+    }));
+    const withForecast = quota('codex-refresh', [{
+      ...quotaWindow('five_hour', 80, 3),
+      model_forecasts: [{
+        model: 'gpt-6.1-sol', sample_requests: 10, sample_priced_requests: 10, sample_tokens: 100_000, sample_used_percent: 20,
+        from_ms: NOW_MS - HOUR_MS, observed_at_ms: NOW_MS, remaining_requests: 40, remaining_tokens: 400_000,
+        remaining_cost_nanos: 12_340_000_000, rounding_error_percent: 5,
+      }],
+    }]);
+    const withoutForecast = quota('codex-refresh', [{
+      ...quotaWindow('five_hour', 75, 3),
+      usage: { from_ms: NOW_MS - HOUR_MS, to_ms: NOW_MS, requests: 12, priced_requests: 12, tokens: 120_000, cost_nanos: 3_000_000_000 },
+      forecast_unavailable: 'mixed_models',
+    }]);
+    const actions: CredentialActions = {
+      isBusy: () => false, isRefreshingQuota: () => false, siwcBadge: () => undefined,
+      onSelect: vi.fn(), onPick: vi.fn(), onToggle: vi.fn(), onDownload: vi.fn(), onDelete: vi.fn(), onOpen: vi.fn(), onRename: vi.fn(async () => true),
+      onRefreshQuota: vi.fn(), onClearCooldown: vi.fn(), onRedeemCredit: vi.fn(), onReauthenticate: vi.fn(), onOpenSIWC: vi.fn(), onOpenModelRules: vi.fn(),
+    };
+    let setItem!: (item: QuotaItem) => void;
+    const Host = () => {
+      const [item, _setItem] = React.useState(withForecast);
+      setItem = _setItem;
+      const { records } = buildOAuthWorkspaceProjection([file(item.auth_index)], [item], []);
+      const [section] = buildCredentialSections(records, records);
+      return <CredentialList groups={[{ ...section, title: 'Codex' }]} selectedKeys={new Set()} nowMS={NOW_MS} actions={actions} />;
+    };
+
+    const view = renderWithOmc(<Host />, { route: '/oauth-management' });
+    try {
+      fireEvent.click(screen.getByRole('button', { name: '≈ $12.34' }));
+      expect(await screen.findByRole('dialog')).toBeTruthy();
+
+      act(() => setItem(withoutForecast));
+      await waitFor(() => expect(within(screen.getByRole('dialog')).getByText('No model forecast yet')).toBeTruthy());
+      expect(screen.queryByRole('button', { name: '≈ $12.34' })).toBeNull();
+    } finally {
+      view.unmount();
+    }
   });
 
   it('triggers inline quota refresh, renewal badge navigation, and inline rename', async () => {
@@ -381,5 +456,102 @@ describe('provider sections across pages', () => {
     } finally {
       view.unmount();
     }
+  });
+
+  it('dismisses and blocks row capacity dialogs while a page overlay is active', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/quota/acct-1/capacity', () => ({ current: null, previous: null }));
+    const windowItem: QuotaWindow = {
+      ...quotaWindow('five_hour', 70, 2),
+      forecast_unavailable: 'low_usage',
+    };
+    const owner = { authIndex: 'acct-1', credentialName: 'Primary' };
+    let setBlocked!: (blocked: boolean) => void;
+    const Host = () => {
+      const [blocked, _setBlocked] = React.useState(false);
+      setBlocked = _setBlocked;
+      return (
+        <QuotaCapacityScope isBlocked={blocked}>
+          <QuotaCapacityButton owner={owner} window={windowItem}>Usage details</QuotaCapacityButton>
+        </QuotaCapacityScope>
+      );
+    };
+    const view = renderWithOmc(<Host />);
+    try {
+      fireEvent.click(screen.getByRole('button', { name: 'Usage details' }));
+      expect(await screen.findByRole('dialog')).toBeTruthy();
+
+      act(() => setBlocked(true));
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+      // Clicking while blocked does not reopen the row dialog.
+      fireEvent.click(screen.getByRole('button', { name: 'Usage details' }));
+      expect(screen.queryByRole('dialog')).toBeNull();
+    } finally {
+      view.unmount();
+    }
+  });
+});
+
+describe('quota consumption and model forecast dialog', () => {
+  it('switches periods and directly observed models while leading with available cost without footer sample clutter', async () => {
+    const api = installOmcApi();
+    const sample = (model: string, remaining: number, costDollars: number): QuotaModelForecast => ({
+      model, sample_requests: 10, sample_priced_requests: 10, sample_tokens: 100_000, sample_used_percent: 10,
+      from_ms: NOW_MS - HOUR_MS, observed_at_ms: NOW_MS, cache_rate: 80,
+      remaining_requests: remaining, remaining_tokens: remaining * 10_000,
+      remaining_cost_nanos: costDollars * 1_000_000_000, rounding_error_percent: 11.2,
+    });
+    const fiveHour: QuotaWindow = {
+      ...quotaWindow('five_hour', 80, 3), period_hours: 5,
+      usage: { from_ms: NOW_MS - 2 * HOUR_MS, to_ms: NOW_MS, requests: 90, priced_requests: 90, tokens: 1_750_000, cache_rate: 78.5, cost_nanos: 10_000_000_000 },
+      model_forecasts: [sample('gemini-4-hydrogen', 890, 40), sample('gemini-4-carbon', 157, 25)],
+    };
+    const weekly: QuotaWindow = {
+      ...quotaWindow('weekly', 60, 100), id: 'seven_day', period_hours: 168,
+      usage: { from_ms: NOW_MS - 68 * HOUR_MS, to_ms: NOW_MS, requests: 400, priced_requests: 400, tokens: 8_000_000, cache_rate: 85, cost_nanos: 80_000_000_000 },
+      model_forecasts: [sample('gemini-4-hydrogen', 2800, 120), sample('gemini-4-carbon', 600, 75)],
+    };
+    api.on('GET', '/management/quota/gemini-seat/capacity', (req) => {
+      const active = req.query.get('window') === 'seven_day' ? weekly : fiveHour;
+      return {
+        window_id: active.id,
+        current: { from_ms: active.usage!.from_ms, reset_at_ms: active.reset_at_ms, used_percent: 100 - active.remaining_percent!, usage: active.usage },
+        previous: null,
+        model_forecasts: active.model_forecasts,
+      };
+    });
+    const view = renderWithOmc(<QuotaCapacityDialog open onClose={vi.fn()} owner={{ authIndex: 'gemini-seat', credentialName: 'Gemini Pro' }} window={fiveHour} windows={[fiveHour, weekly]} />);
+    try {
+      const dialog = await screen.findByRole('dialog');
+      await waitFor(() => expect(within(dialog).getByTestId('quota-capacity-model-select')).toBeTruthy());
+      const forecastCard = within(dialog).getByRole('region', { name: 'Available this window' });
+      expect(forecastCard.textContent).toContain('$40.00');
+      expect(forecastCard.textContent).toContain('890');
+      expect(forecastCard.textContent).not.toContain('10 requests');
+      expect(within(dialog).getByRole('region', { name: 'This window' }).textContent).toContain('$10.00');
+      fireEvent.click(within(dialog).getByTestId('quota-capacity-model-select'));
+      fireEvent.click(await screen.findByRole('option', { name: 'gemini-4-carbon' }));
+      await waitFor(() => expect(forecastCard.textContent).toContain('$25.00'));
+      expect(forecastCard.textContent).toContain('157');
+      fireEvent.click(within(dialog).getByRole('radio', { name: 'Weekly limit' }));
+      await waitFor(() => expect(forecastCard.textContent).toContain('$75.00'));
+      expect(forecastCard.textContent).toContain('600');
+    } finally { view.unmount(); }
+  });
+
+  it('clears an older model forecast when the latest evidence is mixed', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/quota/mixed-seat/capacity', () => ({ window_id: 'five_hour', current: null, previous: null, forecast_unavailable: 'mixed_models' }));
+    const windowItem: QuotaWindow = {
+      ...quotaWindow('five_hour', 80, 3),
+      model_forecasts: [{ model: 'gemini-4-hydrogen', sample_requests: 10, sample_tokens: 1000, sample_used_percent: 10, from_ms: NOW_MS - HOUR_MS, observed_at_ms: NOW_MS, remaining_requests: 123, remaining_tokens: 12300, rounding_error_percent: 11.2 }],
+    };
+    const view = renderWithOmc(<QuotaCapacityDialog open onClose={vi.fn()} owner={{ authIndex: 'mixed-seat', credentialName: 'Gemini Pro' }} window={windowItem} />);
+    try {
+      const dialog = await screen.findByRole('dialog');
+      await waitFor(() => expect(within(dialog).getByText('No model forecast yet')).toBeTruthy());
+      expect(within(dialog).getByRole('region', { name: 'Available this window' }).textContent).not.toContain('123');
+    } finally { view.unmount(); }
   });
 });

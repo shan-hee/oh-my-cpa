@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/oh-my-cpa/oh-my-cpa/internal/cpa/management"
@@ -90,6 +91,9 @@ func (h *Handler) getQuotaOverview(writer http.ResponseWriter, request *http.Req
 	}
 	writeJSON(writer, http.StatusOK, overview)
 }
+
+// quotaRefreshStreamWriteDeadline bounds one frame of a batch refresh stream.
+const quotaRefreshStreamWriteDeadline = 10 * time.Second
 
 type refreshQuotaRequest struct {
 	AuthIndex   string   `json:"auth_index,omitempty"`
@@ -307,7 +311,7 @@ func (h *Handler) refreshCredentialQuota(writer http.ResponseWriter, request *ht
 		}
 
 		_ = h.persistNormalizedQuotaSnapshot(ctx, refreshed)
-		h.attachWindowCapacity(ctx, refreshed, h.now().UnixMilli())
+		h.attachQuotaForecasts(ctx, refreshed, h.now().UnixMilli())
 
 		outcome := "success"
 		if refreshed.Provider == "meta" && refreshed.Error != "" {
@@ -352,18 +356,18 @@ func (h *Handler) refreshCredentialQuota(writer http.ResponseWriter, request *ht
 		}
 	}
 	svc := quota.NewService(client)
-	results := make([]*quota.NormalizedQuota, len(targetIndexes))
+	readings := make(chan *quota.NormalizedQuota)
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 
-	for i, idx := range targetIndexes {
+	for _, idx := range targetIndexes {
 		cleanIdx := strings.TrimSpace(idx)
 		file, exists := fileMap[cleanIdx]
 		if !exists {
 			continue
 		}
 		wg.Add(1)
-		go func(index int, authIdx string, f management.AuthFile) {
+		go func(authIdx string, f management.AuthFile) {
 			defer wg.Done()
 			if h.holdsCallerSlot(f) {
 				sem <- struct{}{}
@@ -373,33 +377,81 @@ func (h *Handler) refreshCredentialQuota(writer http.ResponseWriter, request *ht
 			prior := h.loadPriorNormalizedQuota(ctx, authIdx)
 			refreshed, rErr := h.refreshQuotaReading(ctx, svc, f, prior)
 			if rErr == nil && refreshed != nil {
-				results[index] = refreshed
 				_ = h.persistNormalizedQuotaSnapshot(ctx, refreshed)
+				readings <- refreshed
 			}
-		}(i, cleanIdx, file)
+		}(cleanIdx, file)
 	}
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(readings)
+	}()
 
-	out := make([]*quota.NormalizedQuota, 0, len(results))
-	for _, r := range results {
-		if r != nil {
-			if r.Provider == "meta" && !r.Disabled {
-				outcome := "success"
-				if r.Error != "" {
-					outcome = "failure"
-				}
-				_ = h.recordAudit(request, "quota.refresh", "quota", r.AuthIndex, outcome, map[string]any{"status": r.Status})
-			}
-			h.attachWindowCapacity(ctx, r, h.now().UnixMilli())
-			out = append(out, r)
+	// A batch is as slow as its slowest provider, and a gated one reads one credential at a time.
+	// A caller that accepts an event stream gets each reading the moment it lands, so the console
+	// can settle that credential while the rest are still being read; every other caller keeps the
+	// one JSON answer in request order.
+	if !strings.Contains(request.Header.Get("Accept"), "text/event-stream") {
+		byIndex := make(map[string]*quota.NormalizedQuota, len(targetIndexes))
+		for r := range readings {
+			h.finishBatchReading(request, r)
+			byIndex[r.AuthIndex] = r
 		}
+		out := make([]*quota.NormalizedQuota, 0, len(byIndex))
+		for _, idx := range targetIndexes {
+			if r, ok := byIndex[strings.TrimSpace(idx)]; ok {
+				out = append(out, r)
+			}
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"status": "ok", "quotas": out, "total": len(out)})
+		return
 	}
 
-	writeJSON(writer, http.StatusOK, map[string]any{
-		"status": "ok",
-		"quotas": out,
-		"total":  len(out),
-	})
+	// The stream is one `quota` frame per reading, then `done` with the count; a stream that ends
+	// without `done` was cut.
+	controller := http.NewResponseController(writer)
+	writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	writer.Header().Set("X-Accel-Buffering", "no")
+	writer.WriteHeader(http.StatusOK)
+	isWritable := controller.Flush() == nil
+	writeFrame := func(event string, value any) {
+		if !isWritable {
+			return
+		}
+		payload, err := json.Marshal(value)
+		if err != nil {
+			return
+		}
+		// The server's write timeout counts from the request; a batch that outlives it is still alive.
+		_ = controller.SetWriteDeadline(time.Now().Add(quotaRefreshStreamWriteDeadline))
+		if _, err := fmt.Fprintf(writer, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+			isWritable = false
+			return
+		}
+		isWritable = controller.Flush() == nil
+	}
+
+	// Drained to the end even after the client has gone, so no read is left blocked on the channel.
+	total := 0
+	for r := range readings {
+		h.finishBatchReading(request, r)
+		total++
+		writeFrame("quota", r)
+	}
+	writeFrame("done", map[string]any{"status": "ok", "total": total})
+}
+
+// finishBatchReading audits a Meta read and attaches the quota forecasts before a batch reading is
+// answered, whichever wire format carries it.
+func (h *Handler) finishBatchReading(request *http.Request, r *quota.NormalizedQuota) {
+	if r.Provider == "meta" && !r.Disabled {
+		outcome := "success"
+		if r.Error != "" {
+			outcome = "failure"
+		}
+		_ = h.recordAudit(request, "quota.refresh", "quota", r.AuthIndex, outcome, map[string]any{"status": r.Status})
+	}
+	h.attachQuotaForecasts(request.Context(), r, h.now().UnixMilli())
 }
 
 func (h *Handler) loadPriorNormalizedQuota(ctx context.Context, authIndex string) *quota.NormalizedQuota {
@@ -467,7 +519,7 @@ func (h *Handler) persistNormalizedQuotaSnapshot(ctx context.Context, q *quota.N
 	windows := append([]quota.QuotaWindow(nil), q.Windows...)
 	for i := range windows {
 		window := &windows[i]
-		window.Usage, window.Capacity, window.CapacityUnavailable = nil, nil, ""
+		window.Usage, window.ModelForecasts, window.ForecastUnavailable = nil, nil, ""
 	}
 	q.Windows = windows
 	winJSON := "[]"
@@ -567,6 +619,10 @@ func (h *Handler) clearCredentialCooldownWithAction(writer http.ResponseWriter, 
 		return
 	}
 	defer h.providerWrites.release()
+	if err := h.flushCoordinatorUnderProviderGate(request.Context()); err != nil {
+		writeCPAFacadeError(writer, err)
+		return
+	}
 	result, err := h.clearQuotaCooldown(request.Context(), client, authIndex, action, func(action, targetType, targetID, result string, details map[string]any) error {
 		return h.recordAudit(request, action, targetType, targetID, result, details)
 	})
@@ -574,6 +630,7 @@ func (h *Handler) clearCredentialCooldownWithAction(writer http.ResponseWriter, 
 		writeProviderWriteError(writer, err)
 		return
 	}
+	h.invalidateCoordinator("management-auth-files", "management-quota")
 	writeJSON(writer, 200, result)
 }
 
@@ -608,6 +665,10 @@ func (h *Handler) redeemCodexResetCredit(writer http.ResponseWriter, request *ht
 		return
 	}
 	defer h.providerWrites.release()
+	if err := h.flushCoordinatorUnderProviderGate(request.Context()); err != nil {
+		writeCPAFacadeError(writer, err)
+		return
+	}
 	result, err := h.redeemQuotaCredit(request.Context(), client, authIndex, func(action, targetType, targetID, result string, details map[string]any) error {
 		return h.recordAudit(request, action, targetType, targetID, result, details)
 	})
@@ -615,6 +676,7 @@ func (h *Handler) redeemCodexResetCredit(writer http.ResponseWriter, request *ht
 		writeProviderWriteError(writer, err)
 		return
 	}
+	h.invalidateCoordinator("management-auth-files", "management-quota")
 	writeJSON(writer, 200, result)
 }
 
@@ -722,7 +784,7 @@ func (h *Handler) getCredentialQuotaDetail(writer http.ResponseWriter, request *
 	lastAttempts := h.lastQuotaAttempts(ctx, []string{authIndex})
 	attempt := quotaAttemptOf(lastAttempts[authIndex])
 	quota.ApplyReadingHealth(&normalized, attempt, hasStoredReading, nowMS)
-	h.attachWindowCapacity(ctx, &normalized, nowMS)
+	h.attachQuotaForecasts(ctx, &normalized, nowMS)
 
 	var history []repository.QuotaSnapshotRecord
 	if h.repo != nil {
@@ -889,7 +951,7 @@ func (h *Handler) buildQuotaOverview(ctx context.Context, client *management.Cli
 		attempt := quotaAttemptOf(lastAttempts[authIndex])
 		_, hasStoredReading := latestSnapshots[authIndex]
 		quota.ApplyReadingHealth(&normalized, attempt, hasStoredReading, nowMS)
-		h.attachWindowCapacity(ctx, &normalized, nowMS)
+		h.attachQuotaForecasts(ctx, &normalized, nowMS)
 
 		hasPartialCooldown := !normalized.Disabled && len(normalized.ModelCooldowns) > 0
 		switch normalized.Status {

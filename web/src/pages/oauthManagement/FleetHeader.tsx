@@ -1,14 +1,25 @@
 import React from 'react';
 import clsx from 'clsx';
-import { Button, Dropdown, Popover, Segmented, Select, Space } from 'antd';
+import { Select } from '@/components/ui/select';
+import { ButtonGroup } from '@/components/ui/button-group';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Button } from '@/components/ui/button';
+import { DropdownCaret } from '@/components/ui/dropdown-caret';
+import { Segmented } from '@/components/ui/segmented';
 import { SearchInput } from '../../components/common/SearchInput';
 import { Tooltip } from '../../components/common/Tooltip';
 import {
   AppstoreOutlined,
   ArrowDownOutlined,
   ArrowUpOutlined,
-  CheckOutlined,
-  DownOutlined,
   FilterOutlined,
   ListOutlined,
   SwapOutlined,
@@ -36,7 +47,7 @@ const BUCKET_LABELS: Record<HealthBucket, MessageKey> = {
 function HealthFilter({ counts, isPending, lens, onLens }: Pick<FleetToolbarProps, 'counts' | 'isPending' | 'lens' | 'onLens'>) {
   const t = useT();
   return (
-    <div className={styles.health} role="group" aria-label={t('omc.fleet_health')} data-testid="oauth-health-filter">
+    <div className={clsx(styles.health, 'scroll-fade-x')} role="group" aria-label={t('omc.fleet_health')} data-testid="oauth-health-filter">
       {HEALTH_BUCKETS.map((bucket) => {
         const count = counts[bucket];
         const isActive = lens === bucket;
@@ -61,8 +72,6 @@ function HealthFilter({ counts, isPending, lens, onLens }: Pick<FleetToolbarProp
 }
 
 export interface FleetToolbarProps {
-  /** Leads the row: the selection of everything shown, and the provider switcher on a narrow screen. */
-  leading?: React.ReactNode;
   search: string;
   onSearch: (value: string) => void;
   counts: Record<HealthBucket, number>;
@@ -99,27 +108,43 @@ const SORTS: { key: OAuthWorkspaceSortKey; label: MessageKey; icon?: React.React
 ];
 
 /**
- * One row over the credentials in scope: find them, triage them by health, narrow and order them,
+ * The row over the credentials in scope: find them, triage them by health, narrow and order them,
  * choose how to look at them and refresh their quota. Only the search takes a label; the other
  * tools are glyphs that name themselves on hover.
+ *
+ * It is laid out on a grid of three areas rather than a wrapping row, so the parts land in the same
+ * place at every width: the search, the health verdicts and the tools side by side on a wide page;
+ * the search on a line of its own over the verdicts and the tools on a narrow one.
  */
 export function FleetToolbar({
-  leading, search, onSearch, counts, isPending, lens, onLens, status, quota, sort, isViewLoaded, onFilters, onSort, onReset, layout, onLayout, refresh,
+  search, onSearch, counts, isPending, lens, onLens, status, quota, sort, isViewLoaded, onFilters, onSort, onReset, layout, onLayout, refresh,
 }: FleetToolbarProps) {
   const t = useT();
   const filterCount = Number(status !== 'all') + Number(quota !== 'all');
   const sortLabel = t(SORTS.find((entry) => entry.key === sort)?.label ?? 'omc.sort_custom');
   return (
+    <div className={styles.frame}>
     <div className={styles.toolbar}>
-      {leading}
       <SearchInput className={styles.search} value={search} onChange={onSearch} label={t('af.search_ph')} />
       <HealthFilter counts={counts} isPending={isPending} lens={lens} onLens={onLens} />
-      <div className={styles.tools}>
-        <Popover
-          trigger="click"
-          placement="bottomRight"
-          arrow={false}
-          content={(
+      {/* What narrows and orders the list sits with the search; how it is drawn and refreshed, with
+          the verdicts. On a wide page the two groups read as one row of tools. */}
+      <div className={clsx(styles.tools, styles['query-tools'])}>
+        <Popover>
+          <PopoverTrigger
+            render={
+              <Button
+                className={clsx(styles['tool-button'], filterCount > 0 && styles['tool-active'])}
+                icon={<FilterOutlined />}
+                aria-label={t('events.more_filters')}
+                aria-controls="oauth-collection-filters"
+                data-testid="oauth-filter-toggle"
+              >
+                {filterCount > 0 && <span className={styles['tool-count']}>{filterCount}</span>}
+              </Button>
+            }
+          />
+          <PopoverContent placement="bottomRight">
             <div className={styles.filters} id="oauth-collection-filters">
               <label className={styles['filter-field']}>
                 <span className={styles['filter-label']}>{t('af.detail_status')}</span>
@@ -157,47 +182,38 @@ export function FleetToolbar({
                   ]}
                 />
               </label>
-              <Button size="small" type="text" disabled={!isViewLoaded} onClick={onReset} className={styles['filter-reset']}>
+              <Button size="sm" variant="ghost" disabled={!isViewLoaded} onClick={onReset} className={styles['filter-reset']}>
                 {t('omc.reset_filters')}
               </Button>
             </div>
-          )}
-        >
-          <Button
-            className={clsx(styles['tool-button'], filterCount > 0 && styles['tool-active'])}
-            icon={<FilterOutlined />}
-            aria-label={t('events.more_filters')}
-            aria-controls="oauth-collection-filters"
-            data-testid="oauth-filter-toggle"
-          >
-            {filterCount > 0 && <span className={styles['tool-count']}>{filterCount}</span>}
-          </Button>
+          </PopoverContent>
         </Popover>
-        <Dropdown
-          trigger={['click']}
-          disabled={!isViewLoaded}
-          menu={{
-            items: SORTS.map((entry) => ({
-              key: entry.key,
-              label: (
-                <span className={styles['sort-item']}>
-                  <span>{t(entry.label)}</span>
-                  {entry.key === sort && <CheckOutlined aria-hidden />}
-                </span>
-              ),
-            })),
-            onClick: ({ key }) => onSort(key as OAuthWorkspaceSortKey),
-          }}
-        >
-          <Tooltip title={`${t('af.sort_label')}: ${sortLabel}`}>
-            <Button
-              className={clsx(styles['tool-button'], sort !== 'custom' && styles['tool-active'])}
-              icon={<SwapOutlined rotate={90} />}
-              disabled={!isViewLoaded}
-              aria-label={`${t('af.sort_label')}: ${sortLabel}`}
-            />
-          </Tooltip>
-        </Dropdown>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            disabled={!isViewLoaded}
+            render={
+              <Tooltip title={`${t('af.sort_label')}: ${sortLabel}`}>
+                <Button
+                  className={clsx(styles['tool-button'], sort !== 'custom' && styles['tool-active'])}
+                  icon={<SwapOutlined rotate={90} />}
+                  disabled={!isViewLoaded}
+                  aria-label={`${t('af.sort_label')}: ${sortLabel}`}
+                />
+              </Tooltip>
+            }
+          />
+          <DropdownMenuContent placement="bottomRight">
+            <DropdownMenuRadioGroup value={sort} onValueChange={(next) => onSort(next as OAuthWorkspaceSortKey)}>
+              {SORTS.map((entry) => (
+                <DropdownMenuRadioItem key={entry.key} value={entry.key} icon={entry.icon}>
+                  {t(entry.label)}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
+      <div className={clsx(styles.tools, styles['view-tools'])}>
         <Segmented<OAuthWorkspaceLayout>
           className={styles.layout}
           value={layout}
@@ -209,7 +225,8 @@ export function FleetToolbar({
           data-testid="oauth-layout-toggle"
         />
         {/* The main segment refreshes what the workspace is showing; the caret offers the other scopes. */}
-        <Space.Compact>
+        <ButtonGroup>
+          {/* Fetching quota is a call to every provider in scope, so the button says what it does. */}
           <Tooltip title={t('omc.refresh_quota_count', { n: refresh.filtered })}>
             <Button
               icon={<SyncOutlined spin={refresh.isBusy} />}
@@ -217,24 +234,32 @@ export function FleetToolbar({
               onClick={() => refresh.onRefresh('filtered')}
               aria-label={t('omc.refresh_quota_count', { n: refresh.filtered })}
               data-testid="oauth-refresh-quota"
-            />
+            >
+              {t('quota.btn_refresh_quota')}
+            </Button>
           </Tooltip>
-          <Dropdown
-            trigger={['click']}
-            disabled={refresh.isDisabled}
-            menu={{
-              items: [
-                { key: 'page', label: t('omc.refresh_scope_page', { n: refresh.page }) },
-                { key: 'filtered', label: t('omc.refresh_scope_filtered', { n: refresh.filtered }) },
-                { key: 'all', label: t('omc.refresh_scope_all', { n: refresh.all }) },
-              ],
-              onClick: ({ key }) => refresh.onRefresh(key as 'page' | 'filtered' | 'all'),
-            }}
-          >
-            <Button className={styles.caret} icon={<DownOutlined />} disabled={refresh.isDisabled} aria-label={t('omc.fleet_refresh_scopes')} />
-          </Dropdown>
-        </Space.Compact>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              disabled={refresh.isDisabled}
+              render={
+                <Button className={styles.caret} data-split-caret="" icon={<DropdownCaret />} disabled={refresh.isDisabled} aria-label={t('omc.fleet_refresh_scopes')} />
+              }
+            />
+            <DropdownMenuContent placement="bottomRight">
+              <DropdownMenuItem onClick={() => refresh.onRefresh('page')}>
+                {t('omc.refresh_scope_page', { n: refresh.page })}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => refresh.onRefresh('filtered')}>
+                {t('omc.refresh_scope_filtered', { n: refresh.filtered })}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => refresh.onRefresh('all')}>
+                {t('omc.refresh_scope_all', { n: refresh.all })}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </ButtonGroup>
       </div>
+    </div>
     </div>
   );
 }

@@ -1,9 +1,7 @@
 import type { MessageKey } from '../../i18n/catalog';
 import { useTimeZone } from '../../utils/TimeZoneProvider';
 import React from 'react';
-import { Tooltip } from 'antd';
-import type { TooltipRef } from 'antd/es/tooltip';
-import { createPortal } from 'react-dom';
+import { TooltipContent, TooltipReadout, TooltipRoot } from '@/components/ui/tooltip';
 import { RightOutlined } from '../icons';
 import { ApiError } from '../../api/client';
 import { sharedResizeObserverHub } from '../../performance/resizeObserverHub';
@@ -66,7 +64,9 @@ const WEEKDAY_KEYS: readonly MessageKey[] = [
 const HEATMAP_SCROLL_END = 1_000_000;
 
 /** Quiet-stop weights of the legend's swatches, from an empty day to the window's busiest. */
-const HEATMAP_LEGEND_SHARES = ['100%', '75%', '50%', '25%', '0%'];
+/** Steps of the measured ramp; `dashboard.css` carries one `.is-q*` rule per step. */
+const HEATMAP_RAMP_STEPS = 20;
+const HEATMAP_LEGEND_STEPS = [20, 15, 10, 5, 0];
 
 /**
  * The panel's own refresh cadence.
@@ -131,33 +131,36 @@ export const HeatmapTooltipContent: React.FC<{
   const t = useT();
   const { style: tokenStyle } = useTokenDisplayStyle();
   const date = formatDay(day.day, lang, { year: 'numeric', month: 'long', day: 'numeric' });
-  // A day with nothing recorded says so in place of the two counts. Reporting "Requests 0 / Tokens 0"
-  // would be a measurement the panel cannot make - nothing is stored for that day, which is not the
-  // same claim as a day that carried no traffic - and the distinction is the one thing a reader
-  // comparing days needs to be able to see.
   const isRecorded = day.requests > 0 || day.tokens > 0;
+  const compactTokens = formatTokens(day.tokens, tokenStyle);
+  const exactTokens = formatTokensFull(day.tokens);
   return (
-    <dl className="heatmap-tip">
-      <div className="heatmap-tip-day">{date}</div>
-      {isRecorded ? (
-        <>
-          <div className="heatmap-tip-row">
-            <dt>{t('dash.heatmap.tip_requests')}</dt>
-            <dd>{full(day.requests)}</dd>
-          </div>
-          <div className="heatmap-tip-row">
-            <dt>{t('dash.heatmap.tip_tokens')}</dt>
-            <dd title={formatTokensFull(day.tokens)}>{formatTokens(day.tokens, tokenStyle)}</dd>
-          </div>
-          <Link className="heatmap-tip-link" to={href}>
+    <TooltipReadout
+      heading={date}
+      rows={
+        isRecorded
+          ? [
+              { name: t('dash.heatmap.tip_requests'), value: full(day.requests) },
+              {
+                name: t('dash.heatmap.tip_tokens'),
+                value: (
+                  <span data-tip={exactTokens !== compactTokens ? exactTokens : undefined}>
+                    {compactTokens}
+                  </span>
+                ),
+              },
+            ]
+          : [{ value: t('dash.heatmap.tip_no_requests') }]
+      }
+      footer={
+        isRecorded ? (
+          <Link className="heatmap-tip-link inline-flex items-center gap-1" to={href}>
             {t('dash.heatmap.open_requests')}
             <RightOutlined className="heatmap-tip-link-icon" />
           </Link>
-        </>
-      ) : (
-        <div className="heatmap-tip-empty">{t('dash.heatmap.tip_no_requests')}</div>
-      )}
-    </dl>
+        ) : undefined
+      }
+    />
   );
 };
 
@@ -178,17 +181,17 @@ const ActiveHeatmapTooltip: React.FC<{
   lang: Lang;
   onClose: () => void;
 }> = ({ target, entry, lang, onClose }) => {
-  const popupRef = React.useRef<TooltipRef>(null);
+  const popupRef = React.useRef<HTMLDivElement | null>(null);
   const popupId = React.useId();
   const { element, isOpen } = target;
 
   React.useLayoutEffect(() => {
     if (!isOpen) return;
     element.setAttribute('aria-describedby', popupId);
-    element.classList.add('ant-tooltip-open');
+    element.classList.add('omc-tooltip-open');
     return () => {
       element.removeAttribute('aria-describedby');
-      element.classList.remove('ant-tooltip-open');
+      element.classList.remove('omc-tooltip-open');
     };
   }, [element, isOpen, popupId, entry]);
 
@@ -196,12 +199,12 @@ const ActiveHeatmapTooltip: React.FC<{
     if (!isOpen) return;
     const dismissOutside = (event: PointerEvent) => {
       const node = event.target;
-      if (!(node instanceof Node) || element.contains(node) || popupRef.current?.popupElement?.contains(node)) return;
+      if (!(node instanceof Node) || element.contains(node) || popupRef.current?.contains(node)) return;
       onClose();
     };
     const dismissEscape = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (popupRef.current?.popupElement?.contains(document.activeElement)) element.focus({ preventScroll: true });
+      if (popupRef.current?.contains(document.activeElement)) element.focus({ preventScroll: true });
       onClose();
     };
     document.addEventListener('pointerdown', dismissOutside, true);
@@ -212,21 +215,22 @@ const ActiveHeatmapTooltip: React.FC<{
     };
   }, [element, isOpen, onClose]);
 
-  return createPortal(
-    <Tooltip
-      ref={popupRef}
-      id={popupId}
-      open={isOpen}
-      trigger={[]}
-      placement="top"
-      classNames={{ root: 'heatmap-tip-popper' }}
-      styles={{ container: { maxWidth: 'none' } }}
-      title={<HeatmapTooltipContent day={entry} lang={lang} href={heatmapDrillDown(entry)} />}
-      destroyOnHidden
-    >
-      <span className="heatmap-tooltip-anchor" aria-hidden="true" />
-    </Tooltip>,
-    element,
+  if (!isOpen) return null;
+
+  return (
+    <TooltipRoot open>
+      <TooltipContent
+        ref={popupRef}
+        id={popupId}
+        anchor={element}
+        side="top"
+        sideOffset={6}
+        interactive
+        className="min-w-[180px] max-w-none rounded-lg px-3 py-2"
+      >
+        <HeatmapTooltipContent day={entry} lang={lang} href={heatmapDrillDown(entry)} />
+      </TooltipContent>
+    </TooltipRoot>
   );
 };
 
@@ -469,6 +473,7 @@ export const TokenHeatmap: React.FC = React.memo(function TokenHeatmap() {
     return rows;
   }, [cells]);
 
+
   const classifyCell = React.useMemo(
     () => createHeatmapCellClassifier(data?.first_stored_ms ?? null, data?.as_of_ms ?? null),
     [data?.first_stored_ms, data?.as_of_ms, timezone],
@@ -504,43 +509,40 @@ export const TokenHeatmap: React.FC = React.memo(function TokenHeatmap() {
       // The continuous ramp: the weight of the quiet stop, as a percentage. A measured cell carries
       // it as a custom property and CSS mixes the two stops; every other state is drawn by its class
       // and gets no ramp at all, so "no traffic" can never be confused with a light measured shade.
-      const quietShare = state === 'measured'
-        ? `${Math.round((1 - heatmapRampPosition(entry?.tokens ?? 0, rampMax)) * 10000) / 100}%`
+      // Quantised to the ramp's twenty-one steps, which a reader cannot tell apart, so that cells
+      // of a step carry identical styles and the browser computes each step's colour once instead
+      // of once per cell (see `.heatmap-cell.is-q*`).
+      const quietStep = state === 'measured'
+        ? Math.round((1 - heatmapRampPosition(entry?.tokens ?? 0, rampMax)) * HEATMAP_RAMP_STEPS)
         : null;
-      // The visual square is an inner element, and the hover scale applies to *it* rather than to
-      // the cell, because the cell is what antd measures to place the tooltip: a transform on the
-      // anchor is a moving target, and the box would be placed against whichever rect existed when
-      // it was opened rather than the one on screen afterwards. The mark is `pointer-events: none`
-      // so the hover target stays the stationary cell.
       const node = (
         <div
           key={cell.day}
           data-day={cell.day}
           role="gridcell"
-          className={`heatmap-cell is-${state}${quietShare ? ' is-measured' : ''} is-interactive`}
-          // The ramp weight travels as a custom property rather than an inline `background`, which
-          // keeps the two stops in the stylesheet and the mixing in the browser's OKLCH.
-          style={{
-            gridColumn: cell.column + 1,
-            gridRow: cell.row + 1,
-            ...(quietShare ? { '--heatmap-quiet-share': quietShare } : {}),
-          } as React.CSSProperties}
+          className={`heatmap-cell is-${state}${quietStep === null ? '' : ` is-measured is-q${quietStep}`} is-interactive`}
           // Only interactive cells take a tab stop. A field where every cell were focusable would
           // put ~370 stops in the tab order, and one where a dead cell were focusable would make
           // the keyboard promise an interaction that cannot happen.
           tabIndex={cell.day === resolvedFocus ? 0 : -1}
           aria-label={label}
-        >
-          <span className="heatmap-cell-mark" aria-hidden="true" />
-        </div>
+        />
       );
       return node;
   }, [entries, rampMax, t, lang, resolvedFocus, classifyCell]);
 
   const cellRows = React.useMemo(
+    // A cell carries no inline style, so cells of one ramp step share one computed style: the row
+    // places its cells (`grid-row: inherit`) and the grid's flow gives each the next column. A
+    // column the row has no day for - the start of a partial week - is held by an inert gap.
     () => cellsByRow.map((row, index) => (
-      <div key={index} className="heatmap-row" role="row">
-        {row.map(renderCell)}
+      <div key={index} className="heatmap-row" role="row" style={{ gridRow: index + 1 }}>
+        {row.flatMap((cell, at) => {
+          const gap = cell.column - (at === 0 ? 0 : row[at - 1]!.column + 1);
+          return gap > 0
+            ? [<span key={`gap-${cell.day}`} className="heatmap-gap" aria-hidden="true" style={{ gridColumn: `span ${gap}` }} />, renderCell(cell)]
+            : [renderCell(cell)];
+        })}
       </div>
     )),
     [cellsByRow, renderCell],
@@ -657,12 +659,8 @@ export const TokenHeatmap: React.FC = React.memo(function TokenHeatmap() {
           <div className="heatmap-legend" aria-hidden="true">
             <span>{t('dash.heatmap.legend_less')}</span>
             <span className="heatmap-legend-scale">
-              {HEATMAP_LEGEND_SHARES.map((share) => (
-                <i
-                  key={share}
-                  className="heatmap-legend-swatch"
-                  style={{ '--heatmap-quiet-share': share } as React.CSSProperties}
-                />
+              {HEATMAP_LEGEND_STEPS.map((step) => (
+                <i key={step} className={`heatmap-legend-swatch is-q${step}`} />
               ))}
             </span>
             <span>{t('dash.heatmap.legend_more')}</span>

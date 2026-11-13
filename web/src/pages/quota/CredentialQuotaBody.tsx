@@ -1,6 +1,8 @@
 import { useTimeZone } from '../../utils/TimeZoneProvider';
+import clsx from 'clsx';
+import { MetaLine } from '../../components/common/MetaLine';
 import React from 'react';
-import { Button } from 'antd';
+import { Button } from '@/components/ui/button';
 import { CodeOutlined, SyncOutlined } from '../../components/icons';
 import { useT } from '../../i18n';
 import type { QuotaItem } from '../../types/quota';
@@ -111,12 +113,12 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
         <div className={styles['quota-tools']}>
           <span className={styles['card-meta-time']}>{formatObservedAgo(item.observed_at_ms, nowMS, t)}</span>
           {hasDiagnostics && (
-            <ToolButton size="small" type="text" icon={<CodeOutlined />} label={t('omc.quota_diagnostics')} onClick={() => setIsDiagnosticsOpen(true)} />
+            <ToolButton size="sm" variant="ghost" icon={<CodeOutlined />} label={t('omc.quota_diagnostics')} onClick={() => setIsDiagnosticsOpen(true)} />
           )}
           {onRefresh && (
             <ToolButton
-              size="small"
-              type="text"
+              size="sm"
+              variant="ghost"
               icon={<SyncOutlined spin={isRefreshing} />}
               label={t('quota.btn_refresh_quota')}
               disabled={item.disabled || isRefreshing || !item.capabilities?.refresh_supported}
@@ -163,11 +165,11 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
           </div>
           {onClearCooldown && (
             <Button
-              size="small"
+              size="sm"
               danger
               className={styles['callout-action']}
               disabled={isDemo || !item.capabilities?.clear_cooldown_supported}
-              title={isDemo ? t('demo.blocked') : undefined}
+              data-tip={isDemo ? t('demo.blocked') : undefined}
               onClick={() => onClearCooldown(item.auth_index)}
             >
               {t('quota.clear_cooldown')}
@@ -191,8 +193,8 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
             ))}
           </div>
           {!item.active_cooldown?.is_active && onClearCooldown && (
-            <Button size="small" danger className={styles['callout-action']} disabled={isDemo || !item.capabilities?.clear_cooldown_supported}
-              title={isDemo ? t('demo.blocked') : undefined}
+            <Button size="sm" danger className={styles['callout-action']} disabled={isDemo || !item.capabilities?.clear_cooldown_supported}
+              data-tip={isDemo ? t('demo.blocked') : undefined}
               onClick={() => onClearCooldown(item.auth_index)}>
               {t('quota.clear_all_cooldowns')}
             </Button>
@@ -222,12 +224,12 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
                   : formatTimeWithCountdown(item.plan.expires_at_ms, nowMS, t)}
               </span>
               {isSnapshotBound && (
-                <span className={styles['meta-tag']} title={t('quota.renewal_snapshot_hint')}>
+                <span className={styles['meta-tag']} data-tip={t('quota.renewal_snapshot_hint')}>
                   {t('quota.renewal_snapshot')}
                 </span>
               )}
               {item.plan.auto_renews === false && (
-                <span className={styles['meta-tag']} data-renewal-not-renewing="true" title={t('quota.renewal_not_renewing_hint')}>
+                <span className={styles['meta-tag']} data-renewal-not-renewing="true" data-tip={t('quota.renewal_not_renewing_hint')}>
                   {t('quota.renewal_not_renewing')}
                 </span>
               )}
@@ -257,7 +259,7 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
                 <span className={styles['meta-tag']}>{t('quota.extra_usage_user_disabled')}</span>
               )}
               {extraUsage.disabled_reason && (
-                <span className={styles['meta-tag']} title={t('quota.extra_usage_reason')}>{extraUsage.disabled_reason}</span>
+                <span className={styles['meta-tag']} data-tip={t('quota.extra_usage_reason')}>{extraUsage.disabled_reason}</span>
               )}
             </span>
           )}
@@ -291,13 +293,15 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
           <div className={styles['reset-list']}>
             {balances.map((balance) => (
               <div className={styles['reset-row']} key={balance.id}>
-                <span className={styles['meta-label']} title={balance.id}>
+                <span className={styles['meta-label']} data-tip={balance.id}>
                   {balance.id === 'iguana_necktie' ? t('quota.balance_cloud_session_credits') : balance.id}
                 </span>
-                <span className={styles['meta-value']}>
-                  {t('quota.balance_remaining', { amount: formatQuotaMoney(balance.remaining_usd) })}
-                  {` · ${t('quota.balance_spent', { used: formatQuotaMoney(balance.used_usd), limit: formatQuotaMoney(balance.limit_usd) })}`}
-                  {balance.reset_at_ms ? ` · ${formatTimeWithCountdown(balance.reset_at_ms, nowMS, t)}` : ''}
+                <span className={styles['balance-reading']}>
+                  <span className={styles['meta-value']}>{t('quota.balance_remaining', { amount: formatQuotaMoney(balance.remaining_usd) })}</span>
+                  <MetaLine className={styles['balance-detail']}>
+                    {t('quota.balance_spent', { used: formatQuotaMoney(balance.used_usd), limit: formatQuotaMoney(balance.limit_usd) })}
+                    {balance.reset_at_ms ? formatTimeWithCountdown(balance.reset_at_ms, nowMS, t) : ''}
+                  </MetaLine>
                 </span>
               </div>
             ))}
@@ -328,11 +332,12 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
           {item.last_refresh && (
             <div className={styles['diagnostic-line']}>
               <span className={styles['meta-label']}>{t('quota.last_refresh_at')}</span>
-              <span>
+              <MetaLine>
                 {formatObservedAgo(item.last_refresh.attempted_at_ms, nowMS, t)}
-                {' · '}
-                {t(item.last_refresh.outcome === 'failed' ? 'quota.last_refresh_outcome_failed' : 'quota.last_refresh_outcome_succeeded')}
-              </span>
+                <b className={item.last_refresh.outcome === 'failed' ? 'text-danger' : undefined}>
+                  {t(item.last_refresh.outcome === 'failed' ? 'quota.last_refresh_outcome_failed' : 'quota.last_refresh_outcome_succeeded')}
+                </b>
+              </MetaLine>
             </div>
           )}
           {Object.entries(rawSignals).map(([key, value]) => (
@@ -344,14 +349,16 @@ export const CredentialQuotaBody: React.FC<CredentialQuotaBodyProps> = ({
           {payloadSummary.map(([label, value], index) => (
             <div className={styles['diagnostic-line']} key={`payload-${index}`} data-quota-payload-line="true">
               <span className={styles['meta-label']}>{label}</span>
-              <span className="mono-num">{value}</span>
+              <span className={clsx('mono-num', styles['diagnostic-values'])}>{value}</span>
             </div>
           ))}
           {Object.entries(item.model_quotas ?? {}).map(([model, observation]) => (
             <div className={styles['diagnostic-line']} key={`model-${model}`}>
               <span className={styles['meta-label']}>{model}</span>
-              <span className="mono-num">
-                {Object.entries(observation.signals ?? {}).map(([key, value]) => `${key}: ${value}`).join(' · ') || '—'}
+              <span className={clsx('mono-num', styles['diagnostic-values'])}>
+                {Object.entries(observation.signals ?? {}).length === 0
+                  ? '—'
+                  : Object.entries(observation.signals ?? {}).map(([key, value]) => <span key={key}>{key}: {value}</span>)}
               </span>
             </div>
           ))}

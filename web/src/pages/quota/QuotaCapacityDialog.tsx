@@ -1,20 +1,29 @@
 import React from 'react';
+import { MetaLine } from '../../components/common/MetaLine';
 import { useQuery } from '@tanstack/react-query';
+import { Segmented } from '@/components/ui/segmented';
+import { Select } from '@/components/ui/select';
 import { api } from '../../api/client';
 import { AppModal } from '../../components/common/AppModal';
 import { Meter } from '../../components/common/Meter';
 import { PanelTitle } from '../../components/common/PanelTitle';
 import { Tag } from '../../components/common/Tag';
+import { RollingNumber } from '../../components/dashboard/RollingNumber';
 import { HistoryOutlined, HourglassOutlined, InfoCircleOutlined, InsightsOutlined } from '../../components/icons';
 import { useT } from '../../i18n';
-import { formatTokens, type TokenNumberStyle } from '../../types/tokenDisplay';
+import { cacheScaleMix } from '../../theme/cacheScale';
 import { useTokenDisplayStyle } from '../../types/tokenDisplayContext';
-import { formatUsd } from '../../types/pricingDisplay';
-import type { QuotaCapacityCycle, QuotaWindow } from '../../types/quota';
+import type { QuotaCapacityCycle, QuotaModelForecast, QuotaWindow } from '../../types/quota';
+import type { RollingReadout } from '../../types/rollingNumber';
 import { formatShortDateTime } from './quotaFormat';
-import { describeQuotaCapacity, formatEstimatedUsd } from './quotaCapacity';
+import {
+  type CycleCardFigures,
+  describeForecastCard,
+  quotaForecastNote,
+  formatCycleCardFigures,
+} from './quotaCapacity';
 import type { QuotaCapacityOwner } from './QuotaCapacityButton';
-import { quotaWindowGroupName, quotaWindowName } from './quotaWindowSelection';
+import { quotaWindowGroupName, quotaWindowName, siblingCapacityWindows } from './quotaWindowSelection';
 import styles from './QuotaCapacityDialog.module.css';
 
 export interface QuotaCapacityDialogProps {
@@ -22,42 +31,61 @@ export interface QuotaCapacityDialogProps {
   onClose: () => void;
   owner: QuotaCapacityOwner;
   window: QuotaWindow;
+  windows?: readonly QuotaWindow[];
 }
 
-/** A dollar figure needs nearly every request priced; the server applies the same rule. */
-const MIN_PRICED_SHARE = 0.95;
-
-/** One card's figures, already formatted; null where the reading has none. */
-interface CardFigures {
-  cost: string | null;
-  requests: string | null;
-  tokens: string | null;
-}
-
-const EMPTY_FIGURES: CardFigures = { cost: null, requests: null, tokens: null };
-
-/**
- * Three cards of one build: what the last window used, what this one has used so far, and what
- * this window holds in all. Cost, requests and tokens sit at the same height in each, so every
- * figure is read against its neighbours.
- */
-export default function QuotaCapacityDialog({ open, onClose, owner, window }: QuotaCapacityDialogProps) {
+/** Recorded consumption and model-conditioned remaining work share one window selector. */
+export default function QuotaCapacityDialog({ open, onClose, owner, window, windows }: QuotaCapacityDialogProps) {
   const t = useT();
   const { style: tokenStyle } = useTokenDisplayStyle();
+  const siblingWindows = React.useMemo(() => siblingCapacityWindows(window, windows), [window, windows]);
+  const [selectedWindowId, setSelectedWindowId] = React.useState(window.id);
+  const [selectedModel, setSelectedModel] = React.useState<string | null>(null);
+  const [prevTrigger, setPrevTrigger] = React.useState({ open, windowId: window.id });
+  if (prevTrigger.open !== open || prevTrigger.windowId !== window.id) {
+    const openedFresh = open && !prevTrigger.open;
+    const triggerChanged = prevTrigger.windowId !== window.id;
+    setPrevTrigger({ open, windowId: window.id });
+    if (openedFresh || triggerChanged) {
+      setSelectedWindowId(window.id);
+      if (openedFresh) setSelectedModel(null);
+    }
+  }
+
+  const activeWindow = siblingWindows.find((candidate) => candidate.id === selectedWindowId) ?? window;
+
   const history = useQuery({
-    queryKey: ['quota-capacity', owner.authIndex, window.id],
-    queryFn: () => api.getQuotaCapacityHistory(owner.authIndex, window.id),
+    queryKey: ['quota-capacity', owner.authIndex, activeWindow.id],
+    queryFn: () => api.getQuotaCapacityHistory(owner.authIndex, activeWindow.id),
     enabled: open,
     staleTime: 30_000,
   });
-  const used = window.used_percent ?? (window.remaining_percent == null ? undefined : 100 - window.remaining_percent);
-  // The window itself carries this cycle's usage; the history read adds the cycle before it.
+
+  const used = activeWindow.used_percent
+    ?? (activeWindow.remaining_percent == null ? undefined : 100 - activeWindow.remaining_percent);
   const current: QuotaCapacityCycle | null = history.data?.current
-    ?? (window.usage && window.reset_at_ms ? { from_ms: window.usage.from_ms, reset_at_ms: window.reset_at_ms, used_percent: used, usage: window.usage } : null);
+    ?? (activeWindow.usage && activeWindow.reset_at_ms
+      ? { from_ms: activeWindow.usage.from_ms, reset_at_ms: activeWindow.reset_at_ms, used_percent: used, usage: activeWindow.usage }
+      : null);
   const previous = history.data?.previous ?? null;
-  const { capacity } = window;
-  const pendingNote = capacity ? null : describeQuotaCapacity(window, tokenStyle, t)?.note;
-  const group = quotaWindowGroupName(window);
+  const currentUsed = current?.used_percent ?? used;
+  const group = quotaWindowGroupName(activeWindow);
+  const modelOptions = React.useMemo<QuotaModelForecast[]>(() => {
+    if (history.isError) return [];
+    return history.data ? history.data.model_forecasts ?? [] : activeWindow.model_forecasts ?? [];
+  }, [history.isError, history.data, activeWindow.model_forecasts]);
+  const activeForecast = modelOptions.find((option) => forecastKey(option) === selectedModel) ?? modelOptions[0] ?? null;
+  const pendingNote = quotaForecastNote(history.isError ? 'usage_unavailable' : history.data?.forecast_unavailable ?? activeWindow.forecast_unavailable, t);
+  const forecastFigures = describeForecastCard(activeForecast, tokenStyle, t);
+  const untilText = activeWindow.reset_at_ms
+    ? t('quota.capacity_until', { when: formatShortDateTime(activeWindow.reset_at_ms) })
+    : null;
+  const forecastCaption = activeForecast ? (activeForecast.service_tier ? `${activeForecast.model} (${activeForecast.service_tier})` : activeForecast.model) : untilText ?? '\u00a0';
+
+  const selectOptions = React.useMemo(
+    () => modelOptions.map((option) => ({ value: forecastKey(option), label: option.service_tier ? `${option.model} (${option.service_tier})` : option.model })),
+    [modelOptions],
+  );
 
   return (
     <AppModal
@@ -68,19 +96,37 @@ export default function QuotaCapacityDialog({ open, onClose, owner, window }: Qu
       title={(
         <span className={styles['dialog-title']}>
           {owner.mark && <span className={styles['mark-tile']} aria-hidden="true">{owner.mark}</span>}
-          <span className={styles['title-text']}>{t('quota.capacity_dialog_title', { window: quotaWindowName(window, t) })}</span>
+          <span className={styles['title-text']}>
+            {t('quota.capacity_dialog_title', { window: quotaWindowName(activeWindow, t) })}
+          </span>
         </span>
       )}
-      description={group ? `${owner.credentialName} · ${group}` : owner.credentialName}
+      description={group ? <MetaLine>{owner.credentialName}{group}</MetaLine> : owner.credentialName}
     >
-      <div className={styles.cards} data-quota-capacity-dialog={window.id}>
+      {siblingWindows.length > 1 && (
+        <div className={styles['cycle-bar']} data-quota-capacity-toolbar="">
+          <Segmented
+            size="sm"
+            className={styles['window-switch']}
+            aria-label={t('quota.capacity_window_switch')}
+            value={activeWindow.id}
+            onChange={setSelectedWindowId}
+            options={siblingWindows.map((candidate) => ({
+              value: candidate.id,
+              label: quotaWindowName(candidate, t),
+            }))}
+          />
+        </div>
+      )}
+
+      <div className={styles.cards} data-quota-capacity-dialog={activeWindow.id}>
         <Card
           icon={<HistoryOutlined />}
           title={t('quota.capacity_previous_window')}
           caption={previous
             ? cycleSpan(previous)
             : t(history.isError ? 'quota.capacity_reason_history_unavailable' : 'quota.capacity_no_previous')}
-          figures={previous ? usageFigures(previous, tokenStyle) : EMPTY_FIGURES}
+          figures={formatCycleCardFigures(previous, tokenStyle, t)}
           isEmpty={!previous}
           isPending={history.isPending}
           foot={<UsedShare usedPercent={previous?.used_percent} />}
@@ -89,31 +135,41 @@ export default function QuotaCapacityDialog({ open, onClose, owner, window }: Qu
           icon={<HourglassOutlined />}
           title={t('quota.capacity_current_window')}
           caption={current ? cycleSpan(current) : t('quota.capacity_reason_no_traffic')}
-          figures={current ? usageFigures(current, tokenStyle) : EMPTY_FIGURES}
+          figures={formatCycleCardFigures(current, tokenStyle, t)}
           isEmpty={!current}
-          foot={<UsedShare usedPercent={current?.used_percent ?? used} />}
+          foot={<UsedShare usedPercent={currentUsed} />}
         />
         <Card
           tone="forecast"
           icon={<InsightsOutlined />}
           title={t('quota.capacity_forecast_window')}
-          caption={window.reset_at_ms ? t('quota.capacity_until', { when: formatShortDateTime(window.reset_at_ms) }) : ' '}
-          figures={capacity ? {
-            cost: capacity.cost_nanos == null ? null : `≈ ${formatEstimatedUsd(capacity.cost_nanos / 1e9, capacity.error_percent)}`,
-            requests: `≈ ${Math.round(capacity.requests).toLocaleString()}`,
-            tokens: `≈ ${formatTokens(capacity.tokens, tokenStyle)}`,
-          } : EMPTY_FIGURES}
-          isEmpty={!capacity}
+          caption={forecastCaption}
+          captionSlot={modelOptions.length > 1 && activeForecast ? (
+            <Select
+              size="sm"
+              variant="borderless"
+              className={styles['model-select']}
+              popupMatchSelectWidth={false}
+              aria-label={t('quota.capacity_select_model')}
+              data-testid="quota-capacity-model-select"
+              value={forecastKey(activeForecast)}
+              onChange={(next) => { if (next) setSelectedModel(next); }}
+              options={selectOptions}
+            />
+          ) : undefined}
+          figures={forecastFigures}
+          isEmpty={!activeForecast}
           foot={(
             <>
-              {capacity
-                ? <span className={styles['foot-text']} title={t('quota.capacity_error_hint')}>{t('quota.capacity_margin', { n: Math.max(1, Math.round(capacity.error_percent)) })}</span>
-                : <span className={styles['foot-text']}>{pendingNote ?? t('quota.capacity_reason_low_usage')}</span>}
+              {!activeForecast && (
+                <span className={styles['foot-text']}>{pendingNote ?? t('quota.capacity_reason_low_usage')}</span>
+              )}
               <Tag tone="accent" size="small" className={styles['foot-tag']}>{t('quota.capacity_forecast_tag')}</Tag>
             </>
           )}
         />
       </div>
+
       <div className={styles.note}>
         <InfoCircleOutlined className={styles['note-glyph']} />
         <span>{t('quota.capacity_hint')}</span>
@@ -122,31 +178,26 @@ export default function QuotaCapacityDialog({ open, onClose, owner, window }: Qu
   );
 }
 
+function forecastKey(forecast: QuotaModelForecast): string {
+  return JSON.stringify([forecast.model, forecast.service_tier ?? '']);
+}
+
 function cycleSpan(cycle: QuotaCapacityCycle): string {
   return `${formatShortDateTime(cycle.from_ms)} – ${formatShortDateTime(cycle.reset_at_ms)}`;
 }
 
-function usageFigures(cycle: QuotaCapacityCycle, tokenStyle: TokenNumberStyle): CardFigures {
-  const usage = cycle.usage;
-  if (!usage) return EMPTY_FIGURES;
-  return {
-    cost: usage.requests > 0 && usage.priced_requests >= usage.requests * MIN_PRICED_SHARE ? formatUsd(usage.cost_nanos / 1e9) : null,
-    requests: usage.requests.toLocaleString(),
-    tokens: formatTokens(usage.tokens, tokenStyle),
-  };
-}
-
 /**
- * One window's card: a PanelTitle head with its span over a rule, the cost large, requests and
- * tokens as ruled rows, and a foot. A card without a reading keeps every row with a dash for each
- * figure, so the three still line up and the empty one reads as "nothing yet" rather than a gap.
+ * Consumption cards lead with recorded API-equivalent cost; the forecast leads with
+ * remaining available cost. A card without a reading keeps every row with a dash for
+ * each figure, so the three still line up across the subgrid.
  */
-function Card({ tone, icon, title, caption, figures, isEmpty, isPending = false, foot }: {
+function Card({ tone, icon, title, caption, captionSlot, figures, isEmpty, isPending = false, foot }: {
   tone?: 'forecast';
   icon: React.ReactNode;
   title: string;
   caption: string;
-  figures: CardFigures;
+  captionSlot?: React.ReactNode;
+  figures: CycleCardFigures;
   isEmpty: boolean;
   isPending?: boolean;
   foot: React.ReactNode;
@@ -156,24 +207,55 @@ function Card({ tone, icon, title, caption, figures, isEmpty, isPending = false,
     <section className={styles.card} data-tone={tone} data-empty={isEmpty || undefined} aria-label={title} aria-busy={isPending || undefined}>
       <header className={styles.head}>
         <PanelTitle icon={icon}>{title}</PanelTitle>
-        <span className={styles.caption} title={caption}>{isPending ? '…' : caption}</span>
+        {captionSlot ?? (
+          <span className={styles.caption} data-tip={caption} data-tip-overflow="">
+            {isPending ? '…' : caption}
+          </span>
+        )}
       </header>
       <div className={styles.lead}>
-        <span className={styles.label}>{t('quota.capacity_spent')}</span>
-        <span className={styles['lead-value']}>{figures.cost ?? '—'}</span>
+        <span className={styles.label}>{t(tone === 'forecast' ? 'quota.capacity_available_amount' : 'quota.capacity_spent')}</span>
+        <span className={styles['lead-value']} data-tip={figures.costHint ?? undefined}>
+          <FigureValue readout={figures.costReadout} fallback={figures.cost} />
+        </span>
       </div>
       <dl className={styles.rows}>
         <div className={styles.row}>
           <dt>{t('quota.capacity_requests')}</dt>
-          <dd>{figures.requests ?? '—'}</dd>
+          <dd><FigureValue readout={figures.requestsReadout} fallback={figures.requests} /></dd>
         </div>
         <div className={styles.row}>
           <dt>{t('quota.capacity_tokens_label')}</dt>
-          <dd>{figures.tokens ?? '—'}</dd>
+          <dd><FigureValue readout={figures.tokensReadout} fallback={figures.tokens} /></dd>
+        </div>
+        <div className={styles.row}>
+          <dt>{t('quota.capacity_cache_rate')}</dt>
+          <dd><CacheRateValue rate={figures.cacheRate} readout={figures.cacheRateReadout} /></dd>
         </div>
       </dl>
       <footer className={styles.foot}>{foot}</footer>
     </section>
+  );
+}
+
+function FigureValue({ readout, fallback }: { readout?: RollingReadout; fallback: string | null }) {
+  if (readout) return <RollingNumber readout={readout} />;
+  return <>{fallback ?? '—'}</>;
+}
+
+function CacheRateValue({ rate, readout }: { rate: number | undefined; readout?: RollingReadout }) {
+  if (rate == null || !Number.isFinite(rate)) return <>—</>;
+  const mix = cacheScaleMix(rate);
+  const dotStyle = {
+    '--cache-rate-from': mix.from,
+    '--cache-rate-to': mix.to,
+    '--cache-rate-from-share': mix.fromShare,
+  } as React.CSSProperties;
+  return (
+    <span className={styles['cache-value']}>
+      <span className={styles['cache-dot']} style={dotStyle} aria-hidden="true" />
+      <RollingNumber readout={readout} />
+    </span>
   );
 }
 
@@ -182,8 +264,10 @@ function UsedShare({ usedPercent }: { usedPercent: number | undefined }) {
   const share = usedPercent == null ? null : Math.round(Math.min(Math.max(usedPercent, 0), 100));
   return (
     <>
-      <Meter className={styles.meter} value={share ?? 0} />
-      <span className={styles['foot-figure']}>{share == null ? '—' : t('quota.capacity_used_share', { n: share })}</span>
+      {share != null && <Meter className={styles.meter} value={share} label={t('quota.capacity_used_share', { n: share })} />}
+      <span className={styles['foot-figure']}>
+        {share == null ? '—' : t('quota.capacity_used_share', { n: share })}
+      </span>
     </>
   );
 }

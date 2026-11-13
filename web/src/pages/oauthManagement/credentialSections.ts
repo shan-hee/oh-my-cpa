@@ -1,8 +1,8 @@
 import { applyKeyOrder } from '../../types/displayOrder';
-import type { MessageKey } from '../../i18n/catalog';
+import type { MessageKey, TFunc } from '../../i18n/catalog';
 import { PRIMARY_CREDENTIAL_PROVIDERS } from '../../types/credentialProviders';
 import type { QuotaWindow } from '../../types/quota';
-import { orderQuotaWindows, quotaWindowGroupKey, quotaWindowKindOf } from '../quota/quotaWindowSelection';
+import { orderQuotaWindows, quotaWindowGroupKey, quotaWindowKindOf, quotaWindowParts } from '../quota/quotaWindowSelection';
 import type { OAuthWorkspaceRecord } from './oauthWorkspaceLogic';
 
 /**
@@ -34,6 +34,8 @@ export interface QuotaLineCell {
   slot?: QuotaSlot;
   /** The line's only limit, drawn across both columns. */
   spans: boolean;
+  /** Distinguishes separate allowances that share a group and period. */
+  allowanceName?: string;
 }
 
 /** One family of a credential's limits: its short limit and its long one, side by side. */
@@ -43,6 +45,26 @@ export interface QuotaLine {
   /** The group's, model's or allowance's own name; the plan and the code-review allowance are named by the console. */
   label?: string;
   cells: QuotaLineCell[];
+}
+
+const PERIOD_KEYS: Record<QuotaPeriod, MessageKey> = {
+  five_hour: 'quota.slot_five_hour', daily: 'quota.slot_daily', weekly: 'quota.slot_weekly', monthly: 'quota.slot_monthly',
+};
+
+function lineTitle(line: QuotaLine, t: TFunc): string {
+  if (line.label) return line.label;
+  return t(line.scope === 'code_review' ? 'omc.quota_family_code_review' : 'omc.quota_family_plan');
+}
+
+/** The plan's limits are named by their period; any other by its period and name, or its name alone. */
+export function quotaReadingName(line: QuotaLine, cell: QuotaLineCell, t: TFunc): string {
+  const kind = periodOf(cell.window);
+  const period = kind ? t(PERIOD_KEYS[kind]) : undefined;
+  if (line.scope === 'standard' && !line.label) return period ?? cell.window.label;
+  const family = line.scope === 'group' ? groupLabel(cell.window) : lineTitle(line, t);
+  const name = period ? t('omc.quota_reading_name', { family, period }) : family;
+  const allowance = line.scope === 'group' ? cell.allowanceName ?? (!period ? columnLabel(cell.window) : undefined) : undefined;
+  return allowance && allowance !== family ? t('omc.quota_allowance_name', { name, allowance }) : name;
 }
 
 export interface CredentialSection {
@@ -61,9 +83,9 @@ function periodOf(window: QuotaWindow): QuotaPeriod | undefined {
   return kind === 'five_hour' || kind === 'daily' || kind === 'weekly' || kind === 'monthly' ? kind : undefined;
 }
 
-/** "Gemini Models · Weekly Limit" is the group "Gemini"; "Gemini 4 Argon" keeps its whole name. */
+/** The group "Gemini Models" reads as "Gemini"; "Gemini 4 Argon" keeps its whole name. */
 function groupLabel(window: QuotaWindow): string {
-  const group = window.label.split(' · ')[0].trim();
+  const group = quotaWindowParts(window).group ?? window.label;
   return group.replace(/\s+models$/i, '') || group;
 }
 
@@ -79,10 +101,9 @@ function familyLabel(window: QuotaWindow): string | undefined {
   return undefined;
 }
 
-/** What a column says when its period has no name: the window's label without its group prefix. */
+/** What a column says when its period has no name: the window's own name without its group. */
 function columnLabel(window: QuotaWindow): string {
-  const parts = window.label.split(' · ');
-  return (parts.length > 1 ? parts.slice(1).join(' · ') : window.label).trim();
+  return quotaWindowParts(window).name;
 }
 
 /** The family part of a cell key: "group:Gemini Models|five_hour" belongs to "group:Gemini Models". */
@@ -150,6 +171,7 @@ function slotOf(window: QuotaWindow): QuotaSlot | undefined {
  */
 export function quotaLinesOf(record: OAuthWorkspaceRecord, provider = record.displayProvider): QuotaLine[] {
   const families = new Map<string, { line: QuotaLine; short?: QuotaLineCell; long?: QuotaLineCell; extras: QuotaLine[] }>();
+  const groupPeriods = new Map<string, QuotaLineCell[]>();
   for (const [key, window] of listedCellsOf(record, provider)) {
     const familyKey = familyKeyOfCell(key);
     let family = families.get(familyKey);
@@ -158,11 +180,25 @@ export function quotaLinesOf(record: OAuthWorkspaceRecord, provider = record.dis
       families.set(familyKey, family);
     }
     const slot = slotOf(window);
+    const cell: QuotaLineCell = { key, window, slot, spans: false };
+    const period = periodOf(window);
+    if (window.scope === 'group' && period) {
+      const periodKey = `${familyKey}|${period}`;
+      const siblings = groupPeriods.get(periodKey) ?? [];
+      siblings.push(cell);
+      groupPeriods.set(periodKey, siblings);
+    }
     if (slot && !family[slot]) {
-      family[slot] = { key, window, slot, spans: false };
+      family[slot] = cell;
     } else {
-      const label = slot ? modelLabel(window) : columnLabel(window);
-      family.extras.push({ key, scope: window.scope, label, cells: [{ key, window, slot, spans: true }] });
+      const label = window.scope === 'group' ? groupLabel(window) : slot ? modelLabel(window) : columnLabel(window);
+      cell.spans = true;
+      family.extras.push({ key, scope: window.scope, label, cells: [cell] });
+    }
+  }
+  for (const siblings of groupPeriods.values()) {
+    if (siblings.length > 1) {
+      for (const cell of siblings) cell.allowanceName = columnLabel(cell.window);
     }
   }
   const lines: QuotaLine[] = [];

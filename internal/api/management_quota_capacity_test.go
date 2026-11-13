@@ -6,22 +6,51 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/oh-my-cpa/oh-my-cpa/internal/crypto"
 	"github.com/oh-my-cpa/oh-my-cpa/internal/domain"
 	"github.com/oh-my-cpa/oh-my-cpa/internal/quota"
+	"github.com/oh-my-cpa/oh-my-cpa/internal/repository"
 )
 
 func capacityTestHandler(t *testing.T) *Handler {
 	t.Helper()
+	const managementKey = "management-secret"
+	cpaServer := newFakeCPA(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+managementKey {
+			writer.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/v8/management/credentials":
+			_, _ = writer.Write([]byte(`{"files":[{"id":"f-1","name":"codex-1.json","auth_index":"codex-1","type":"codex","provider":"codex"}]}`))
+		case "/v8/management/config/oauth/model-alias":
+			_, _ = writer.Write([]byte(`{}`))
+		default:
+			writer.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(cpaServer.Close)
 	handler := testHandler(t, "")
+	cipher, err := crypto.New("01234567890123456789012345678901")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, nonce, err := cipher.Encrypt([]byte(managementKey))
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
 	if err := handler.repo.UpsertInstance(context.Background(), domain.CPAInstance{
-		ID: "default", Name: "Default", BaseURL: "http://127.0.0.1:8317", UsageAddr: "127.0.0.1:8317",
-		ManagementKeyCiphertext: []byte{0}, ManagementKeyNonce: []byte{0}, CreatedAt: now, UpdatedAt: now,
+		ID: "default", Name: "Default", BaseURL: cpaServer.URL, UsageAddr: "127.0.0.1:8317",
+		ManagementKeyCiphertext: ciphertext, ManagementKeyNonce: nonce, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,171 +87,8 @@ func observeCapacity(t *testing.T, handler *Handler, reading *quota.NormalizedQu
 	if err := handler.persistNormalizedQuotaSnapshot(context.Background(), reading); err != nil {
 		t.Fatal(err)
 	}
-	handler.attachWindowCapacity(context.Background(), reading, nowMS)
+	handler.attachQuotaForecasts(context.Background(), reading, nowMS)
 	return reading.Windows[0]
-}
-
-func TestAttachWindowCapacity(t *testing.T) {
-	handler := capacityTestHandler(t)
-	ctx := context.Background()
-	nowMS := time.Now().UnixMilli()
-	resetAtMS := nowMS + 2*3600*1000
-	cycleStartMS := resetAtMS - 5*3600*1000
-	observedAtMS := nowMS - 60_000
-
-	insertCapacityUsage(t, handler, "previous-cycle", cycleStartMS-1, 9_000_000, 9_000_000_000)
-	insertCapacityUsage(t, handler, "in-cycle-1", cycleStartMS, 300_000, 400_000_000)
-	insertCapacityUsage(t, handler, "in-cycle-2", observedAtMS-1, 200_000, 600_000_000)
-	insertCapacityUsage(t, handler, "failed", observedAtMS-1, 0, nil)
-	insertCapacityUsage(t, handler, "after-observation", observedAtMS, 5_000_000, 5_000_000_000)
-	// Started before the reading but finished after it: upstream meters it later.
-	insertCapacityUsage(t, handler, "in-flight", observedAtMS-2000, 1_000_000, 1_000_000_000)
-	if _, err := handler.repo.SQL().ExecContext(ctx, `UPDATE usage_events SET latency_ms = 5000 WHERE event_key = 'in-flight'`); err != nil {
-		t.Fatal(err)
-	}
-
-	reading := capacityReading(observedAtMS, resetAtMS, 5, 20)
-	shared := reading.Windows
-	window := observeCapacity(t, handler, reading, nowMS)
-	if window.Usage == nil || window.Usage.Requests != 2 || window.Usage.Tokens != 500_000 || window.Usage.CostNanos != 1_000_000_000 {
-		t.Fatalf("usage = %+v, want the two finished requests between the cycle start and the reading", window.Usage)
-	}
-	if window.Usage.FromMS != cycleStartMS || window.Usage.ToMS != observedAtMS {
-		t.Fatalf("usage range = [%d, %d), want [%d, %d)", window.Usage.FromMS, window.Usage.ToMS, cycleStartMS, observedAtMS)
-	}
-	capacity := window.Capacity
-	if capacity == nil || capacity.Basis != "current_cycle" || capacity.Tokens != 2_500_000 || capacity.CostNanos == nil || *capacity.CostNanos != 5_000_000_000 {
-		t.Fatalf("capacity = %+v, want the cycle's usage scaled by 100/20", capacity)
-	}
-	if capacity.RemainingTokens == nil || *capacity.RemainingTokens != 2_000_000 || capacity.ErrorPercent != 2.6 {
-		t.Fatalf("capacity = %+v, want 80%% remaining and the rounding of one reading", capacity)
-	}
-
-	// A feature-scoped window has no metered model mapping and carries neither a
-	// usage figure nor a reason: the estimate does not apply to it at all.
-	if scoped := reading.Windows[1]; scoped.Usage != nil || scoped.Capacity != nil || scoped.CapacityUnavailable != "" {
-		t.Fatalf("feature-scoped window = %+v, want it left untouched", scoped)
-	}
-	// A failed refresh shares its windows with the prior observation, and a
-	// snapshot is marshalled from that slice.
-	if shared[0].Usage != nil || shared[0].Capacity != nil {
-		t.Fatal("the caller's window slice was edited in place")
-	}
-	latest, err := handler.repo.GetLatestQuotaSnapshots(ctx, []string{"codex-1"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var stored []quota.QuotaWindow
-	if err := json.Unmarshal([]byte(latest["codex-1"].WindowsJSON), &stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored[0].Usage != nil || stored[0].Capacity != nil || stored[0].CapacityUnavailable != "" {
-		t.Fatalf("a read-time join was stored: %+v", stored[0])
-	}
-
-	// A refresh that failed keeps the dated estimate but states nothing as left.
-	stale := capacityReading(observedAtMS, resetAtMS, 5, 20)
-	stale.Status = "stale"
-	handler.attachWindowCapacity(ctx, stale, nowMS)
-	if capacity := stale.Windows[0].Capacity; capacity == nil || capacity.Tokens != 2_500_000 || capacity.RemainingTokens != nil {
-		t.Fatalf("stale window = %+v, want the dated capacity without a remaining amount", stale.Windows[0])
-	}
-}
-
-// The reported symptom: a credential that was exhausted and then served nothing
-// must keep one estimate for days - through idle refreshes, snapshot and request
-// record retention, and the reset into an unused cycle.
-func TestWindowCapacityIdleEstimateIsStable(t *testing.T) {
-	handler := capacityTestHandler(t)
-	ctx := context.Background()
-	const hour = int64(3600 * 1000)
-	cycleStart := time.Now().UnixMilli() - 6*24*hour
-	resetAtMS := cycleStart + 168*hour
-
-	for step, percent := range []float64{10, 40, 100} {
-		observedAtMS := cycleStart + int64(step+1)*2*hour
-		insertCapacityUsage(t, handler, fmt.Sprintf("burst-%d", step), observedAtMS-hour, 1_000_000, 7_000_000_000)
-		observeCapacity(t, handler, capacityReading(observedAtMS, resetAtMS, 168, percent), observedAtMS)
-	}
-	exhaustedAt := cycleStart + 7*hour
-	first := observeCapacity(t, handler, capacityReading(exhaustedAt, resetAtMS, 168, 100), exhaustedAt).Capacity
-	if first == nil || first.CostNanos == nil || *first.CostNanos != 21_000_000_000 || first.Tokens != 3_000_000 {
-		t.Fatalf("estimate at exhaustion = %+v, want the cycle's 3M tokens and $21", first)
-	}
-	for step := 1; step <= 96; step++ {
-		observedAtMS := exhaustedAt + int64(step)*hour/2
-		got := observeCapacity(t, handler, capacityReading(observedAtMS, resetAtMS, 168, 100), observedAtMS).Capacity
-		if got == nil || got.Tokens != first.Tokens || *got.CostNanos != *first.CostNanos {
-			t.Fatalf("idle refresh %d moved the estimate: %+v, want %+v", step, got, first)
-		}
-	}
-	// Request records aged out and snapshots trimmed leave the evidence intact.
-	if _, err := handler.repo.SQL().ExecContext(ctx, `DELETE FROM usage_events; DELETE FROM quota_snapshots`); err != nil {
-		t.Fatal(err)
-	}
-
-	// The window resets and stays unused; an unused Codex window's reset instant
-	// rolls forward with every refresh.
-	for step := range 5 {
-		observedAtMS := resetAtMS + int64(step+1)*hour
-		got := observeCapacity(t, handler, capacityReading(observedAtMS, observedAtMS+168*hour, 168, 0), observedAtMS).Capacity
-		if got == nil || got.Basis != "previous_cycle" || got.Tokens != first.Tokens || *got.CostNanos != *first.CostNanos {
-			t.Fatalf("idle refresh %d after the reset = %+v, want the previous cycle's size", step, got)
-		}
-		if got.RemainingCostNanos == nil || *got.RemainingCostNanos != *first.CostNanos || got.ErrorPercent != 5 {
-			t.Fatalf("idle refresh %d after the reset = %+v, want the whole window left", step, got)
-		}
-	}
-}
-
-// A credential first seen part-way through a cycle, partly used elsewhere: only
-// the changes this gateway recorded traffic for are measured.
-func TestWindowCapacityMeasuresOnlyRecordedChanges(t *testing.T) {
-	handler := capacityTestHandler(t)
-	nowMS := time.Now().UnixMilli()
-	resetAtMS := nowMS + 3600*1000
-	at := func(minutes int64) int64 { return nowMS - 120*60*1000 + minutes*60*1000 }
-
-	// 60% was spent before this gateway saw the credential.
-	window := observeCapacity(t, handler, capacityReading(at(0), resetAtMS, 5, 60), nowMS)
-	if window.Capacity != nil || window.CapacityUnavailable != quota.CapacityReasonNoTraffic {
-		t.Fatalf("first reading = %+v, want no estimate from traffic the gateway never saw", window)
-	}
-	insertCapacityUsage(t, handler, "first", at(5), 100_000, 100_000_000)
-	observeCapacity(t, handler, capacityReading(at(10), resetAtMS, 5, 70), nowMS)
-	// Ten points spent elsewhere while the gateway was idle.
-	observeCapacity(t, handler, capacityReading(at(20), resetAtMS, 5, 80), nowMS)
-	insertCapacityUsage(t, handler, "second", at(25), 100_000, 100_000_000)
-	window = observeCapacity(t, handler, capacityReading(at(30), resetAtMS, 5, 90), nowMS)
-	if capacity := window.Capacity; capacity == nil || capacity.Basis != "observed_delta" || capacity.Tokens != 1_000_000 {
-		t.Fatalf("capacity = %+v, want 200k recorded over the 20 points it moved", capacity)
-	}
-}
-
-func TestWindowCapacityReferencesFollowThePlan(t *testing.T) {
-	handler := capacityTestHandler(t)
-	nowMS := time.Now().UnixMilli()
-	previousReset := nowMS - 3600*1000
-	insertCapacityUsage(t, handler, "previous", previousReset-2*3600*1000, 100_000, 100_000_000)
-	observeCapacity(t, handler, capacityReading(previousReset-3600*1000, previousReset, 5, 25), previousReset-3600*1000)
-
-	// A small current climb leans on the previous cycle by precision.
-	insertCapacityUsage(t, handler, "current", nowMS-120_000, 2_000, 2_000_000)
-	window := observeCapacity(t, handler, capacityReading(nowMS-60_000, nowMS+4*3600*1000, 5, 1), nowMS)
-	if capacity := window.Capacity; capacity == nil || capacity.Basis != "blended" || capacity.Tokens < 390_000 || capacity.Tokens >= 400_000 {
-		t.Fatalf("capacity = %+v, want the 400k previous cycle nudged toward the 200k sample", capacity)
-	}
-	if window.Usage == nil || window.Usage.Tokens != 2_000 {
-		t.Fatalf("usage = %+v, want the current cycle's own traffic", window.Usage)
-	}
-
-	// Another plan's size is no reference.
-	changed := capacityReading(nowMS-60_000, nowMS+4*3600*1000, 5, 1)
-	changed.Plan = &quota.QuotaPlan{PlanType: "pro", Tier: "elite"}
-	handler.attachWindowCapacity(context.Background(), changed, nowMS)
-	if window := changed.Windows[0]; window.Capacity != nil || window.CapacityUnavailable != quota.CapacityReasonLowUsage {
-		t.Fatalf("window = %+v, want no estimate from another plan's size", window)
-	}
 }
 
 func TestWindowCapacityScopedUsagePrefersServedModel(t *testing.T) {
@@ -248,7 +114,7 @@ func TestWindowCapacityScopedUsagePrefersServedModel(t *testing.T) {
 	reading.Windows[0].Scope = "model"
 	reading.Windows[0].Model = "claude-sonnet-4-5"
 	window := observeCapacity(t, handler, reading, nowMS)
-	if window.Usage == nil || window.Usage.Requests != 1 || window.Usage.Tokens != 100 || window.Capacity == nil || window.Capacity.Tokens != 500 {
+	if window.Usage == nil || window.Usage.Requests != 1 || window.Usage.Tokens != 100 {
 		t.Fatalf("scoped window = %+v, want only the served Sonnet request", window)
 	}
 }
@@ -330,8 +196,8 @@ func TestWindowCapacityUnreadableEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	reading := capacityReading(nowMS-60_000, nowMS+3600*1000, 5, 20)
-	handler.attachWindowCapacity(context.Background(), reading, nowMS)
-	if window := reading.Windows[0]; window.Capacity != nil || window.CapacityUnavailable != quota.CapacityReasonHistoryUnavailable {
+	handler.attachQuotaForecasts(context.Background(), reading, nowMS)
+	if window := reading.Windows[0]; len(window.ModelForecasts) != 0 || window.ForecastUnavailable != quota.CapacityReasonHistoryUnavailable {
 		t.Fatalf("window = %+v, want history_unavailable", window)
 	}
 }
@@ -353,5 +219,262 @@ func TestWindowCapacityDoesNotPersistFailedCooldownObservation(t *testing.T) {
 	cycles, err := handler.repo.LoadCapacityCycles(ctx, "codex-1")
 	if err != nil || len(cycles) != 0 {
 		t.Fatalf("failed reading calibrated: %+v error=%v", cycles, err)
+	}
+}
+
+func TestQuotaCapacityHistorySkipsOverlappingSupersededCycle(t *testing.T) {
+	handler := capacityTestHandler(t)
+	const day = int64(24 * 3600 * 1000)
+	nowMS := time.Now().UnixMilli()
+
+	// Pre-subscription weekly cycle (ends in the future at nowMS + 1d, started nowMS - 6d)
+	supersededReset := nowMS + day
+	supersededStart := supersededReset - 7*day
+	insertCapacityUsage(t, handler, "pre-sub", supersededStart+day, 61_400_000, 10_650_000_000)
+	observeCapacity(t, handler, capacityReading(nowMS-2*day, supersededReset, 168, 7), nowMS-2*day)
+
+	// User subscribes yesterday (nowMS - 1d): upstream starts a fresh 7-day cycle [nowMS - 1d, nowMS + 6d).
+	activeReset := nowMS + 6*day
+	activeStart := activeReset - 7*day
+	insertCapacityUsage(t, handler, "active-sub", activeStart+day/2, 455_000_000, 103_720_000_000)
+	observeCapacity(t, handler, capacityReading(nowMS-60_000, activeReset, 168, 53), nowMS)
+
+	status, body := getCapacityHistory(t, handler, "?window=five_hour")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d (%v), want 200", status, body)
+	}
+	if body["previous"] != nil {
+		t.Fatalf("overlapping pre-subscription cycle leaked as previous = %v, want nil", body["previous"])
+	}
+	current, _ := body["current"].(map[string]any)
+	currentUsage, _ := current["usage"].(map[string]any)
+	if current["from_ms"] != float64(activeStart) || currentUsage["cost_nanos"] != float64(103_720_000_000) {
+		t.Fatalf("current = %v, want active cycle from %d with $103.72", current, activeStart)
+	}
+}
+
+func insertForecastTraffic(t *testing.T, handler *Handler, model string, count int, fromMS int64) {
+	t.Helper()
+	for index := range count {
+		key := fmt.Sprintf("%s-%d-%d", model, fromMS, index)
+		insertCapacityUsage(t, handler, key, fromMS+int64(index), 1000, 1_000_000)
+		if _, err := handler.repo.SQL().ExecContext(context.Background(), `UPDATE usage_events SET model=?, input_tokens=1000 WHERE event_key=?`, model, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestQuotaForecastsKeepNativeReadingsAndSeparateRecordedCosts(t *testing.T) {
+	handler := capacityTestHandler(t)
+	now := time.Now().UnixMilli()
+	reset := now + 2*3600*1000
+	baseline := capacityReading(now-30_000, reset, 5, 0)
+	observeCapacity(t, handler, baseline, now)
+	insertForecastTraffic(t, handler, "gemini-4-hydrogen", 10, now-25_000)
+	first := observeCapacity(t, handler, capacityReading(now-20_000, reset, 5, 10), now)
+	if len(first.ModelForecasts) != 1 || first.ModelForecasts[0].RemainingRequests != 90 {
+		t.Fatalf("first forecast = %+v", first)
+	}
+	insertForecastTraffic(t, handler, "gemini-4-carbon", 10, now-15_000)
+	reading := capacityReading(now-10_000, reset, 5, 30)
+	shared := reading.Windows
+	window := observeCapacity(t, handler, reading, now)
+	if window.Usage == nil || window.Usage.Requests != 20 || window.Usage.CostNanos != 20_000_000 {
+		t.Fatalf("recorded usage = %+v", window.Usage)
+	}
+	if *window.UsedPercent != 30 || *window.ResetAtMS != reset || len(window.ModelForecasts) != 2 {
+		t.Fatalf("window = %+v", window)
+	}
+	if window.ModelForecasts[0].Model != "gemini-4-carbon" || window.ModelForecasts[0].RemainingRequests != 35 || window.ModelForecasts[1].RemainingRequests != 70 ||
+		window.ModelForecasts[0].RemainingCostNanos == nil || *window.ModelForecasts[0].RemainingCostNanos != 35_000_000 ||
+		window.ModelForecasts[1].RemainingCostNanos == nil || *window.ModelForecasts[1].RemainingCostNanos != 70_000_000 {
+		t.Fatalf("model attribution = %+v", window.ModelForecasts)
+	}
+	if shared[0].Usage != nil || len(shared[0].ModelForecasts) != 0 {
+		t.Fatal("mutated caller's slice")
+	}
+	if scoped := reading.Windows[1]; scoped.Usage != nil || len(scoped.ModelForecasts) != 0 || scoped.ForecastUnavailable != "" {
+		t.Fatalf("feature window changed: %+v", scoped)
+	}
+	data, err := json.Marshal(window)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"capacity":`, `"model_projections":`} {
+		if strings.Contains(string(data), field) {
+			t.Fatalf("legacy quota promise leaked: %s", data)
+		}
+	}
+	stored, err := handler.repo.GetLatestQuotaSnapshots(context.Background(), []string{"codex-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stored["codex-1"].WindowsJSON, "model_forecasts") {
+		t.Fatal("forecasts were persisted into upstream snapshot")
+	}
+	// Retention and idle refreshes leave frozen model samples unchanged.
+	if _, err := handler.repo.SQL().ExecContext(context.Background(), `DELETE FROM usage_events`); err != nil {
+		t.Fatal(err)
+	}
+	idle := observeCapacity(t, handler, capacityReading(now-5000, reset, 5, 30), now)
+	if !reflect.DeepEqual(idle.ModelForecasts, window.ModelForecasts) {
+		t.Fatalf("idle refresh changed forecasts: %+v", idle.ModelForecasts)
+	}
+	status, body := getCapacityHistory(t, handler, "?window=five_hour")
+	if status != http.StatusOK || body["model_projections"] != nil {
+		t.Fatalf("history = %d %v", status, body)
+	}
+	historyForecasts, ok := body["model_forecasts"].([]any)
+	if !ok || len(historyForecasts) != 2 {
+		t.Fatalf("history model_forecasts = %T %v", body["model_forecasts"], body["model_forecasts"])
+	}
+	for idx, wantCost := range []float64{35_000_000, 70_000_000} {
+		f, _ := historyForecasts[idx].(map[string]any)
+		if f["sample_priced_requests"] != float64(10) || f["remaining_cost_nanos"] != wantCost {
+			t.Fatalf("history forecast[%d] = %v, want priced=10 cost=%v", idx, f, wantCost)
+		}
+	}
+	if err := handler.repo.SaveQuotaRefreshAttempt(context.Background(), repository.QuotaRefreshAttemptRecord{AuthIndex: "codex-1", AttemptedAtMS: now, Outcome: repository.QuotaRefreshAttemptFailed, Error: "temporary gateway failure"}); err != nil {
+		t.Fatal(err)
+	}
+	status, body = getCapacityHistory(t, handler, "?window=five_hour")
+	if status != http.StatusOK || body["model_forecasts"] != nil || body["forecast_unavailable"] != quota.CapacityReasonNoReading {
+		t.Fatalf("failed refresh reused a forecast: %d %v", status, body)
+	}
+
+	if _, err := handler.repo.SQL().ExecContext(context.Background(), `INSERT INTO error_events (
+		instance_id, event_key, provider, model, auth_index, status_code, body,
+		retryable, auth_status, auth_disabled, auth_unavailable, quota_exceeded,
+		quota_reason, next_recover_at_ms, timestamp_ms, created_at_ms
+	) VALUES ('default', 'cooldown-1', 'codex', 'gpt-6.1-sol', 'codex-1', 429, 'Rate limit', 1, 'active', 0, 0, 1, 'rate limited', ?, ?, ?)`,
+		now+60_000, now-1000, now-1000,
+	); err != nil {
+		t.Fatal(err)
+	}
+	client, err := handler.capabilityClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	overview, err := handler.buildQuotaOverview(context.Background(), client)
+	if err != nil || len(overview.Quotas) != 1 {
+		t.Fatalf("overview = %+v, %v", overview, err)
+	}
+	if item := overview.Quotas[0]; item.Status != "cooldown" || len(item.Windows[0].ModelForecasts) != 0 || item.Windows[0].ForecastUnavailable != quota.CapacityReasonNoReading {
+		t.Fatalf("overview failed refresh during cooldown = %+v", item)
+	}
+	detailRouter := chi.NewRouter()
+	detailRouter.Get("/quota/{authIndex}", handler.getCredentialQuotaDetail)
+	detailRecorder := httptest.NewRecorder()
+	detailRouter.ServeHTTP(detailRecorder, httptest.NewRequest(http.MethodGet, "/quota/codex-1", nil))
+	var detail struct {
+		Quota quota.NormalizedQuota `json:"quota"`
+	}
+	if detailRecorder.Code != http.StatusOK || json.Unmarshal(detailRecorder.Body.Bytes(), &detail) != nil {
+		t.Fatalf("detail = %d %s", detailRecorder.Code, detailRecorder.Body.String())
+	}
+	if detail.Quota.Status != "cooldown" || len(detail.Quota.Windows[0].ModelForecasts) != 0 || detail.Quota.Windows[0].ForecastUnavailable != quota.CapacityReasonNoReading {
+		t.Fatalf("detail failed refresh during cooldown = %+v", detail.Quota)
+	}
+
+	for _, status := range []string{"stale", "error"} {
+		failed := capacityReading(now-5000, reset, 5, 30)
+		failed.Status = status
+		handler.attachQuotaForecasts(context.Background(), failed, now)
+		if len(failed.Windows[0].ModelForecasts) != 0 {
+			t.Fatalf("%s observation forecasted: %+v", status, failed)
+		}
+	}
+	expired := capacityReading(now-5000, reset, 5, 30)
+	handler.attachQuotaForecasts(context.Background(), expired, reset)
+	if len(expired.Windows[0].ModelForecasts) != 0 || expired.Windows[0].ForecastUnavailable != quota.CapacityReasonExpired {
+		t.Fatalf("expired = %+v", expired.Windows[0])
+	}
+}
+
+func TestQuotaForecastHistoryWithholdsUnattributableAndOldSamples(t *testing.T) {
+	handler := capacityTestHandler(t)
+	now := time.Now().UnixMilli()
+	reset := now + 2*3600*1000
+	observeCapacity(t, handler, capacityReading(now-30_000, reset, 5, 10), now)
+	insertForecastTraffic(t, handler, "gemini-4-hydrogen", 5, now-25_000)
+	insertForecastTraffic(t, handler, "gemini-4-carbon", 5, now-24_000)
+	window := observeCapacity(t, handler, capacityReading(now-20_000, reset, 5, 30), now)
+	if len(window.ModelForecasts) != 0 || window.ForecastUnavailable != quota.CapacityReasonMixedModels {
+		t.Fatalf("mixed sample = %+v", window)
+	}
+	insertForecastTraffic(t, handler, "gemini-4-hydrogen", 5, now-15_000)
+	window = observeCapacity(t, handler, capacityReading(now-10_000, reset, 5, 40), now)
+	if len(window.ModelForecasts) != 1 || window.ModelForecasts[0].SampleRequests != 5 {
+		t.Fatalf("pure sample = %+v", window)
+	}
+	// A fresh cycle has to establish its own baseline and direct samples.
+	next := observeCapacity(t, handler, capacityReading(reset+1, reset+5*3600*1000, 5, 1), reset+1)
+	if len(next.ModelForecasts) != 0 {
+		t.Fatalf("older cycle supplied a forecast: %+v", next)
+	}
+}
+
+func TestLegacyCalibrationIntervalsBackfillForecastCost(t *testing.T) {
+	handler := capacityTestHandler(t)
+	now := time.Now().UnixMilli()
+	reset := now + 2*3600*1000
+	observeCapacity(t, handler, capacityReading(now-30_000, reset, 5, 10), now)
+	insertForecastTraffic(t, handler, "gemini-4-hydrogen", 9, now-25_000)
+	// Include a request that started before the interval (after cycle start) and finished inside it.
+	insertCapacityUsage(t, handler, "cross-interval", now-40_000, 1000, 1_000_000)
+	if _, err := handler.repo.SQL().ExecContext(context.Background(), `UPDATE usage_events SET model='gemini-4-hydrogen', latency_ms=15000 WHERE event_key='cross-interval'`); err != nil {
+		t.Fatal(err)
+	}
+	observeCapacity(t, handler, capacityReading(now-10_000, reset, 5, 20), now)
+
+	// Simulate calibration points persisted before per-interval cost_nanos existed.
+	cycles, err := handler.repo.LoadCapacityCycles(context.Background(), "codex-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, list := range cycles {
+		for i := range list {
+			for j := range list[i].Points {
+				for m := range list[i].Points[j].IntervalModels {
+					list[i].Points[j].IntervalModels[m].CostNanos = 0
+					list[i].Points[j].IntervalModels[m].PricedRequests = 0
+				}
+			}
+			raw, err := json.Marshal(list[i].Points)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := handler.repo.SQL().ExecContext(context.Background(), `UPDATE quota_capacity_cycles SET points_json = ? WHERE auth_index = 'codex-1' AND window_key = ? AND cycle_reset_at_ms = ?`, string(raw), k, list[i].CycleResetAtMS); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	reading := capacityReading(now-10_000, reset, 5, 20)
+	handler.attachQuotaForecasts(context.Background(), reading, now)
+	got := reading.Windows[0].ModelForecasts
+	if len(got) != 1 || got[0].SamplePricedRequests != 10 || got[0].RemainingCostNanos == nil || *got[0].RemainingCostNanos != 80_000_000 {
+		t.Fatalf("backfilled forecast = %+v", got)
+	}
+
+	// A new interval merged onto that legacy interval still has SamplePricedRequests < SampleRequests
+	// until backfilled from usage_events across the whole combined sample.
+	insertForecastTraffic(t, handler, "gemini-4-hydrogen", 5, now-5_000)
+	window := observeCapacity(t, handler, capacityReading(now-1_000, reset, 5, 25), now)
+	got = window.ModelForecasts
+	if len(got) != 1 || got[0].SampleRequests != 15 || got[0].SamplePricedRequests != 15 || got[0].RemainingCostNanos == nil || *got[0].RemainingCostNanos != 75_000_000 {
+		t.Fatalf("mixed legacy+new forecast = %+v", got)
+	}
+	status, body := getCapacityHistory(t, handler, "?window=five_hour")
+	if status != http.StatusOK {
+		t.Fatalf("backfilled history status = %d (%v)", status, body)
+	}
+	historyForecasts, ok := body["model_forecasts"].([]any)
+	if !ok || len(historyForecasts) != 1 {
+		t.Fatalf("backfilled history model_forecasts = %T %v", body["model_forecasts"], body["model_forecasts"])
+	}
+	firstForecast, _ := historyForecasts[0].(map[string]any)
+	if firstForecast["sample_priced_requests"] != float64(15) || firstForecast["remaining_cost_nanos"] != float64(75_000_000) {
+		t.Fatalf("backfilled history forecast = %v", firstForecast)
 	}
 }

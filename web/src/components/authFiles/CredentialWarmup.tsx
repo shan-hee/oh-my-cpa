@@ -1,11 +1,14 @@
 import type { MessageKey } from '../../i18n/catalog';
+import { quotaWindowFullName, quotaWindowParts } from '../../pages/quota/quotaWindowSelection';
+import { MetaLine } from '../common/MetaLine';
 import React from 'react';
-import { Button, Input, Segmented } from 'antd';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Segmented } from '@/components/ui/segmented';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, describeError } from '../../api/client';
 import { useI18n, useT, type TFunc } from '../../i18n';
 import { languageLocale } from '../../i18n/language';
-import { isDemoMode } from '../../types/demoMode';
 import { formatEventDuration } from '../../types/usageEventMetrics';
 import { credentialBrandIdentity } from '../../types/credentialIdentity';
 import { usePluginMultiPortalKeys, usePluginOAuthLogos, usePluginOAuthTitles } from '../../hooks/usePluginOAuthLogos';
@@ -97,16 +100,32 @@ function accountLabel(account: WarmupCatalogAccount | undefined, task: Pick<Warm
   return account?.email || account?.name || task.account || task.auth_index;
 }
 
-function windowLabel(id: string | undefined, account: WarmupCatalogAccount | undefined, t: TFunc): string {
+/** A window's name; `isGrouped` keeps the model group in front where nothing else names it. */
+function windowLabel(id: string | undefined, account: WarmupCatalogAccount | undefined, t: TFunc, isGrouped = false): string {
   const key = id ? WINDOW_KEYS[id] : undefined;
   if (key) return t(key);
-  return account?.windows.find((w) => w.id === id)?.label || id || '';
+  const label = account?.windows.find((w) => w.id === id)?.label;
+  if (!label) return id || '';
+  const window = { label, scope: id?.startsWith('ag_') ? 'group' as const : 'standard' as const };
+  return isGrouped ? quotaWindowFullName(window) : quotaWindowParts(window).name;
+}
+
+/** A window option: its own name, with the model group it belongs to as a quiet line beneath. */
+function WindowOption({ id, account, t }: { id: string; account: WarmupCatalogAccount | undefined; t: TFunc }) {
+  const label = account?.windows.find((w) => w.id === id)?.label;
+  const group = label && id.startsWith('ag_') ? quotaWindowParts({ label, scope: 'group' }).group : null;
+  return (
+    <span className={styles['window-option']}>
+      <span>{windowLabel(id, account, t)}</span>
+      {group && <span className={styles['window-option-group']}>{group}</span>}
+    </span>
+  );
 }
 
 function describeTrigger(trigger: WarmupTrigger, account: WarmupCatalogAccount | undefined, fallbackZone: string, t: TFunc): string {
   switch (trigger.kind) {
     case 'window':
-      return t('warmup.summary_window', { window: windowLabel(trigger.window, account, t) });
+      return t('warmup.summary_window', { window: windowLabel(trigger.window, account, t, true) });
     case 'daily':
       return t('warmup.summary_daily', { time: trigger.time ?? '08:55', zone: trigger.time_zone || fallbackZone || 'UTC' });
     case 'every':
@@ -174,7 +193,7 @@ function TaskEditorModal({
   const multiPortalKeys = usePluginMultiPortalKeys();
   const draft = editing?.draft;
   const account = draft ? findAccount(catalog, draft) : undefined;
-  const isDisabled = isSaving || isDemoMode();
+  const isDisabled = isSaving;
 
   if (!draft) return <AppModal open={false} title="" onCancel={onCancel} />;
 
@@ -222,7 +241,7 @@ function TaskEditorModal({
       destroyOnHidden
       footer={[
         <Button key="cancel" onClick={onCancel} disabled={isSaving}>{t('common.cancel')}</Button>,
-        <Button key="save" type="primary" onClick={onSave} loading={isSaving} disabled={!canSaveWarmupTask(draft) || isDemoMode()}>
+        <Button key="save" variant="primary" onClick={onSave} loading={isSaving} disabled={!canSaveWarmupTask(draft)}>
           {t('common.save')}
         </Button>,
       ]}
@@ -273,7 +292,7 @@ function TaskEditorModal({
         {draft.trigger.kind === 'window' && (
           <div className={styles['field']}>
             <span className={styles['field-label']}>{t('warmup.window_select')}</span>
-            {/* A window's label is the provider's own, such as "Gemini Models · 5小时限制", so the
+            {/* A grouped window names its model group too ("5小时限制" in "Gemini Models"), so the
                 options do not fit one row at any dialog width: laid out as a row each one was
                 truncated to its middle, which left two families' five-hour windows reading alike. */}
             <Segmented
@@ -283,7 +302,7 @@ function TaskEditorModal({
               aria-label={t('warmup.window_select')}
               value={draft.trigger.window || windows[0]}
               disabled={isDisabled}
-              options={windows.map((id) => ({ value: id, label: windowLabel(id, account, t) }))}
+              options={windows.map((id) => ({ value: id, label: <WindowOption id={id} account={account} t={t} /> }))}
               onChange={(win) => setTrigger({ window: String(win) })}
             />
           </div>
@@ -348,7 +367,7 @@ function TaskEditorModal({
             aria-label={t('warmup.task_name')}
             value={draft.name}
             maxLength={120}
-            placeholder={`${accountLabel(account, draft)} · ${describeTrigger(draft.trigger, account, timezone, t)}`}
+            placeholder={t('warmup.task_name_placeholder', { account: accountLabel(account, draft), trigger: describeTrigger(draft.trigger, account, timezone, t) })}
             disabled={isDisabled}
             onChange={(e) => set({ name: e.target.value })}
           />
@@ -387,7 +406,6 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
   const locale = languageLocale(useI18n().lang);
   const toast = useToast();
   const queryClient = useQueryClient();
-  const isDemo = isDemoMode();
 
   const catalog = state.catalog;
   const timezone = catalog?.timezone || 'UTC';
@@ -423,8 +441,32 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
   const toggleMutation = useMutation({
     mutationFn: ({ task, enabled }: { task: WarmupTask; enabled: boolean }) =>
       api.updateWarmupTask(task.id, toPayload({ ...taskToInput(task, timezone), name: task.name, enabled }, timezone)),
+    onMutate: ({ task, enabled }) => {
+      const current = queryClient.getQueryData<WarmupStateView>(WARMUP_QUERY_KEY);
+      const priorEnabled = current?.tasks.find((item) => item.id === task.id)?.enabled ?? task.enabled;
+      if (current) {
+        applyState({
+          ...current,
+          tasks: current.tasks.map((item) => (item.id === task.id ? { ...item, enabled } : item)),
+        });
+      }
+      return { taskId: task.id, priorEnabled };
+    },
     onSuccess: applyState,
-    onError: reportFailure('warmup.update_failed'),
+    onError: (err, _variables, context) => {
+      if (context) {
+        const latest = queryClient.getQueryData<WarmupStateView>(WARMUP_QUERY_KEY);
+        if (latest) {
+          applyState({
+            ...latest,
+            tasks: latest.tasks.map((item) =>
+              item.id === context.taskId ? { ...item, enabled: context.priorEnabled } : item,
+            ),
+          });
+        }
+      }
+      reportFailure('warmup.update_failed')(err);
+    },
   });
 
   const deleteMutation = useMutation({
@@ -475,7 +517,7 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
   const runTitle = (run: WarmupRun): string => views.get(run.task_id)?.title ?? (run.account || run.auth_index);
 
   const shownRuns = isShowingAllRuns ? runs : runs.slice(0, RUNS_PREVIEW);
-  const canClearRuns = runs.length > 0 && !isDemo;
+  const canClearRuns = runs.length > 0;
 
   return (
     <div className={styles['workspace']}>
@@ -486,7 +528,7 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
           title={t('warmup.tasks')}
           count={tasks.length || undefined}
           extra={(
-            <Button size="small" type="primary" icon={<PlusOutlined />} onClick={startCreate} disabled={isDemo} data-testid="warmup-add-task">
+            <Button size="sm" variant="primary" icon={<PlusOutlined />} onClick={startCreate} data-testid="warmup-add-task">
               {t('warmup.add_task')}
             </Button>
           )}
@@ -503,26 +545,25 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
                 <li key={task.id} className={styles['task-row']} data-enabled={task.enabled} data-testid={`warmup-task-${task.id}`}>
                   <CredentialMark className={styles['task-mark']} credential={{ provider: task.provider, hint: task.account }} size={20} />
                   <div className={styles['task-copy']}>
-                    <span className={styles['task-title']} title={view.title}>{view.title}</span>
-                    <span className={styles['task-meta']}>{view.meta.join(' · ')}</span>
+                    <span className={styles['task-title']} data-tip={view.title} data-tip-overflow="">{view.title}</span>
+                    <MetaLine className={styles['task-meta']}>{view.meta.map((part) => <span key={part}>{part}</span>)}</MetaLine>
                     {next && <span className={styles['task-next']}>{next}</span>}
                   </div>
                   <div className={styles['task-actions']}>
                     <ToolButton
-                      size="small"
-                      type="text"
+                      size="sm"
+                      variant="ghost"
                       icon={<PlayCircleOutlined />}
                       label={t('warmup.run')}
                       loading={isRunning}
-                      disabled={isDemo || (runMutation.isPending && !isRunning)}
+                      disabled={runMutation.isPending && !isRunning}
                       onClick={() => runMutation.mutate(task.id)}
                     />
                     <ToolButton
-                      size="small"
-                      type="text"
+                      size="sm"
+                      variant="ghost"
                       icon={<EditOutlined />}
                       label={t('warmup.edit_task')}
-                      disabled={isDemo}
                       onClick={() => setEditing({ id: task.id, draft: taskToInput(task, timezone) })}
                     />
                     <ConfirmAction
@@ -532,17 +573,16 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
                       isConfirming={deleteMutation.isPending && deleteMutation.variables === task.id}
                       tooltip={t('warmup.delete_task')}
                       onConfirm={() => deleteMutation.mutateAsync(task.id)}
-                      disabled={isDemo || isRunning}
+                      disabled={isRunning}
                     >
-                      <Button size="small" type="text" icon={<DeleteOutlined />} aria-label={t('warmup.delete_task')} disabled={isDemo || isRunning} />
+                      <Button size="sm" variant="ghost" icon={<DeleteOutlined />} aria-label={t('warmup.delete_task')} disabled={isRunning} />
                     </ConfirmAction>
                     <Switch
                       size="small"
                       className={styles['task-switch']}
                       aria-label={view.title}
-                      checked={task.enabled}
                       loading={toggleMutation.isPending && toggleMutation.variables?.task.id === task.id}
-                      disabled={isDemo}
+                      checked={task.enabled}
                       onChange={(enabled) => toggleMutation.mutate({ task, enabled })}
                     />
                   </div>
@@ -568,7 +608,7 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
               tooltip={t('warmup.clear_history')}
               onConfirm={() => clearMutation.mutateAsync()}
             >
-              <Button size="small" type="text" icon={<ClearOutlined />} aria-label={t('warmup.clear_history')} data-testid="warmup-clear-runs" />
+              <Button size="sm" variant="ghost" icon={<ClearOutlined />} aria-label={t('warmup.clear_history')} data-testid="warmup-clear-runs" />
             </ConfirmAction>
           )}
         />
@@ -578,11 +618,13 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
           <>
             <ul className={styles['list']} data-testid="warmup-last-result">
               {shownRuns.map((run) => {
-                const meta = [
-                  t(SOURCE_KEYS[run.source] ?? 'warmup.source_manual'),
-                  run.model,
-                  typeof run.ms === 'number' ? formatEventDuration(run.ms) : null,
-                ].filter(Boolean).join(' · ');
+                const meta = (
+                  <MetaLine>
+                    {t(SOURCE_KEYS[run.source] ?? 'warmup.source_manual')}
+                    {run.model ? <span className="mono-num">{run.model}</span> : null}
+                    {typeof run.ms === 'number' ? formatEventDuration(run.ms) : null}
+                  </MetaLine>
+                );
                 return (
                   <li key={run.id} className={styles['run-row']}>
                     <div className={styles['run-head']}>
@@ -599,7 +641,7 @@ function WarmupWorkspace({ state }: { state: WarmupStateView }) {
               })}
             </ul>
             {runs.length > RUNS_PREVIEW && !isShowingAllRuns && (
-              <Button type="link" size="small" className={styles['more']} onClick={() => setIsShowingAllRuns(true)}>
+              <Button variant="link" size="sm" className={styles['more']} onClick={() => setIsShowingAllRuns(true)}>
                 {t('warmup.show_all_runs', { count: runs.length })}
               </Button>
             )}

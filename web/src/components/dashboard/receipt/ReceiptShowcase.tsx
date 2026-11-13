@@ -1,6 +1,6 @@
 import React from 'react';
 import { createPortal } from 'react-dom';
-import { Button } from 'antd';
+import { Button } from '@/components/ui/button';
 import { Tooltip } from '../../common/Tooltip';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../../../api/client';
@@ -248,10 +248,12 @@ export default function ReceiptShowcase({ range, keyFilter, onClose }: ReceiptSh
               <div
                 className={`receipt-showcase-paper${isCurrentData ? '' : ' is-loading'}`}
                 onAnimationEnd={(event) => {
-                  if (event.target === event.currentTarget && event.animationName === 'receipt-release') setIsSettled(true);
+                  if (event.animationName === 'receipt-release') setIsSettled(true);
                 }}
               >
-                <ReceiptPaper ref={paperRef} sheet={sheet} marks={marks} />
+                <div className="receipt-showcase-slip">
+                  <ReceiptPaper ref={paperRef} sheet={sheet} marks={marks} />
+                </div>
               </div>
             )}
           </div>
@@ -272,7 +274,7 @@ export default function ReceiptShowcase({ range, keyFilter, onClose }: ReceiptSh
               </Tooltip>
               <Button
                 block
-                type="primary"
+                variant="primary"
                 icon={<DownloadOutlined />}
                 loading={pendingAction === 'download'}
                 disabled={!isReady || pendingAction === 'copy'}
@@ -370,7 +372,7 @@ function buildSheet({ data, range, ledger, labels, isCubeError, issuedAt, zone, 
   const placeholder = isCubeError
     ? t('dash.receipt.items_unavailable')
     : !ledger
-      ? '· · ·'
+      ? '…'
       : groups.length === 0 ? t('dash.receipt.items_empty') : undefined;
 
   const tokenRows: ReceiptRow[] = [

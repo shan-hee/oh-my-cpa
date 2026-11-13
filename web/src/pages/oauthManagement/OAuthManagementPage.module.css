@@ -14,18 +14,13 @@
   min-width: 0;
 }
 
-.select-all {
-  flex: none;
-  padding: 0 4px 0 15px;
-}
-
 .empty {
   display: flex;
   align-items: center;
   justify-content: center;
   min-height: 220px;
   border: 1px dashed var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-xl);
 }
 
 .pagination {
@@ -60,8 +55,10 @@
 }
 
 @media (max-width: 640px) {
-  .select-all {
-    padding-left: 12px;
+  /* The head's row is the scope and the page's actions: the scope takes what the actions leave. */
+  .page :global(.terminal-page-head > .terminal-page-actions) {
+    flex: 1 1 auto;
+    flex-wrap: nowrap;
   }
 
   .pagination {

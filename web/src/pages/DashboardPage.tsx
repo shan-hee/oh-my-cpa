@@ -5,8 +5,13 @@ import { DeferredPanel } from '../components/common/DeferredPanel';
 import { useTimeZone } from '../utils/TimeZoneProvider';
 import React from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Button, Select } from 'antd';
-import { AppstoreOutlined, HistoryOutlined, KeyOutlined, QuestionCircleOutlined, ReceiptOutlined, RightOutlined } from '../components/icons';
+import { Select } from '@/components/ui/select';
+import { Button } from '@/components/ui/button';
+import { AppstoreOutlined, ArrowDownOutlined, ArrowUpOutlined, HistoryOutlined, KeyOutlined, QuestionCircleOutlined, ReceiptOutlined, RightOutlined, SwapOutlined } from '../components/icons';
+import { calendarPresetLabel } from '../components/common/timeRange/presetGroups';
+import { changeTrend, formatChange, formatCountBaseline } from '../types/insightsFormat';
+import { useComparisonTip } from '../hooks/useCompareWindowLabel';
+import { tipCard } from '../components/common/tipCard';
 import { PageHeader } from '../components/common/PageHeader';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import dayjs from '../utils/time';
@@ -35,6 +40,7 @@ import { TimeRangeControl } from '../components/dashboard/TimeRangeControl';
 import { RollingNumber } from '../components/dashboard/RollingNumber';
 import { TokenHeatmap, TOKEN_HEATMAP_QUERY_KEY } from '../components/dashboard/TokenHeatmap';
 import { RoutingPanel, ROUTING_WINDOW_CACHE_KEY } from '../components/dashboard/routing/RoutingPanel';
+import { RoutingMapSkeleton } from '../components/dashboard/routing/RoutingMapSkeleton';
 import {
   CredentialQuota,
   CREDENTIAL_FILES_QUERY_KEY,
@@ -57,14 +63,21 @@ import { invalidateSwrScopes, useSwrQuery } from '../performance/swrContract';
 import { preloadRegisteredRoute, useTransitionNavigate } from '../performance/routeContract';
 import {
   applyTail,
+  DASHBOARD_COMPARISON_PREFERENCE,
   DASHBOARD_RANGE_PREFERENCE,
+  DEFAULT_DASHBOARD_COMPARISON,
+  dashboardMetricComparison,
   dashboardRangeParams,
   DEFAULT_DASHBOARD_RANGE,
+  isOpenCalendarPreset,
   isSlidingRange,
+  previousCalendarPreset,
   requestListWindowParams,
   livePollInterval,
+  parseDashboardComparisonPreference,
   parseDashboardRange,
   costNoteKey,
+  type DashboardMetricDelta,
   type DashboardRange,
   type DashboardWindow,
   type DashboardResponse,
@@ -78,7 +91,7 @@ import {
   type DashboardLayout,
   type DashboardWidgetId,
 } from '../types/dashboardLayout';
-import { LoadFailure, useToast } from '../components/feedback';
+import { LoadFailure, Notice, useToast } from '../components/feedback';
 import { EmptyState } from '../components/common/EmptyState';
 import { Panel } from '../components/common/Panel';
 import { LoadingRegion, Placeholder } from '../components/common/Placeholder';
@@ -125,6 +138,50 @@ function rateTone(successRate: number | null | undefined): ChartTone {
   return successRateTone(successRate);
 }
 
+const KpiDelta: React.FC<{
+  delta: DashboardMetricDelta | null;
+  formatPrevious: (value: number) => string;
+  testId?: string;
+}> = ({ delta, formatPrevious, testId }) => {
+  const t = useT();
+  const comparisonTip = useComparisonTip();
+  if (!delta) return null;
+  const { comparison, previousValue, window: compareWindow } = delta;
+  const changeText = comparison.kind === 'change' ? formatChange(comparison.change) : null;
+  const hasChange = comparison.kind === 'new' || changeText !== null;
+  if (!hasChange) return null;
+  const previousText = previousValue !== null ? formatPrevious(previousValue) : null;
+  const card = comparisonTip({ comparison, compare: compareWindow, previous: previousText });
+  return (
+    <span
+      className="tile-delta tile-delta-has-change"
+      data-trend={changeTrend(comparison)}
+      {...tipCard(card)}
+      tabIndex={card ? 0 : undefined}
+      data-testid={testId}
+    >
+      {comparison.kind === 'new' ? (
+        <span className="tile-delta-none">{t('insights.change_new')}</span>
+      ) : comparison.kind === 'change' && changeText !== null ? (
+        <>
+          {comparison.change > 0 && <ArrowUpOutlined aria-hidden="true" />}
+          {comparison.change < 0 && <ArrowDownOutlined aria-hidden="true" />}
+          {comparison.change === 0 ? (
+            <span>{changeText}</span>
+          ) : (
+            <>
+              <span aria-hidden="true">{changeText.replace(/^[+−]/, '')}</span>
+              <span className="sr-only">{changeText}</span>
+            </>
+          )}
+          {comparison.isNoise && <span className="sr-only"> {t('insights.change_noise')}</span>}
+        </>
+      ) : null}
+      {previousText && <span className="sr-only">, {t('insights.change_was', { value: previousText })}</span>}
+    </span>
+  );
+};
+
 export const DashboardPage: React.FC = () => {
   const timeZone = useTimeZone();
   const t = useT();
@@ -147,6 +204,11 @@ export const DashboardPage: React.FC = () => {
     DASHBOARD_RANGE_PREFERENCE,
     DEFAULT_DASHBOARD_RANGE,
     parseDashboardRange,
+  );
+  const { value: showComparisonBadge, loaded: isComparisonStored, set: setShowComparisonBadge } = usePreference<boolean>(
+    DASHBOARD_COMPARISON_PREFERENCE,
+    DEFAULT_DASHBOARD_COMPARISON,
+    parseDashboardComparisonPreference,
   );
 
   const toast = useToast();
@@ -183,6 +245,9 @@ export const DashboardPage: React.FC = () => {
       .map((k) => ({
         label: k.alias ? `${k.alias} (${maskKeyText(k.key)})` : maskKeyText(k.key),
         value: k.usage_fingerprint as string,
+        // A phone's closed filter has room for a few glyphs: the alias, or the mask's tail - the end
+        // of a key is what tells two `sk-cpa-` keys apart; the open list keeps the full label.
+        short: k.alias || `••${maskKeyText(k.key).slice(-4)}`,
       }));
   }, [keysQuery.data]);
 
@@ -264,10 +329,8 @@ export const DashboardPage: React.FC = () => {
   const pickTokenRate = React.useCallback((point: DashboardSeriesPoint) => pickTokens(point) / bucketMinutes, [bucketMinutes]);
   const formatRequests = React.useCallback((value: number) => `${formatCount(value)} ${t('dash.unit_requests')}`, [t]);
   const formatTokens = React.useCallback((value: number) => `${formatTokensStyled(value, tokenStyle)} ${t('dash.unit_tokens')}`, [t, tokenStyle]);
-  const formatExactTokens = React.useCallback((value: number) => `${formatTokensFull(value)} ${t('dash.unit_tokens')}`, [t]);
   const formatRequestRate = React.useCallback((value: number) => `${value.toFixed(2)} ${t('dash.unit_requests_per_min')}`, [t]);
   const formatTokenRateLabel = React.useCallback((value: number) => `${formatTokenRate(value)} ${t('dash.unit_tokens_per_min')}`, [t]);
-  const formatExactTokenRate = React.useCallback((value: number) => `${formatTokensFull(value)} ${t('dash.unit_tokens_per_min')}`, [t]);
 
   const overviewQuery = useSwrQuery(managementOverviewSwr, undefined, {
     refetchInterval: 30_000,
@@ -298,19 +361,48 @@ export const DashboardPage: React.FC = () => {
         {t('dash.layout.reset')}
       </Button>
       <Button onClick={() => setLayoutDraft(null)}>{t('common.cancel')}</Button>
-      <Button type="primary" onClick={() => void saveLayout()} data-testid="dashboard-layout-done">
+      <Button variant="primary" onClick={() => void saveLayout()} data-testid="dashboard-layout-done">
         {t('dash.layout.done')}
       </Button>
     </>
   );
 
+  const compareButton = (
+    <ToolButton
+      icon={<SwapOutlined />}
+      label={t(showComparisonBadge ? 'insights.compare_off' : 'insights.compare_on')}
+      variant={showComparisonBadge ? 'active' : 'secondary'}
+      aria-pressed={showComparisonBadge}
+      disabled={!isComparisonStored || range.preset === 'all'}
+      onClick={() => void setShowComparisonBadge(!showComparisonBadge)}
+      data-testid="dashboard-compare"
+    />
+  );
+
   const header = (
     <PageHeader
       title={t('nav.dashboard')}
+      // A phone's head is one row that fills the width: the window, the key filter when there are
+      // keys to filter by, and the menu at the edge. Two controls of different widths floated on
+      // two ragged lines read as misplaced.
       mobileActions={isArranging ? arrangeActions : (
-        <>
+        <div className="dashboard-phone-head">
           <TimeRangeControl range={range} onChange={applyRange} isDisabled={!isRangeStored} />
+          {clientKeyOptions.length > 0 && (
+            <Select
+              allowClear
+              className="dashboard-key-filter"
+              placeholder={t('dash.filter_by_key_short')}
+              aria-label={t('dash.filter_by_key')}
+              value={selectedApiKey}
+              onChange={setSelectedApiKey}
+              options={clientKeyOptions}
+              labelRender={({ value }) => clientKeyOptions.find((option) => option.value === value)?.short ?? null}
+              prefix={<KeyOutlined className="dashboard-key-filter-icon" />}
+            />
+          )}
           <ActionMenu>
+            {compareButton}
             {hasCostHidden && (
               <ToolButton
                 icon={<ReceiptOutlined />}
@@ -336,18 +428,7 @@ export const DashboardPage: React.FC = () => {
               disabled={!data}
             />
           </ActionMenu>
-          {clientKeyOptions.length > 0 && (
-            <Select
-              allowClear
-              className="dashboard-key-filter"
-              placeholder={t('dash.filter_by_key')}
-              value={selectedApiKey}
-              onChange={setSelectedApiKey}
-              options={clientKeyOptions}
-              prefix={<KeyOutlined className="dashboard-key-filter-icon" />}
-            />
-          )}
-        </>
+        </div>
       )}
       actions={isArranging ? arrangeActions : (
         <>
@@ -360,9 +441,11 @@ export const DashboardPage: React.FC = () => {
               value={selectedApiKey}
               onChange={(val) => setSelectedApiKey(val)}
               options={clientKeyOptions}
+              labelRender={({ value }) => clientKeyOptions.find((option) => option.value === value)?.short ?? null}
               prefix={<KeyOutlined className="dashboard-key-filter-icon" />}
             />
           )}
+          {compareButton}
           {/* With the cost tile hidden, its receipt link moves to the toolbar. */}
           {hasCostHidden && (
             <ToolButton
@@ -396,6 +479,11 @@ export const DashboardPage: React.FC = () => {
     />
   );
 
+  const requestsDelta = React.useMemo(() => (data ? dashboardMetricComparison(data, 'requests') : null), [data]);
+  const tokensDelta = React.useMemo(() => (data ? dashboardMetricComparison(data, 'tokens') : null), [data]);
+  const costDelta = React.useMemo(() => (data ? dashboardMetricComparison(data, 'cost') : null), [data]);
+  const formatPreviousTokens = React.useCallback((value: number) => formatTokensStyled(value, tokenStyle), [tokenStyle]);
+
   if (!data && isError) {
     return (
       <div className="terminal-page dashboard-page">
@@ -414,6 +502,15 @@ export const DashboardPage: React.FC = () => {
   const hasWarmHeatmap = Boolean(dashboardHeatmapSwr.readSnapshot(queryClient, timeZone));
   const hasWarmQuota = Boolean(queryClient.getQueryData([CREDENTIAL_FILES_QUERY_KEY]));
   const hasModelUsageHidden = layout.some((item) => item.id === 'model_usage' && item.hidden);
+  const previousPreset = previousCalendarPreset(range.preset);
+  const isQuietOpenCalendar = Boolean(
+    data
+    && !isPlaceholderData
+    && data.coverage.has_usage
+    && data.requests.total === 0
+    && !selectedApiKey
+    && isOpenCalendarPreset(range.preset),
+  );
 
   const renderWidget = (id: DashboardWidgetId): React.ReactNode => {
     switch (id) {
@@ -424,8 +521,8 @@ export const DashboardPage: React.FC = () => {
             <div className="tile-head">
               <div className="tile-label">{t('dash.total_requests')}</div>
               <Button
-                type="link"
-                size="small"
+                variant="link"
+                size="sm"
                 className="tile-link"
                 icon={<RightOutlined />}
                 onMouseEnter={() => preloadRegisteredRoute('/usage/events')}
@@ -437,6 +534,7 @@ export const DashboardPage: React.FC = () => {
             </div>
             <div className="tile-value">
               <RollingNumber readout={resolveCountFlowReadout(data.requests.total)} />
+              <KpiDelta delta={showComparisonBadge ? requestsDelta : null} formatPrevious={formatCountBaseline} testId="dashboard-requests-delta" />
             </div>
             <div className="tile-caption">
               <span className="tile-rate">
@@ -466,15 +564,16 @@ export const DashboardPage: React.FC = () => {
         return (
           <Panel className="dashboard-tile kpi-tile">
             <div className="tile-label">{t('dash.total_tokens')}</div>
-            <div className="tile-value" title={formatTokensFull(data.tokens.total)}>
+            <div className="tile-value" data-tip={formatTokensFull(data.tokens.total)}>
               <RollingNumber readout={resolveTokenFlowReadout(data.tokens.total, tokenStyle)} />
+              <KpiDelta delta={showComparisonBadge ? tokensDelta : null} formatPrevious={formatPreviousTokens} testId="dashboard-tokens-delta" />
             </div>
             <div className="tile-caption">
-              <span>{t('dash.tokens_input')} <b title={formatTokensFull(data.tokens.input)}>{formatTokensStyled(data.tokens.input, tokenStyle)}</b></span>
-              <span>{t('dash.tokens_output')} <b title={formatTokensFull(data.tokens.output)}>{formatTokensStyled(data.tokens.output, tokenStyle)}</b></span>
-              <span>{t('dash.tokens_cache_read')} <b title={formatTokensFull(data.tokens.cache_read)}>{formatTokensStyled(data.tokens.cache_read, tokenStyle)}</b></span>
+              <span>{t('dash.tokens_input')} <b data-tip={formatTokensFull(data.tokens.input)}>{formatTokensStyled(data.tokens.input, tokenStyle)}</b></span>
+              <span>{t('dash.tokens_output')} <b data-tip={formatTokensFull(data.tokens.output)}>{formatTokensStyled(data.tokens.output, tokenStyle)}</b></span>
+              <span>{t('dash.tokens_cache_read')} <b data-tip={formatTokensFull(data.tokens.cache_read)}>{formatTokensStyled(data.tokens.cache_read, tokenStyle)}</b></span>
               {data.tokens.reasoning > 0 && (
-                <span>{t('dash.tokens_reasoning')} <b title={formatTokensFull(data.tokens.reasoning)}>{formatTokensStyled(data.tokens.reasoning, tokenStyle)}</b></span>
+                <span>{t('dash.tokens_reasoning')} <b data-tip={formatTokensFull(data.tokens.reasoning)}>{formatTokensStyled(data.tokens.reasoning, tokenStyle)}</b></span>
               )}
             </div>
             <DashboardTrendChart
@@ -485,7 +584,6 @@ export const DashboardPage: React.FC = () => {
               height={64}
               label={formatTrendTime}
               format={formatTokens}
-              formatExact={formatExactTokens}
             />
           </Panel>
         );
@@ -516,11 +614,11 @@ export const DashboardPage: React.FC = () => {
         return (
           <Panel className="dashboard-tile kpi-tile">
             <div className="tile-label">{t('dash.tpm')}</div>
-            <div className="tile-value" title={data.metrics.tpm == null ? undefined : `${formatTokensFull(data.metrics.tpm)} ${t('dash.unit_tokens_per_min')}`}>
+            <div className="tile-value" data-tip={data.metrics.tpm == null ? undefined : `${formatTokensFull(data.metrics.tpm)} ${t('dash.unit_tokens_per_min')}`}>
               <RollingNumber readout={resolveTokenRateFlowReadout(data.metrics.tpm)} />
             </div>
             <div className="tile-caption">
-              <span>{t('dash.total_tokens')} <b title={formatTokensFull(data.tokens.total)}>{formatTokensStyled(data.tokens.total, tokenStyle)}</b></span>
+              <span>{t('dash.total_tokens')} <b data-tip={formatTokensFull(data.tokens.total)}>{formatTokensStyled(data.tokens.total, tokenStyle)}</b></span>
             </div>
             <DashboardTrendChart
               ariaLabel={t('dash.tpm')}
@@ -530,7 +628,6 @@ export const DashboardPage: React.FC = () => {
               height={44}
               label={formatTrendTime}
               format={formatTokenRateLabel}
-              formatExact={formatExactTokenRate}
             />
           </Panel>
         );
@@ -548,8 +645,8 @@ export const DashboardPage: React.FC = () => {
               <RollingNumber readout={resolveCacheRateReadout(data.metrics.cache_rate)} />
             </div>
             <div className="tile-caption">
-              <span>{t('dash.tokens_cache_read')} <b title={formatTokensFull(data.tokens.cache_read)}>{formatTokensStyled(data.tokens.cache_read, tokenStyle)}</b></span>
-              <span>{t('dash.tokens_input')} <b title={formatTokensFull(data.tokens.input)}>{formatTokensStyled(data.tokens.input, tokenStyle)}</b></span>
+              <span>{t('dash.tokens_cache_read')} <b data-tip={formatTokensFull(data.tokens.cache_read)}>{formatTokensStyled(data.tokens.cache_read, tokenStyle)}</b></span>
+              <span>{t('dash.tokens_input')} <b data-tip={formatTokensFull(data.tokens.input)}>{formatTokensStyled(data.tokens.input, tokenStyle)}</b></span>
             </div>
             <DashboardTrendChart
               ariaLabel={t('dash.cache_rate')}
@@ -559,7 +656,6 @@ export const DashboardPage: React.FC = () => {
               height={44}
               label={formatTrendTime}
               format={formatTokens}
-              formatExact={formatExactTokens}
             />
           </Panel>
         );
@@ -576,8 +672,8 @@ export const DashboardPage: React.FC = () => {
               </div>
               {/* The receipt is offered where the spend is read, with the same weight as the requests tile's link. */}
               <Button
-                type="link"
-                size="small"
+                variant="link"
+                size="sm"
                 className="tile-link"
                 icon={<ReceiptOutlined />}
                 onMouseEnter={preloadReceiptShowcase}
@@ -590,13 +686,14 @@ export const DashboardPage: React.FC = () => {
             </div>
             <div className="tile-value">
               <RollingNumber readout={currencyReadout(data.metrics.cost, currency)} />
+              <KpiDelta delta={showComparisonBadge ? costDelta : null} formatPrevious={formatTrendCost} testId="dashboard-cost-delta" />
             </div>
             <div className="tile-caption">
               <span>{costNoteKey(data.metrics.cost_source) ? t(costNoteKey(data.metrics.cost_source)!) : ''}</span>
               {unpricedModels > 0 && data.metrics.cost_source !== 'estimated' && (
                 <Button
-                  type="link"
-                  size="small"
+                  variant="link"
+                  size="sm"
                   className="tile-caption-link"
                   onMouseEnter={() => preloadRegisteredRoute('/pricing')}
                   onClick={() => navigateTo('/pricing')}
@@ -625,7 +722,7 @@ export const DashboardPage: React.FC = () => {
             fallback={(
               <Panel className="dashboard-tile">
                 <Placeholder width="24%" className="placeholder-line is-meta" />
-                <Placeholder width="100%" height={260} className="tile-placeholder-spark" />
+                <RoutingMapSkeleton className="tile-placeholder-spark" />
               </Panel>
             )}
           >
@@ -719,8 +816,31 @@ export const DashboardPage: React.FC = () => {
           className="dashboard-alert"
           tone="warning"
           title={t('dash.partial_title')}
-          detail={data.partial_errors.join(' · ')}
+          detail={data.partial_errors.length === 1
+            ? data.partial_errors[0]
+            : <ul className="dashboard-alert-list">{data.partial_errors.map((error) => <li key={error}>{error}</li>)}</ul>}
           onRetry={refreshAll}
+        />
+      )}
+
+      {isQuietOpenCalendar && !isArranging && (
+        <Notice
+          tone="info"
+          className="dashboard-alert"
+          data-testid="dashboard-calendar-quiet"
+          title={t('dash.calendar_quiet')}
+          action={(
+            <>
+              <Button size="sm" onClick={() => void applyRange({ preset: '24h' })} data-testid="dashboard-switch-24h">
+                {t('dash.range.24h')}
+              </Button>
+              {previousPreset && (
+                <Button size="sm" onClick={() => void applyRange({ preset: previousPreset })} data-testid="dashboard-switch-previous">
+                  {calendarPresetLabel(t, previousPreset)}
+                </Button>
+              )}
+            </>
+          )}
         />
       )}
 

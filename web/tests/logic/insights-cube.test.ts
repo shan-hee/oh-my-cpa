@@ -2,22 +2,27 @@ import assert from 'node:assert/strict';
 import {
   FOLDED_ID,
   attributeServingProviders,
+  baselineMeasures,
   buildFlow,
   buildMatrix,
   compareMetric,
+  comparisonScale,
   decodeInsightsCube,
   emptyMeasures,
   facetValues,
   filterRows,
+  groupBaselines,
   groupTotals,
   isOAuthRow,
   matrixCellKey,
   metricValue,
   rankGroups,
+  robustBucketSum,
   sumMeasures,
   trendSeries,
 } from '../../src/types/insightsCube.ts';
-import { comparesSameStretch, insightsRangeParams, parseInsightsRange } from '../../src/types/insights.ts';
+import { formatCountBaseline } from '../../src/types/insightsFormat.ts';
+import { insightsRangeParams, parseInsightsRange } from '../../src/types/insights.ts';
 import { canShowWeekView, peakHourSet, summarizeRhythm } from '../../src/pages/insights/insightsRhythm.ts';
 import {
   DEFAULT_INSIGHTS_VIEW,
@@ -30,6 +35,7 @@ import type { InsightsCubeResponse } from '../../src/types/insights.ts';
 import { buildReceiptLedger, receiptCubeParams } from '../../src/components/dashboard/receipt/receiptModel.ts';
 import { isSlidingRange, requestListWindowParams } from '../../src/types/dashboard.ts';
 import { test } from 'vitest';
+import { buildSankeyLayout } from '../../src/pages/insights/charts/InsightsFlowChart.tsx';
 
 test('insights cube', () => {
   const COLUMNS = [
@@ -254,16 +260,49 @@ test('insights cube', () => {
   assert.equal(insightsRangeParams({ preset: 'today' }), 'preset=today');
   assert.equal(insightsRangeParams({ from: 1, to: null }, 'day'), 'from=1&bucket=day', 'an open range sends no end');
 
-  // A running calendar unit compares against the same stretch of the previous one; every other window
-  // compares against a whole period, so its figure is not a partial reading that needs saying.
-  const resolvedWindow = (preset: string, isOpen: boolean) => ({
-    preset, from: 0, to: 1, open_end: isOpen, bucket: 'hour' as const, timezone: 'UTC', widened: false,
+  // Robust baseline Winsorizes extreme single-bucket spikes while preserving normal skew and duty cycle,
+  // and scales the previous period's rate to the current window's elapsed duration.
+  assert.equal(robustBucketSum([]), 0);
+  assert.equal(robustBucketSum([0, 50, 0, 5000, 0, 10]), 5060, 'fewer than 4 active buckets keep raw sum');
+  assert.equal(robustBucketSum([1, 2, 5, 10, 20, 50, 100, 200]), 388, 'normal diurnal right-skew is untouched');
+  assert.ok(Math.abs(robustBucketSum([1, 1, 1, 1000]) - 5.5) < 1e-6, 'k=4 extreme spike is Winsorized');
+  assert.ok(Math.abs(robustBucketSum([20, 22, 18, 25, 20, 21, 19, 2000]) - 196.25) < 1e-6, 'extreme anomaly is Winsorized');
+
+  const bucketedCube = decodeInsightsCube({
+    ...response,
+    window: { preset: 'today', from: 0, to: 12 * 3_600_000 - 1, open_end: true, bucket: 'hour', timezone: 'UTC', widened: false },
+    compare_window: { from: -24 * 3_600_000, to: -1 },
+    previous_rows: [
+      row(0, 0, 0, 0, 0, 0, 10, 0, 1000, 1_000_000_000),
+      row(1, 0, 0, 0, 0, 0, 10, 0, 1000, 1_000_000_000),
+      row(2, 0, 0, 0, 0, 0, 10, 0, 1000, 1_000_000_000),
+      row(3, 0, 0, 0, 0, 0, 10, 0, 1000, 1_000_000_000),
+      // Extreme single-hour runaway spike in hour 4.
+      row(4, 0, 0, 0, 0, 0, 500, 0, 50_000, 50_000_000_000),
+    ],
   });
-  assert.equal(comparesSameStretch(resolvedWindow('today', true)), true);
-  assert.equal(comparesSameStretch(resolvedWindow('this_month', true)), true);
-  assert.equal(comparesSameStretch(resolvedWindow('yesterday', false)), false, 'a closed unit compares against a whole period');
-  assert.equal(comparesSameStretch(resolvedWindow('7d', true)), false, 'a relative window compares against a whole span');
-  assert.equal(comparesSameStretch(resolvedWindow('custom', true)), false, 'an open-ended range compares against the span before it');
+  const scale = comparisonScale(bucketedCube);
+  assert.equal(scale, 0.5);
+  const { baseline: prevBaseline, raw: prevRaw } = baselineMeasures(bucketedCube.previous, scale);
+  assert.equal(prevRaw.requests, 540);
+  // 4 buckets * 10 + 1 bucket capped at 2.5*10 = 65 -> * 0.5 = 32.5 requests.
+  assert.equal(prevBaseline.requests, 32.5);
+  assert.equal(prevBaseline.totalTokens, 3250);
+  const byKeyBase = groupBaselines(bucketedCube, bucketedCube.previous, 'key', scale);
+  assert.equal(byKeyBase.baseline.get('hmac:a')?.requests, 32.5);
+  assert.equal(byKeyBase.raw.get('hmac:a')?.requests, 540);
+  // Noise testing uses unscaled raw evidence counts rather than scaled baseline counts:
+  // with 100 current vs 100 raw previous (scaled to 1.0 baseline -> +9900% ratio), vs 1 raw previous.
+  const scaledWithFirmEvidence = compareMetric(usage(100, 10_000), usage(1, 5_000), 'tokens', usage(100, 100_000));
+  const scaledWithThinEvidence = compareMetric(usage(100, 10_000), usage(1, 5_000), 'tokens', usage(1, 5_000));
+  assert.deepEqual(scaledWithFirmEvidence, { kind: 'change', change: 1, isNoise: false });
+  assert.deepEqual(scaledWithThinEvidence, { kind: 'change', change: 1, isNoise: true });
+
+  // Fractional baseline counts format cleanly without dropping below visibility.
+  assert.equal(formatCountBaseline(1234.6), '1,235');
+  assert.equal(formatCountBaseline(32.5), '32.5');
+  assert.equal(formatCountBaseline(3.47), '3.47');
+  assert.equal(formatCountBaseline(0.004), '<0.01');
 
   // ── the view in the URL ───────────────────────────────────────────────────────
 
@@ -382,4 +421,47 @@ test('dashboard receipt ledger and calendar windows', () => {
   assert.equal(requestListWindowParams({ preset: 'yesterday' }, window).toString(), 'from=1000&to=9000', 'a calendar drill-down carries its resolved bounds');
   assert.equal(requestListWindowParams({ preset: 'this_month' }, window).toString(), 'from=1000', 'the current unit stays open');
   assert.equal(requestListWindowParams({ preset: 'all' }, window).toString(), 'preset=90d');
+
+  // Skewed 7-node Sankey column reserves minimum node heights within chart bounds.
+  const skewedWeights = [100_000, 1, 1, 1, 1, 1, 1];
+  const skewedNodes = [
+    ...skewedWeights.map((_, idx) => ({
+      id: `0:k${idx}`,
+      level: 0,
+      dimension: 'key' as const,
+      value: `k${idx}`,
+      folded: idx === skewedWeights.length - 1,
+      foldedCount: idx === skewedWeights.length - 1 ? 3 : 0,
+    })),
+    { id: '1:claude', level: 1, dimension: 'provider' as const, value: 'claude', folded: false, foldedCount: 0 },
+  ];
+  const skewedLinks = skewedWeights.map((weight, idx) => ({
+    source: `0:k${idx}`,
+    target: '1:claude',
+    value: weight,
+  }));
+  const chartHeight = 320;
+  const { layoutNodes } = buildSankeyLayout(
+    skewedNodes,
+    skewedLinks,
+    640,
+    chartHeight,
+    () => '#00a2fb',
+    (node) => node.value,
+  );
+  const col0 = layoutNodes.filter((item) => item.node.level === 0);
+  assert.equal(col0.length, 7);
+  assert.ok(col0.every((item) => item.h >= 4), 'every small node retains the 4px floor');
+  const col0Bottom = Math.max(...col0.map((item) => item.y + item.h));
+  assert.ok(col0Bottom <= chartHeight - 10 + 1e-6, `skewed column fits inside innerHeight (bottom=${col0Bottom})`);
+});
+
+test('a tooltip card travels as one fact per line plus its structure, and an empty card adds no hint', async () => {
+  const { readTipCard, tipCard } = await import('../../src/components/common/tipCard.ts');
+  const card = { heading: 'Versus the previous period', rows: [{ label: 'Change', value: '+230%', tone: 'up' as const }, { label: 'Previous average', value: '867' }], notes: [false, 'Scaled from the previous period'] };
+  const attributes = tipCard(card);
+  assert.equal(attributes['data-tip'], 'Versus the previous period\nChange: +230%\nPrevious average: 867\nScaled from the previous period');
+  assert.deepEqual(readTipCard(attributes['data-tip-card']), card);
+  assert.deepEqual(tipCard({ rows: [], notes: [null] }), {});
+  assert.equal(readTipCard('{not json'), null);
 });
