@@ -18,8 +18,8 @@
 }
 
 .section {
-  border: 1px solid var(--border);
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-edge);
   background: var(--surface);
   overflow: hidden;
 }
@@ -27,7 +27,7 @@
 .section-title {
   margin: 0;
   padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
   color: var(--meta);
   font-family: var(--font-mono);
   font-size: var(--text-xs);

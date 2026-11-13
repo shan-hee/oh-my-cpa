@@ -27,6 +27,55 @@ const LABEL = /^([A-Za-z][A-Za-z ]*):$/;
 const SSE_EVENT = 'event: ';
 const SSE_DATA = 'data: ';
 
+/** A string value this short and on one line reads as a field; anything longer is folded. */
+const MAX_FIELD_STRING_CHARS = 200;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Names one entry of a body's list by what the protocols put there: a message's role, a tool's
+ * name, or an item's type.
+ */
+function describeEntry(entry: unknown): string {
+  if (!isPlainObject(entry)) return '';
+  const fn = isPlainObject(entry.function) ? entry.function.name : undefined;
+  const hint = [entry.role, entry.name, fn, entry.type].find((value) => typeof value === 'string' && value !== '');
+  return typeof hint === 'string' ? ` ${hint}` : '';
+}
+
+/**
+ * Splits a JSON body into its top-level members, so a long conversation reads one message at a
+ * time: short scalars become fields, each list entry and each nested object its own payload.
+ * Anything that is not an object, or does not parse, stays one payload.
+ */
+function splitJsonBody(line: string): RequestLogBlock[] {
+  let body: unknown;
+  try {
+    body = JSON.parse(line);
+  } catch {
+    body = undefined;
+  }
+  if (!isPlainObject(body)) return [{ kind: 'payload', label: 'JSON', text: line }];
+
+  const blocks: RequestLogBlock[] = [];
+  for (const [key, value] of Object.entries(body)) {
+    if (Array.isArray(value) && value.length > 0) {
+      value.forEach((entry, index) => {
+        blocks.push({ kind: 'payload', label: `${key}[${index}]${describeEntry(entry)}`, text: JSON.stringify(entry) });
+      });
+    } else if (isPlainObject(value)) {
+      blocks.push({ kind: 'payload', label: key, text: JSON.stringify(value) });
+    } else if (typeof value === 'string' && (value.length > MAX_FIELD_STRING_CHARS || value.includes('\n'))) {
+      blocks.push({ kind: 'payload', label: key, text: value });
+    } else {
+      blocks.push({ kind: 'field', name: key, value: typeof value === 'string' ? value : JSON.stringify(value) });
+    }
+  }
+  return blocks;
+}
+
 function parseBlocks(lines: string[]): RequestLogBlock[] {
   const blocks: RequestLogBlock[] = [];
   for (let i = 0; i < lines.length; i++) {
@@ -42,7 +91,7 @@ function parseBlocks(lines: string[]): RequestLogBlock[] {
       continue;
     }
     if (line.startsWith('{') || line.startsWith('[')) {
-      blocks.push({ kind: 'payload', label: 'JSON', text: line });
+      blocks.push(...splitJsonBody(line));
       continue;
     }
     const label = LABEL.exec(line);

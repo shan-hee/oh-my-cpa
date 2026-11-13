@@ -1,11 +1,11 @@
 import React from 'react';
-import { Button, Segmented } from 'antd';
 import { useQuery } from '@tanstack/react-query';
+import { Button } from '@/components/ui/button';
+import { Segmented } from '@/components/ui/segmented';
 import { DownloadOutlined } from '../icons';
 import { api, apiErrorCode } from '../../api/client';
 import { useT } from '../../i18n';
 import { isDemoMode } from '../../types/demoMode';
-import { canPreviewLog, MAX_LOG_PREVIEW_BYTES } from '../../types/logs';
 import {
   formatLogPayload,
   parseRequestLog,
@@ -22,11 +22,17 @@ import { LoadFailure, Notice } from '../feedback';
 import logStyles from '../logs/Logs.module.css';
 import styles from './RequestLogTab.module.css';
 
-/** One body or stream event, open on arrival and foldable out of the way. */
+/**
+ * A long-context request body alone can run to megabytes, so one past this arrives folded and is
+ * indented only once it is opened.
+ */
+const OPEN_ON_ARRIVAL_CHARS = 256 * 1024;
+
+/** One body or stream event, foldable out of the way. */
 const Payload: React.FC<{ label: string; text: string }> = ({ label, text }) => {
-  const [isOpen, setIsOpen] = React.useState(true);
+  const [isOpen, setIsOpen] = React.useState(() => text.length <= OPEN_ON_ARRIVAL_CHARS);
   const size = React.useMemo(() => formatBytes(new TextEncoder().encode(text).length), [text]);
-  const formatted = React.useMemo(() => formatLogPayload(text), [text]);
+  const formatted = React.useMemo(() => (isOpen ? formatLogPayload(text) : ''), [isOpen, text]);
   return (
     <details className={styles.payload} open={isOpen} onToggle={(event) => setIsOpen(event.currentTarget.open)}>
       <summary>
@@ -89,9 +95,10 @@ export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId
 
   const query = useQuery({
     queryKey: ['usage-event-request-log', eventId],
+    // The server refuses a log past 16 MiB, so whatever arrives is small enough to draw.
     queryFn: async () => {
       const blob = await api.downloadUsageEventRequestLog(eventId);
-      return canPreviewLog(blob.size) ? { blob, text: await blob.text() } : { blob, text: undefined };
+      return { blob, text: await blob.text() };
     },
     enabled: isAvailable && isActive,
     meta: { silent: true },
@@ -99,8 +106,8 @@ export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId
     staleTime: Infinity,
     gcTime: 0,
   });
-  const text = query.data?.text;
-  const sections = React.useMemo(() => (text ? parseRequestLog(text) : []), [text]);
+  const text = query.data?.text ?? '';
+  const sections = React.useMemo(() => parseRequestLog(text), [text]);
 
   if (isDemo) return <Notice tone="info" title={t('demo.blocked')} />;
   if (!isAvailable) return <EmptyState size="compact" title={t('events.log_unavailable')} />;
@@ -114,9 +121,7 @@ export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId
   const { blob } = query.data;
   const fileName = `${(requestId ?? '').replace(/[^a-zA-Z0-9._-]/g, '_')}.log`;
   let body: React.ReactNode;
-  if (text === undefined) {
-    body = <Notice tone="info" title={t('logs.viewer_too_large', { limit: formatBytes(MAX_LOG_PREVIEW_BYTES) })} />;
-  } else if (text.trim() === '') {
+  if (text.trim() === '') {
     body = <EmptyState size="compact" title={t('logs.viewer_empty')} />;
   } else if (sections.length === 0) {
     body = <pre className={logStyles['viewer-text']} tabIndex={0}>{text}</pre>;
@@ -129,17 +134,17 @@ export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId
     <div className={styles.root}>
       <div className={styles.toolbar}>
         {sections.length > 0 && (
-          <Segmented
+          <Segmented<RequestLogSide>
             value={side}
             options={[
               { value: 'request', label: t('events.raw_log_request') },
               { value: 'response', label: t('events.raw_log_response') },
             ]}
-            onChange={(value) => setSide(value as RequestLogSide)}
+            onChange={setSide}
           />
         )}
         <div className={styles.actions}>
-          <CopyButton showLabel size="middle" text={text ?? ''} disabled={!text} />
+          <CopyButton showLabel size="default" text={text} disabled={!text} />
           <Button icon={<DownloadOutlined />} onClick={() => saveBlob(blob, fileName)}>
             {t('logs.download')}
           </Button>
