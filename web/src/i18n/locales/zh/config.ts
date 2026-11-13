@@ -79,7 +79,7 @@ export default {
   'cfg.request_log': '记录请求日志',
   'cfg.logging_to_file': '写入日志文件',
   'cfg.logging_to_file_desc': '保存日志到磁盘，实时日志查看依赖此项',
-  'cfg.logs_max_total_size_mb': '日志文件大小上限',
+  'cfg.logs_max_total_size_mb': '日志总大小上限',
   'cfg.error_logs_max_files': '错误日志保留数',
   'cfg.routing_strategy': '负载路由策略',
   'cfg.strategy_round_robin': '轮询 (Round Robin)',

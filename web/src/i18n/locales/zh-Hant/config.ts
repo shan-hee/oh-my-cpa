@@ -82,7 +82,7 @@ export default {
   "cfg.request_log": "記錄請求日誌",
   "cfg.logging_to_file": "寫入日誌檔案",
   "cfg.logging_to_file_desc": "保存日誌到磁碟，即時日誌查看依賴此項",
-  "cfg.logs_max_total_size_mb": "日誌檔案大小上限",
+  "cfg.logs_max_total_size_mb": "日誌總大小上限",
   "cfg.error_logs_max_files": "錯誤日誌保留數",
   "cfg.routing_strategy": "負載路由策略",
   "cfg.strategy_round_robin": "輪詢 (Round Robin)",
