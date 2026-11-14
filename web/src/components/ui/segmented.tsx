@@ -88,7 +88,7 @@ export function Segmented<T extends string | number = string>({
           disabled={disabled || option.disabled}
           data-tip={option.title}
           className={cn(
-            'inline-flex flex-1 items-center gap-1.5 whitespace-nowrap rounded-sm border-0 bg-transparent font-normal text-muted-foreground cursor-pointer',
+            'inline-flex flex-1 items-center gap-1.5 whitespace-nowrap rounded-sm border-0 bg-transparent font-normal text-fg-2 cursor-pointer',
             'transition-[background-color,color,box-shadow] touch-manipulation',
             'justify-center',
             'hover:not-data-disabled:not-data-checked:text-foreground',
@@ -97,7 +97,6 @@ export function Segmented<T extends string | number = string>({
             'focus-visible:outline-none focus-visible:shadow-focus',
             'data-disabled:pointer-events-none data-disabled:opacity-50',
             isSmall ? 'min-h-6 px-2.5 py-0.5 text-md' : 'min-h-7 px-3 py-1 text-md',
-            '[@media(pointer:coarse)]:min-h-[30px]',
             option.className,
           )}
         >

@@ -80,6 +80,10 @@ type ProviderItemDTO struct {
 	// link.
 	Website   string `json:"website,omitempty"`
 	TestModel string `json:"test_model,omitempty"`
+
+	// runtimeKeys stays internal so non-reveal projections can recover disabled
+	// auth_indexes and record key masks without exposing plaintext keys in JSON.
+	runtimeKeys []providerRuntimeKey
 }
 
 // providerConfigFamilySpec describes one of CPA's config API-key credential
@@ -166,6 +170,7 @@ func configKeyProviderItems(spec providerConfigFamilySpec, entries []management.
 		}
 
 		keyEntries := make([]ProviderKeyEntryDTO, 0)
+		var runtimeKeys []providerRuntimeKey
 		if strings.TrimSpace(entry.APIKey) != "" {
 			pool := entry.ConnectionPoolContext()
 			keyEntries = append(keyEntries, ProviderKeyEntryDTO{
@@ -176,6 +181,10 @@ func configKeyProviderItems(spec providerConfigFamilySpec, entries []management.
 				ProxyURL:                entry.ProxyURL,
 				Weight:                  entry.Weight,
 			})
+			runtimeKeys = []providerRuntimeKey{{
+				authIndex: entry.AuthIndex,
+				apiKey:    entry.APIKey,
+			}}
 		}
 
 		var disableCoolingVal bool
@@ -208,6 +217,7 @@ func configKeyProviderItems(spec providerConfigFamilySpec, entries []management.
 			ProxyConfigured: strings.TrimSpace(entry.ProxyURL) != "",
 			RuntimePolicy:   providerRuntimePolicyDTO(entry.DisableCooling, entry.RequestRetry, entry.RequestScopedErrors, capabilities),
 			Behavior:        configKeyBehaviorDTO(entry, capabilities),
+			runtimeKeys:     runtimeKeys,
 		})
 	}
 	return items
@@ -240,6 +250,24 @@ func revealedProviderKeyCount(items []ProviderItemDTO) int {
 	return count
 }
 
+// ManagementProviderListResponseDTO lists configured provider entries and optional state version.
+type ManagementProviderListResponseDTO struct {
+	Providers []ProviderItemDTO `json:"providers"`
+	Total     int               `json:"total"`
+	Version   uint64            `json:"version,omitempty"`
+}
+
+// @Summary List configured AI providers
+// @Description Return configured AI providers with optional raw API key reveal (audited fail-closed when include_keys=true).
+// @Tags Providers
+// @Produce json
+// @Security CookieAuth
+// @Param include_keys query boolean false "Include raw API keys (audited fail-closed; refused in demo)"
+// @Success 200 {object} ManagementProviderListResponseDTO
+// @Failure 401 {object} ErrorResponseDTO
+// @Failure 500 {object} ErrorResponseDTO
+// @Failure 502 {object} ErrorResponseDTO
+// @Router /v1/management/providers [get]
 func (h *Handler) listManagementProviders(writer http.ResponseWriter, request *http.Request) {
 	writer.Header().Set("Cache-Control", "no-store")
 	client, ok := h.managementClientOrError(writer, request)
@@ -273,14 +301,11 @@ func (h *Handler) listManagementProviders(writer http.ResponseWriter, request *h
 		}
 	}
 	setStateVersionHeader(writer, version)
-	body := map[string]any{
-		"providers": items,
-		"total":     len(items),
-	}
-	if version > 0 {
-		body["version"] = version
-	}
-	writeJSON(writer, http.StatusOK, body)
+	writeJSON(writer, http.StatusOK, ManagementProviderListResponseDTO{
+		Providers: items,
+		Total:     len(items),
+		Version:   version,
+	})
 }
 
 func (h *Handler) readProviderItems(ctx context.Context, client *management.Client) []ProviderItemDTO {
@@ -288,7 +313,17 @@ func (h *Handler) readProviderItems(ctx context.Context, client *management.Clie
 	return items
 }
 
+func (h *Handler) readProviderItemsWithStatus(ctx context.Context, client *management.Client) ([]ProviderItemDTO, bool) {
+	items, _, known := h.readProviderItemsCore(ctx, client)
+	return items, known
+}
+
 func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *management.Client) ([]ProviderItemDTO, uint64) {
+	items, version, _ := h.readProviderItemsCore(ctx, client)
+	return items, version
+}
+
+func (h *Handler) readProviderItemsCore(ctx context.Context, client *management.Client) ([]ProviderItemDTO, uint64, bool) {
 	if h.stateCoord != nil {
 		// Load local SQLite metadata overlays BEFORE acquiring stateCoord.RLock so
 		// the coordinator lock stays strictly I/O-free.
@@ -305,18 +340,19 @@ func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *mana
 		env, err := statecoord.ProjectTyped(ctx, h.stateCoord, func(state projectedConfigState, _ uint64) (projectedProviderInput, error) {
 			fams := make(map[management.ConfigKeyFamily][]management.ConfigAPIKey, len(state.ConfigFamilies))
 			for fam, list := range state.ConfigFamilies {
-				fams[fam] = cloneViaJSON(list)
+				fams[fam] = cloneConfigAPIKeys(list)
 			}
 			return projectedProviderInput{
 				families:      fams,
 				failedFam:     maps.Clone(state.FailedProviderFamilies),
-				openAI:        cloneViaJSON(state.OpenAICompat),
+				openAI:        cloneOpenAICompatEntries(state.OpenAICompat),
 				openAIFailed:  state.OpenAISliceFailed,
 				hasAnyFailure: state.ProviderSliceFailed,
 			}, nil
 		})
 		if err == nil {
 			input := env.Data
+			stillAnyFailure := false
 			if input.hasAnyFailure {
 				recoveredFamilies := make(map[management.ConfigKeyFamily][]management.ConfigAPIKey)
 				recoveredRuntimeOnly := make(map[management.ConfigKeyFamily]bool)
@@ -331,6 +367,8 @@ func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *mana
 						input.families[fam] = runtimeEntries
 						recoveredFamilies[fam] = runtimeEntries
 						recoveredRuntimeOnly[fam] = true
+					} else {
+						stillAnyFailure = true
 					}
 				}
 				var recoveredOpenAI []management.OpenAICompatibility
@@ -351,13 +389,15 @@ func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *mana
 						recoveredOpenAI = runtime.Entries
 						didRecoverOpenAI = true
 						recoveredOpenAIRuntime = true
+					} else {
+						stillAnyFailure = true
 					}
 				}
 				if len(recoveredFamilies) > 0 || didRecoverOpenAI {
 					h.stateCoord.UpdateBaseline(func(state *projectedConfigState, _ bool) {
 						for fam, entries := range recoveredFamilies {
 							if len(state.PendingFamilyToggles[fam]) == 0 {
-								state.ConfigFamilies[fam] = cloneViaJSON(entries)
+								state.ConfigFamilies[fam] = cloneConfigAPIKeys(entries)
 							}
 							delete(state.FailedProviderFamilies, fam)
 							if recoveredRuntimeOnly[fam] {
@@ -368,7 +408,7 @@ func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *mana
 						}
 						if didRecoverOpenAI {
 							if len(state.PendingOpenAIToggles) == 0 {
-								state.OpenAICompat = cloneViaJSON(recoveredOpenAI)
+								state.OpenAICompat = cloneOpenAICompatEntries(recoveredOpenAI)
 							}
 							state.OpenAISliceFailed = false
 							state.OpenAIRuntime = recoveredOpenAIRuntime
@@ -377,13 +417,18 @@ func (h *Handler) readProviderItemsWithVersion(ctx context.Context, client *mana
 					})
 				}
 			}
-			return projectProviderItemsFromRaw(input.families, input.openAI, customNames, customWebsites, testModels), env.Version
+			items := projectProviderItemsFromRaw(input.families, input.openAI, customNames, customWebsites, testModels)
+			complete := !stillAnyFailure
+			h.enrichAndArchiveProviders(ctx, items, complete)
+			return items, env.Version, complete
 		}
 	}
-	return h.readProviderItemsUpstream(ctx, client), 0
+	items, known := h.readProviderItemsUpstreamWithStatus(ctx, client)
+	h.enrichAndArchiveProviders(ctx, items, known)
+	return items, 0, known
 }
 
-func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *management.Client) []ProviderItemDTO {
+func (h *Handler) readProviderItemsUpstreamWithStatus(ctx context.Context, client *management.Client) ([]ProviderItemDTO, bool) {
 	items := make([]ProviderItemDTO, 0)
 	customNames := h.loadProviderNames(ctx)
 	customWebsites := h.loadProviderWebsites(ctx)
@@ -393,6 +438,7 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 	// the compatibility list, then join by registry position so gateway latency
 	// does not accumulate and completion order cannot reorder positional ids.
 	familyItems := make([][]ProviderItemDTO, len(providerConfigFamilies))
+	familyFailed := make([]bool, len(providerConfigFamilies))
 	var reads sync.WaitGroup
 	for index, spec := range providerConfigFamilies {
 		reads.Go(func() {
@@ -402,6 +448,7 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 				// CPA's runtime view when only the stored-group read failed; provider
 				// writes still require the editable read and refuse to overwrite it.
 				if entries, err = client.ConfigAPIKeys(ctx, spec.Family); err != nil {
+					familyFailed[index] = true
 					return
 				}
 				// The runtime read carries effective pool values, not the stored
@@ -470,8 +517,13 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 			}
 			keyEntries := make([]ProviderKeyEntryDTO, 0, len(entry.APIKeyEntries)+len(entry.LegacyAPIKeys))
 			authIndexes := make([]string, 0, len(entry.APIKeyEntries))
+			runtimeKeys := make([]providerRuntimeKey, 0, len(entry.APIKeyEntries)+len(entry.LegacyAPIKeys))
 			for ki, k := range entry.APIKeyEntries {
 				authIndexes = append(authIndexes, nonEmptyStrings(k.AuthIndex)...)
+				runtimeKeys = append(runtimeKeys, providerRuntimeKey{
+					authIndex: k.AuthIndex,
+					apiKey:    k.APIKey,
+				})
 				keyEntries = append(keyEntries, ProviderKeyEntryDTO{
 					ConnectionPool:          providerPoolSettingsDTO(k.ConnectionPool),
 					EffectiveConnectionPool: providerPoolSettingsDTO(management.MergeConnectionPools(entry.ConnectionPool, k.ConnectionPool)),
@@ -482,6 +534,7 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 				})
 			}
 			for ki, k := range entry.LegacyAPIKeys {
+				runtimeKeys = append(runtimeKeys, providerRuntimeKey{apiKey: k})
 				keyEntries = append(keyEntries, ProviderKeyEntryDTO{
 					Index:  len(entry.APIKeyEntries) + ki,
 					APIKey: k,
@@ -512,6 +565,7 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 				ProxyConfigured: false,
 				RuntimePolicy:   providerRuntimePolicyDTO(entry.DisableCooling, entry.RequestRetry, entry.RequestScopedErrors, compatCapabilities),
 				Behavior:        &ProviderBehaviorDTO{SupportPromptCacheKey: &isPromptCacheKeySupported},
+				runtimeKeys:     runtimeKeys,
 			})
 		}
 	}
@@ -525,5 +579,12 @@ func (h *Handler) readProviderItemsUpstream(ctx context.Context, client *managem
 		items[index].TestModel = testModels[items[index].ID]
 	}
 
-	return items
+	allKnown := err == nil
+	for _, failed := range familyFailed {
+		if failed {
+			allKnown = false
+			break
+		}
+	}
+	return items, allKnown
 }

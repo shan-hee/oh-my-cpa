@@ -23,7 +23,7 @@ import {
   eventWindowQuery,
   type EventFilterKey,
 } from '../types/usageEventQuery';
-import { createProviderNameResolver, credentialOptionLabel, indexCredentialFiles } from '../types/usageEventIdentity';
+import { createProviderNameResolver, credentialOptionLabel } from '../types/usageEventIdentity';
 import {
   UNKNOWN_EVENT_GROUP,
   eventCredentialIdentity,
@@ -217,9 +217,11 @@ export const UsageEventsPage: React.FC = () => {
     [cursor, query],
   );
   const queryString = React.useMemo(() => usageEventParams(baseEventParams), [baseEventParams]);
-  // A live signal moves the list to a new key, so its read has no data yet and would count as a
-  // load. Only the read the signal alone caused is silent: the same key change that also carries a
-  // new filter, page or manual sync is one the operator asked for.
+  // Only a read caused solely by a live signal is silent: a filter/page change
+  // or manual sync is one the operator asked for. Keeping `refresh` out of the
+  // query key lets live signals refetch the current view in place instead of
+  // minting a new key with `isPlaceholderData: true` (which flashed "Updating"
+  // in the pagination footer on every live tick).
   const readCauseRef = React.useRef({ queryString, refresh, liveRevision, isLiveRead: false });
   if (readCauseRef.current.queryString !== queryString || readCauseRef.current.refresh !== refresh) {
     const previous = readCauseRef.current;
@@ -231,7 +233,7 @@ export const UsageEventsPage: React.FC = () => {
     };
   }
   const result = useQuery({
-    queryKey: ['usage-events', queryString, refresh],
+    queryKey: ['usage-events', queryString],
     queryFn: async () => {
       const heldBoundaryID = getHeldBoundaryID();
       const params = heldBoundaryID !== undefined
@@ -244,35 +246,55 @@ export const UsageEventsPage: React.FC = () => {
     enabled: isQueryEnabled,
     placeholderData: keepPreviousData,
     staleTime: 5_000,
-    // Every live signal is a new key and a superseded page is never read again, so
-    // keeping it would hold a page per signal for the default five minutes.
-    // keepPreviousData works from the observer's last result, not the old entry.
-    gcTime: 0,
     meta: { silent: readCauseRef.current.isLiveRead },
   });
+  const refetchEvents = result.refetch;
+  const lastRefreshTriggerRef = React.useRef({ queryString, refresh });
+  React.useEffect(() => {
+    const previous = lastRefreshTriggerRef.current;
+    lastRefreshTriggerRef.current = { queryString, refresh };
+    if (!isQueryEnabled) return;
+    if (previous.queryString !== queryString) {
+      void refetchEvents({ cancelRefetch: false });
+      return;
+    }
+    if (previous.refresh === refresh) return;
+    void refetchEvents();
+  }, [isQueryEnabled, queryString, refresh, refetchEvents]);
+
   // Assigned after the read it describes, so the poll's interval always observes
   // the latest value without naming it in its dependency list.
   isFetchingRef.current = result.isFetching;
+  const wasFetchingRef = React.useRef(false);
   // A record that landed while this read was in flight was held for it; it is read now.
   React.useEffect(() => {
-    if (!result.isFetching) notifySettled();
+    if (result.isFetching) {
+      wasFetchingRef.current = true;
+      return;
+    }
+    if (wasFetchingRef.current) {
+      wasFetchingRef.current = false;
+      readCauseRef.current.isLiveRead = false;
+    }
+    notifySettled();
   }, [result.isFetching, notifySettled]);
+  const isVisibleFetching = result.isFetching && !readCauseRef.current.isLiveRead;
 
   const handlePrevPage = React.useCallback(() => {
-    if (!cursors.length || result.isFetching) return;
+    if (!cursors.length || isVisibleFetching) return;
     markPageNavigation();
     setPagination({ scope: viewScope, cursors: cursors.slice(0, -1) });
     scrollListToTop();
     schedulePageNavigationReset();
-  }, [cursors, markPageNavigation, result.isFetching, schedulePageNavigationReset, scrollListToTop, viewScope]);
+  }, [cursors, isVisibleFetching, markPageNavigation, schedulePageNavigationReset, scrollListToTop, viewScope]);
 
   const handleNextPage = React.useCallback(() => {
-    if (!result.data?.has_more || !result.data?.next_cursor || result.isFetching || result.isError) return;
+    if (!result.data?.has_more || !result.data?.next_cursor || isVisibleFetching || result.isError) return;
     markPageNavigation();
     setPagination({ scope: viewScope, cursors: [...cursors, result.data.next_cursor] });
     scrollListToTop();
     schedulePageNavigationReset();
-  }, [cursors, markPageNavigation, result.data, result.isFetching, result.isError, schedulePageNavigationReset, scrollListToTop, viewScope]);
+  }, [cursors, isVisibleFetching, markPageNavigation, result.data, result.isError, schedulePageNavigationReset, scrollListToTop, viewScope]);
 
 
   // keepPreviousData covers in-flight changes; retain the last successful page
@@ -332,40 +354,32 @@ export const UsageEventsPage: React.FC = () => {
   React.useEffect(clearSelectedRows, [clearSelectedRows, signature]);
   const pendingCount = pendingArrivals(result.data?.arrived_count);
 
-  // Safe file metadata only: never download credential contents for the stream.
-  const authFiles = useQuery({
-    queryKey: ['management-auth-files'],
-    queryFn: () => api.getManagementAuthFiles(),
-    staleTime: 60_000,
-  });
-  const credentials = React.useMemo(
-    () => indexCredentialFiles(authFiles.data?.files || []),
-    [authFiles.data],
-  );
-  // A plugin that registers an OAuth provider also publishes its logo, which the
-  // request row shows in place of the console's catalog mark. The catalog itself
-  // comes from the shared hook: a page-local copy of this query drifted from the
-  // freshness rule the other surfaces apply to the same data.
+  // Safe credential metadata and historical archive come from the consolidated
+  // identity directory so live and deleted credentials resolve identically.
   const {
+    credentials,
+    isCredentialsUnavailable,
     providerIcons,
     pluginLogos,
     multiPortalKeys,
     pluginTitles,
     configuredProviders,
+    archivedProvidersByKey,
+    archive,
     isProviderCatalogUnproven,
     refetchProviders,
   } = useProviderBranding();
   // Resolves CPA's stored provider key to the name the operator configured, so
   // the filter names a line the same way the providers page does.
   const providerName = React.useMemo(
-    () => createProviderNameResolver(configuredProviders, pluginTitles),
-    [configuredProviders, pluginTitles],
+    () => createProviderNameResolver(configuredProviders, pluginTitles, archivedProvidersByKey),
+    [configuredProviders, pluginTitles, archivedProvidersByKey],
   );
   // Records resolve by runtime credential index, not a projected positional id.
   // A routine catalog refetch does not withdraw an identity already resolved.
   const renderFacetMark = React.useMemo(
-    () => createFacetMarkRenderer({ credentials, providerIcons, configuredProviders, pluginLogos, multiPortalKeys, isProviderCatalogUnknown: isProviderCatalogUnproven }),
-    [credentials, providerIcons, configuredProviders, pluginLogos, multiPortalKeys, isProviderCatalogUnproven],
+    () => createFacetMarkRenderer({ credentials, providerIcons, configuredProviders, pluginLogos, multiPortalKeys, isProviderCatalogUnknown: isProviderCatalogUnproven, archive }),
+    [credentials, providerIcons, configuredProviders, pluginLogos, multiPortalKeys, isProviderCatalogUnproven, archive],
   );
 
   /**
@@ -528,9 +542,10 @@ export const UsageEventsPage: React.FC = () => {
   }, [credentials, grouping, multipleAuthSources, providerName, t, unknownCredentialLabel, unknownProviderLabel]);
 
   const renderRequestRow = React.useCallback(
-    (event: UsageEvent) => (
+    (event: UsageEvent, position: number) => (
       <RequestRow
         event={event}
+        isOddRow={position % 2 === 0}
         credentials={credentials}
         providerIcons={providerIcons}
         configuredProviders={configuredProviders}
@@ -538,6 +553,7 @@ export const UsageEventsPage: React.FC = () => {
         multiPortalKeys={multiPortalKeys}
         pluginTitles={pluginTitles}
         isProviderCatalogUnknown={isProviderCatalogUnproven}
+        archive={archive}
         onOpen={setSelected}
         isSelected={selected === event.id}
         isChecked={selection.has(event.id)}
@@ -555,6 +571,7 @@ export const UsageEventsPage: React.FC = () => {
       pluginLogos,
       pluginTitles,
       providerIcons,
+      archive,
       selected,
       selection,
     ],
@@ -635,7 +652,7 @@ export const UsageEventsPage: React.FC = () => {
               />
               <RequestFoldToggle collapse={collapse} onToggle={handleToggleExpand} />
               <RefreshButton
-                isRefreshing={isSyncing || result.isFetching}
+                isRefreshing={isSyncing || isVisibleFetching}
                 disabled={isSyncing}
                 onRefresh={handleManualRefresh}
               />
@@ -652,7 +669,10 @@ export const UsageEventsPage: React.FC = () => {
             <LoadFailure
               title={t('events.load_error')}
               error={result.error}
-              onRetry={() => void result.refetch()}
+              onRetry={() => {
+                readCauseRef.current.isLiveRead = false;
+                void result.refetch();
+              }}
             />
           )}
           <RequestToolbar
@@ -699,7 +719,7 @@ export const UsageEventsPage: React.FC = () => {
               setIsFilterDrawerOpen(false);
             }}
           />
-          {authFiles.isError && (
+          {isCredentialsUnavailable && (
             <div className="request-detail-note" role="status">
               {t('events.credentials_unavailable')}
             </div>
@@ -712,18 +732,9 @@ export const UsageEventsPage: React.FC = () => {
           className={clsx('request-stream', isSelecting && 'is-selecting')}
           data-folded-columns={foldedColumns}
           aria-label={t('events.title')}
-          aria-busy={result.isFetching}
+          aria-busy={isVisibleFetching}
           style={streamStyle}
         >
-          {isSelecting && (
-            <RequestSelectionBar
-              count={selection.size}
-              isEveryLoadedSelected={loadedSelectionState(selection, events) === 'all'}
-              onSelectLoaded={() => handleToggleAll(true)}
-              onClear={clearSelection}
-              onExport={() => setIsExportOpen(true)}
-            />
-          )}
           <div ref={scrollAreaRef} className="request-table-scroll-area">
             <RequestStreamHeader
               colWidths={colWidths}
@@ -769,7 +780,7 @@ export const UsageEventsPage: React.FC = () => {
             page={cursors.length + 1}
             count={events.length}
             limit={query.limit!}
-            isFetching={result.isFetching}
+            isFetching={isVisibleFetching}
             isError={result.isError}
             hasMore={!!result.data?.has_more}
             hasNextCursor={!!result.data?.next_cursor}
@@ -777,6 +788,15 @@ export const UsageEventsPage: React.FC = () => {
             onPageSizeChange={setPageSize}
             onPrev={handlePrevPage}
             onNext={handleNextPage}
+            dock={isSelecting && (
+              <RequestSelectionBar
+                count={selection.size}
+                isEveryLoadedSelected={loadedSelectionState(selection, events) === 'all'}
+                onSelectLoaded={() => handleToggleAll(true)}
+                onClear={clearSelection}
+                onExport={() => setIsExportOpen(true)}
+              />
+            )}
           />
         </section>
         <RequestBackToTop scrolledDown={scrolledDown} pendingCount={pendingCount} onBackToTop={handleBackToTop} />
@@ -793,6 +813,7 @@ export const UsageEventsPage: React.FC = () => {
         multiPortalKeys={multiPortalKeys}
         pluginTitles={pluginTitles}
         isProviderCatalogUnknown={isProviderCatalogUnproven}
+        archive={archive}
       />
       <RequestExportDialog
         open={isExportOpen}
@@ -807,6 +828,7 @@ export const UsageEventsPage: React.FC = () => {
         pluginTitles={pluginTitles}
         isProviderUnproven={isProviderCatalogUnproven}
         onRetryProviders={() => void refetchProviders()}
+        archive={archive}
       />
     </div>
   );

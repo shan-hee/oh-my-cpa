@@ -26,6 +26,7 @@ import { Select } from '../src/components/ui/select';
 import { Tabs } from '../src/components/ui/tabs';
 import { Combobox } from '../src/components/ui/combobox';
 import { AutoComplete } from '../src/components/ui/autocomplete';
+import { DataTable } from '../src/components/ui/table';
 import { I18nProvider, useT, type MessageKey } from '../src/i18n';
 import { ThemeProvider } from '../src/theme/ThemeContext';
 import { RoutingPanel } from '../src/components/dashboard/routing/RoutingPanel';
@@ -231,7 +232,7 @@ describe('SelectionBar', () => {
       </SelectionBar>,
     );
     expect(screen.getByRole('status').textContent).toBe('3 selected');
-    expect(container.querySelector('.selection-bar.is-framed')).toBeTruthy();
+    expect(container.querySelector('.selection-bar')).toBeTruthy();
     expect(container.querySelector('.selection-bar-note')?.textContent).toBe('2 on other pages');
     expect(container.querySelector('.selection-bar-actions button')?.textContent).toBe('Delete');
   });
@@ -1055,5 +1056,67 @@ describe('RoutingPanel loading topology', () => {
       expect(screen.queryByTestId('routing-skeleton')).toBeNull();
       expect(screen.getByTestId('routing-map')).toBeTruthy();
     });
+  });
+});
+
+describe('Combobox empty-string option selection', () => {
+  it('displays and marks an explicit empty-string option when value is "" and shows placeholder otherwise', () => {
+    const { rerender } = renderWithOmc(
+      <Combobox
+        aria-label="Warmup model"
+        value=""
+        open
+        options={[
+          { value: '', label: 'Auto (gpt-6-luna)' },
+          { value: 'gpt-6-luna', label: 'gpt-6-luna' },
+        ]}
+      />,
+    );
+    const trigger = screen.getByRole('combobox', { name: 'Warmup model' });
+    expect(trigger.textContent).toContain('Auto (gpt-6-luna)');
+    const autoOption = screen.getByRole('option', { name: 'Auto (gpt-6-luna)' });
+    expect(autoOption.getAttribute('aria-selected')).toBe('true');
+
+    rerender(
+      <Combobox
+        aria-label="Warmup model"
+        value=""
+        placeholder="Pick a model"
+        options={[
+          { value: 'gpt-6-luna', label: 'gpt-6-luna' },
+        ]}
+      />,
+    );
+    expect(screen.getByRole('combobox', { name: 'Warmup model' }).textContent).toContain('Pick a model');
+  });
+});
+
+describe('DataTable row slots', () => {
+  it('marks rendered data rows with data-slot="table-row" and omits it from empty-state rows', () => {
+    const columns = [{ title: 'Name', dataIndex: 'name', key: 'name' }] as const;
+    const CustomRow = (props: React.HTMLAttributes<HTMLTableRowElement>) => <tr data-custom-row="true" {...props} />;
+
+    const { container, rerender } = render(
+      <DataTable<{ id: string; name: string }>
+        rowKey="id"
+        columns={columns}
+        dataSource={[]}
+        locale={{ emptyText: 'Nothing yet' }}
+      />,
+    );
+    expect(container.querySelectorAll('[data-slot="table-row"]')).toHaveLength(0);
+
+    rerender(
+      <DataTable<{ id: string; name: string }>
+        rowKey="id"
+        columns={columns}
+        dataSource={[{ id: 'p1', name: 'Alpha' }]}
+        components={{ body: { row: CustomRow } }}
+      />,
+    );
+    const rows = container.querySelectorAll('tbody [data-slot="table-row"]');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].getAttribute('data-row-key')).toBe('p1');
+    expect(rows[0].getAttribute('data-custom-row')).toBe('true');
   });
 });

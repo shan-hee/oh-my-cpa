@@ -46,7 +46,7 @@ pnpm exec wrangler deploy --config deploy/cloudflare/wrangler.jsonc --dry-run
 
 `build:demo` stages an already-built SPA and ensures `deploy/cloudflare/data/responses.json` is generated; it does not build the SPA itself. A fresh checkout has no embedded production assets. If `go` is absent from `PATH` (for example on Cloudflare Workers Builds), `scripts/generate-demo-data.mjs` downloads and verifies the Go toolchain pinned in `scripts/tools-versions.json`.
 
-`pnpm check:demo` and `pnpm test:self` verify dataset privacy, schema coverage, refusal rules, and Worker route matching. Local built-artifact browser acceptance and its setup are described in [Testing](../testing.md).
+`pnpm check:demo` and `pnpm test:self` verify dataset privacy, schema coverage, refusal rules, and Worker route matching; `ci.yml` also verifies `pnpm build:demo` and `wrangler deploy --dry-run` whenever browser-facing or API code changes. Local built-artifact browser acceptance and its setup are described in [Testing](../testing.md).
 
 ## Deploy
 
@@ -71,6 +71,14 @@ checkout reproduces the intended publication surface.
 Rollback restores the Worker and static assets together using Cloudflare's retained
 versions. Revert the corresponding source change on `main` as well, otherwise the
 next push deploys it again. There is no demonstration database to restore.
+
+## Public site, `/demo` subpath, and API documentation (`deploy/site`)
+
+[`deploy/site`](../../deploy/site) mounts the replaceable root entrypoint (`deploy/site/landing/`), `/api-docs/`, and `/demo/` together for `omc.junze.dev`:
+
+- `pnpm build:api-docs`: Stages the standalone, self-hosted Scalar UI (`index.html`, content-hashed `scalar.<hash>.js`, `docs/openapi/swagger.json`, and `favicon.svg`) to `tmp/api-docs` (or `--out <dir>`) with zero Cloudflare or landing-page coupling, so any landing framework or static server can embed `/api-docs/`.
+- `pnpm build:site`: Composes `deploy/site/landing/` (or `--landing-dir <dir>`), `_headers`, `/api-docs/`, and `/demo/` (from the built SPA with `basePath: '/demo'`, or skip with `--skip-demo`) into `tmp/site/dist`.
+- `deploy/site/worker.mjs` and `deploy/site/wrangler.jsonc`: Mount the shared `deploy/cloudflare/worker.mjs` demo handler under `/demo` (`run_worker_first: ["/demo", "/demo/*"]`) for `omc.junze.dev` (`workers_dev: false`, `not_found_handling: "none"`). Workers Builds connects `oh-my-cpa-site` to `main` with preview builds disabled, build command `pnpm build && pnpm check:demo && pnpm build:site`, and deploy command `pnpm exec wrangler deploy --config deploy/site/wrangler.jsonc`.
 
 ## Troubleshooting
 

@@ -62,7 +62,7 @@ and operator procedures.
 
 - **Backend layered structure**:
   - `cmd/oh-my-cpa/`: CLI entrypoints (`serve`, `updater`, `mcp`, `database`).
-  - `internal/api/`: HTTP transport, auth/CSRF middleware, handwritten DTO projections, SSE streaming.
+  - `internal/api/`: HTTP transport, auth/CSRF middleware, handwritten DTO projections, SSE streaming, and `swaggo` Swagger 2.0 annotations.
   - `internal/operations/`: Shared business mutations (validation, revision checks, write gates, backups, readback) consumed by both HTTP handlers and Agent/MCP capabilities.
   - `internal/capability/`, `internal/agent/`, `internal/mcpbridge/`: Capability registry, Agent loop/persistence, and MCP transport adapters.
   - `internal/cpa/`: Gateway v8 management client, lossless YAML patching (`configyaml`), credential discovery.
@@ -83,6 +83,10 @@ and operator procedures.
   - One replica per SQLite data directory. Migrations are strictly forward-only; never edit applied migration files. Price versions and audit logs are append-only.
   - Only the updater container holds the Docker socket; the console stays socket-free, read-only and unprivileged. OMC updates verify Ed25519-signed manifests and pull by digest.
   - The production SPA is embedded into the Go binary (`internal/web`). Both root (`/`) and configured `OMCPA_BASE_PATH` must work.
+- **OpenAPI / Swagger contract (`docs/openapi/swagger.json`)**:
+  - Every `/api` route registered in `internal/api/handler.go` MUST carry `swaggo` annotations (`@Summary`, `@Description`, `@Tags`, `@Param`, `@Success`, `@Failure`, `@Security`, `@Router` relative to `@BasePath /api`) referencing explicit, safe DTO structs (never unprojected domain/repository/secret-bearing models or inline `map[string]any` payloads for documented responses).
+  - After adding, modifying, or removing any `/api` handler, route, or DTO, regenerate `docs/openapi/swagger.json` with `pnpm openapi:generate` and commit the updated spec.
+  - `TestOpenAPIRouteCoverage` and `TestOpenAPISpecFreshness` (`internal/api/openapi_test.go`) plus `pnpm check:openapi` enforce 100% bidirectional route parity and spec freshness in Go tests and CI (`verify:static:repository`).
 
 ## Testing governance & anti-bloat rules
 
@@ -103,6 +107,7 @@ To keep local feedback and CI fast, follow the 3-tier testing pyramid in [Testin
 ## Verification workflow
 
 - `pnpm test:fast`: Fast local verification (`pnpm type-check && pnpm test:logic && go test -short ./...`). Runs in seconds without building the binary or launching a browser.
+- `pnpm openapi:generate` / `pnpm check:openapi`: Regenerates `docs/openapi/swagger.json` via the pinned `swag` Go tool (`go tool swag`) or verifies it is up to date without mutating the worktree.
 - `pnpm test:frontend`: Runs all Vitest `logic` and `components` suites (`~20s`). For targeted iteration, run `pnpm exec vitest run --config web/vitest.config.ts <file>`.
 - `pnpm verify:browser:smoke`: Builds the embedded SPA + Go binary and runs the fast end-to-end Chromium smoke check.
 - `pnpm verify`: Runs `test:fast`, `test:components`, and `verify:build` (`type-check`, `build`, `check:bundle`).
@@ -113,6 +118,8 @@ To keep local feedback and CI fast, follow the 3-tier testing pyramid in [Testin
 - Write all technical documentation (`AGENTS.md`, `CONTEXT.md`, `CONTRIBUTING.md`, `docs/**/*.md`) and code comments in English. Only `README.zh-CN.md` and `web/src/i18n/locales/zh*` use Chinese.
 - Corners use the five-step scale (`--radius-xs|sm|md|lg|xl`, `RADIUS` in TypeScript) by role, never a literal length, and nested shapes stay concentric (inner = outer − gap); see [Design](docs/design.md#corners).
 - Edges are shadows, not borders: a surface takes `--shadow-edge|raised|float|overlay`, a control `--shadow-control`, a field or track `--shadow-well`, and a state recolours the ring. Ring strength is solved per palette (`EDGE_STEPS`), so never hand-tune one surface's shadow; see [Design](docs/design.md#edges-and-elevation).
+- A selected thing is picked up and lit (`--shadow-selected` + `--select-surface`, `--select-transition`), never outlined; the accent ring is for keyboard focus alone. Buttons follow the variant table (primary once per view, `active` for a pressed toggle, `ghost` for row and inline actions, icon-only tools as `ToolButton`); see [Design](docs/design.md#buttons).
+- A control is one height on every pointer (32px, `sm` 28px; touch widens the hit area, never the control), tags share one geometry, and a state never moves what is already on screen (docked `SelectionBar`, shrinking search, tooltip over notice); see [Design](docs/design.md#composition-and-shared-controls).
 - Never string facts together with a middle dot (`·`) in code, styles or catalogs: side-by-side facts use `MetaLine`, label/value pairs use rows, related parts use a sentence or parentheses (`pnpm check:feedback` enforces it); see [Design](docs/design.md#information-expression).
 - A tooltip is a last resort: it names an icon-only control, explains a disabled one, completes truncated text, or reads an exact value or a data mark. It never repeats visible text or explains how to click. More than one fact is a `TipCard` (heading, label/value rows, notes) rendered by `TooltipReadout`, never a joined string; see [Design](docs/design.md#tooltips).
 - Read only declared tokens (no `var(--x, fallback)` for a token that does not exist), keep `--meta` for quiet prose rather than anything pressable, key motion on `data-reduced-motion` rather than `prefers-reduced-motion`, and use 900px for shell-shaped rules and 640px only for phone content; see [Design](docs/design.md#small-screens-keyboard-and-touch).

@@ -37,9 +37,10 @@ and shipped-artifact checks strict.
 4. **Shared environment discipline (`isolate: false`)**: Both Vitest projects run with `isolate: false` so modules and the jsdom window are reused across files in each worker. `web/tests/setup.ts` cleans up React trees, query clients, timers, storage, and mocked API handlers in `afterEach`. Do not mutate module-level singletons without restoring them in `afterEach`.
 5. **Deterministic assertions**: For a bug fix, verify the regression test fails without the fix before restoring the fix. Never paper over timing or state leaks with retries, fixed sleeps, or longer timeouts.
 
-## Golden data and demo dataset
+## Golden data, OpenAPI spec, and demo dataset
 
 - **Go golden files**: Regenerate only the owning package with `UPDATE_GOLDEN=1 go test ./<package>`.
+- **OpenAPI / Swagger 2.0 spec**: Regenerate `docs/openapi/swagger.json` with `pnpm openapi:generate` whenever `/api` routes, annotations, or DTOs change. `pnpm check:openapi` (in `verify:static:repository`), `TestOpenAPIRouteCoverage`, and `TestOpenAPISpecFreshness` (`internal/api/openapi_test.go`) enforce 100% route parity and freshness.
 - **Cloudflare demo dataset**: Generated on demand (and in CI / Workers Builds) from real Go handlers over the deterministic demo fixture rather than committed to Git. Run `pnpm check:demo` to verify route coverage and privacy, and `TestExportDemoDataset` (`internal/api/demo_export_test.go`) to validate in-memory export invariants and dashboard health parity.
 
 ## Browser acceptance diagnostics
@@ -50,13 +51,15 @@ retain diagnostics under `tmp/browser-acceptance-failure/`.
 
 ## CI and releases
 
-The GitHub Actions workflows (`.github/workflows/ci.yml` and `.github/workflows/release.yml`)
+The GitHub Actions workflows (`.github/workflows/ci.yml`, `.github/workflows/release.yml`,
+`.github/workflows/maintenance.yml`, and `.github/workflows/readme-screenshots.yml`)
 are the executable source of truth:
 
-- **Pull requests**: Path-filtered lanes (`go`, `frontend`, `static`, `browser`) run only when relevant files change, with built-artifact `browser` smoke (`pnpm verify:browser:smoke`) when application code is affected.
-- **Main, nightly, manual, or `full-ci` label**: Full static and unit suites plus full built-artifact browser acceptance (`pnpm verify:browser`).
+- **Pull requests**: Repository hygiene (`static-repo`: workflow lint, toolchain pin, doc links, worktree/history secret scans) runs on every change; `changes` selects `static-go`, `static-frontend`, `docker-check`, and `browser` smoke (`pnpm verify:browser:smoke`) only when relevant paths change.
+- **Main, merge queue, nightly, manual, or `full-ci` label**: Full static and unit suites plus full built-artifact browser acceptance (`pnpm verify:browser`), Cloudflare demo staging dry-run, and `docker-check` when container inputs change.
 - **Weekly/manual maintenance**: Go race detector, bounded fuzzing, dependency advisories, and host-native runtime checks.
-- **Release**: Complete static and browser verification before packaging, immutable tag/commit identity, Ed25519-signed manifests, container/native smoke tests, and promotion gates. See [Releasing](releasing.md).
+- **README screenshots**: Refreshed automatically in CI (`.github/workflows/readme-screenshots.yml`) on a daily schedule or manual dispatch, enabling squash auto-merge on the rolling pull request without local generation.
+- **Release**: Static gates, full browser acceptance, and isolated candidate native packaging/smoke run in parallel before publication gates (`verify`), followed by immutable tag/commit verification, same-builder container smoke and attested multi-platform Docker push, Ed25519-signed manifests, GitHub Release publication, and `latest` promotion. See [Releasing](releasing.md).
 
 ## Tooling
 
