@@ -18,6 +18,7 @@ import { parseDocument, type Document } from 'yaml';
 
 import { PayloadRulesEditor } from './PayloadRulesEditor';
 import { IceServersEditor } from './IceServersEditor';
+import { PatternRulesEditor } from './PatternRulesEditor';
 import { StringMapEditor } from './StringMapEditor';
 
 import type { useT } from '../../i18n';
@@ -202,6 +203,22 @@ export function renderFieldControl(view: ConfigSectionContext, field: ConfigFiel
     );
   }
 
+  if (field.type === 'pattern_rules') {
+    return (
+      <PatternRulesEditor
+        field={field}
+        value={val}
+        disabled={disabled}
+        ariaDescribedBy={ariaDescribedBy}
+        draftState={view.patternRulesDrafts[field.id]}
+        onDraftStateChange={view.setPatternRulesDraft}
+        onValidationChange={view.setPatternRulesIssue}
+        t={t}
+        onChange={(target, next) => updateFieldInDoc(target, next)}
+      />
+    );
+  }
+
   if (field.type === 'ice_servers') {
     return (
       <IceServersEditor
@@ -267,6 +284,7 @@ export function renderGridField(view: ConfigSectionContext, field: ConfigFieldDe
     field.type === 'textarea' ||
     field.type === 'json_editor' ||
     field.type === 'string_map' ||
+    field.type === 'pattern_rules' ||
     field.id === 'proxyUrl' ||
     field.id === 'authDir' ||
     field.id === 'logDir' ||
@@ -405,28 +423,28 @@ export function renderGroupPanel(view: ConfigSectionContext, grp: ConfigGroupDef
     // Payload Builder variant (structured JSON rules for models and parameters)
     if (grp.variant === 'payload-builder') {
       return (
-        <div key={grp.id} id={groupAnchorId(grp.id)} className="settings-group payload-builder-group">
+        // The section header already frames the payload workspace; keeping it unboxed avoids
+        // stacking a second .settings-group card around the rule cards and clipping their edge shadows.
+        <div key={grp.id} id={groupAnchorId(grp.id)} className="payload-builder-group">
           {context === 'search' && (
             <SectionHeading className="settings-group-head" title={t(grp.labelKey)} description={grp.descKey ? t(grp.descKey) : undefined} />
           )}
-          <div className="settings-group-body">
-            <PayloadRulesEditor
-              doc={docRef.current}
-              onDocChange={() => {
-                if (docRef.current) {
-                  // Check semantic equality with serverDocRef before setting rawYaml
-                  if (serverDocRef.current && isConfigSemanticallyEqual(docRef.current, serverDocRef.current, ALL_CONFIG_FIELDS)) {
-                    setRawYaml(serverYaml);
-                    docRef.current = parseDocument(serverYaml);
-                  } else {
-                    setRawYaml(docRef.current.toString());
-                  }
+          <PayloadRulesEditor
+            doc={docRef.current}
+            onDocChange={() => {
+              if (docRef.current) {
+                // Check semantic equality with serverDocRef before setting rawYaml
+                if (serverDocRef.current && isConfigSemanticallyEqual(docRef.current, serverDocRef.current, ALL_CONFIG_FIELDS)) {
+                  setRawYaml(serverYaml);
+                  docRef.current = parseDocument(serverYaml);
+                } else {
+                  setRawYaml(docRef.current.toString());
                 }
-              }}
-              onValidationChange={setPayloadIssues}
-              validateTrigger={validateTrigger}
-            />
-          </div>
+              }
+            }}
+            onValidationChange={setPayloadIssues}
+            validateTrigger={validateTrigger}
+          />
         </div>
       );
     }

@@ -84,6 +84,16 @@ write-behind batch under the same serialized backup-and-write gate (callers requ
 synchronous persistence pass `X-OMC-Sync: 1`); structural saves and Agent writes flush
 pending batches first so revisions and readbacks never observe unpersisted drift.
 
+External file edits and writes through other management clients are reconciled by
+periodically checking CPA's persisted configuration and a fingerprint of its applied
+runtime configuration. A changed baseline replaces the full
+in-memory projection before connected consoles are notified; failed reads retain the
+last successful baseline and are retried. Pending batches validate their baseline
+before their first write, and a stale batch reports a conflict and reloads upstream
+state. The configuration revision identifies the persisted document, not completion
+of CPA's runtime hot reload. Applied-runtime changes are observed separately, so a
+later hot reload cannot remain hidden behind an unchanged file revision.
+
 The visual editor exposes shared Claude header settings through the
 [configuration schema](../web/src/types/configSchema.ts) and the existing change-set
 path. Native-client entrypoint labels extend CPA's built-in entries and still require
@@ -123,7 +133,7 @@ provider write gate, configuration revision checks and encrypted pre-write backu
 
 The trusted Plugin Host is a separate native-response boundary; its fixed origins,
 credential separation, audit and write-backup requirements are in
-[Architecture](architecture.md#trusted-plugin-pages). It is not permission to add
+[Architecture](dev/architecture.md#trusted-plugin-pages). It is not permission to add
 native responses to the ordinary facade or an arbitrary HTTP proxy.
 
 ## Credential recovery evidence
@@ -196,7 +206,7 @@ Installing OMC must not rewrite or upgrade an existing CPA deployment implicitly
 Keep its files, auth directory, network topology and other panels intact.
 Authentication probes must never pop the queue.
 
-[Installation](install.md#other-management-panels) covers coexistence choices.
+[Standalone](install/standalone.md#other-management-panels) covers coexistence choices.
 [SQLite operations](ops/sqlite-operations.md) covers encrypted configuration copies
-and manual recovery of legacy layouts. [Operations](operations.md) covers current
+and manual recovery of legacy layouts. [Quota and warmup](features/quota.md) covers current
 credential/quota controls and their limitations.
