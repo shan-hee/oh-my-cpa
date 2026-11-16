@@ -17,7 +17,8 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        primary: 'bg-primary text-primary-foreground hover:enabled:bg-primary-hover active:enabled:bg-primary-active shadow-[var(--control-drop)]',
+        // Ink, not accent: the palette's foreground as a solid key.
+        primary: 'bg-primary bg-(image:--primary-sheen) text-primary-foreground hover:enabled:bg-primary-hover active:enabled:bg-primary-active shadow-primary',
         // Switched on: the same control material as `secondary`, the state carried by the wash and ink
         // alone, so a toggled tool never gains an outline its neighbours do not have.
         active: 'bg-[color-mix(in_srgb,var(--accent)_14%,transparent)] text-brand hover:enabled:bg-[color-mix(in_srgb,var(--accent)_20%,transparent)] shadow-control',
@@ -35,8 +36,9 @@ const buttonVariants = cva(
         default: 'h-8 px-3 text-base gap-1.5',
         sm: 'h-7 px-2.5 text-md gap-1.5',
         lg: 'h-9 px-4 text-base gap-2',
-        icon: 'size-8 p-0 gap-0',
-        'icon-sm': 'size-7 p-0 gap-0',
+        // A glyph standing alone is drawn a step above the label size it would sit beside.
+        icon: 'size-8 p-0 gap-0 text-lg',
+        'icon-sm': 'size-7 p-0 gap-0 text-lg',
       },
     },
     defaultVariants: {

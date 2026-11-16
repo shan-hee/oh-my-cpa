@@ -416,9 +416,9 @@ test('agent workspace', async () => {
   });
 
   check('the context readout needs both a reported input and a listed window, and takes the narrowest route', () => {
-    const reference = (context?: number) => ({ id: 'm', name: 'm', limit: { context }, modalities: {} });
+    const reference = (context?: number) => ({ id: 'm', name: 'm', context_length: context, input_modalities: [], output_modalities: [], supported_parameters: [] });
     const directory: ModelSquareDirectory = {
-      models: [], providers: [], partial: [], metadata_updated_at: '',
+      models: [], providers: [], partial: [],
       routes: [
         { provider_id: 'a', upstream_model: 'wide', call_point: 'alias' },
         { provider_id: 'b', upstream_model: 'narrow', call_point: 'alias' },
@@ -532,5 +532,23 @@ test('agent workspace', async () => {
     const phoneRule = /\.shell\s+\.examples\s*>\s*\*\s*\{([^}]*)\}/.exec(agentCss);
     assert.ok(phoneRule, 'phone .examples item rule must outrank .example regardless of stylesheet order');
     assert.match(phoneRule[1], /\bbox-shadow:\s*none\s*;/);
+  });
+
+  check('agent notices stay column-aligned at the top without colliding with the empty-state hero', () => {
+    const agentTsx = readFileSync(new URL('../../src/pages/agent/AgentPage.tsx', import.meta.url), 'utf8');
+    const agentCss = readFileSync(new URL('../../src/pages/agent/AgentPage.module.css', import.meta.url), 'utf8');
+    const workspaceCss = readFileSync(new URL('../../src/components/workspace/Workspace.module.css', import.meta.url), 'utf8');
+
+    assert.match(agentTsx, /workspace\['notices'\][^>]*>\{notices\}<\/div>/);
+    const noticesRule = /^\.notices\s*\{([^}]*)\}/m.exec(workspaceCss);
+    assert.ok(noticesRule, 'Workspace.module.css must define .notices');
+    assert.match(noticesRule[1], /\bflex-shrink:\s*0\s*;/);
+    assert.match(workspaceCss, /\.notices:empty\s*\{[^}]*\bdisplay:\s*none\s*;/);
+
+    const heroMain = /\.shell\[data-hero\]\s+\.shell-main\s*\{([^}]*)\}/.exec(agentCss);
+    assert.ok(heroMain, 'AgentPage.module.css must define .shell[data-hero] .shell-main');
+    assert.doesNotMatch(heroMain[1], /\bjustify-content:\s*center\b/);
+    assert.match(agentCss, /\.shell\[data-hero\]\s+\.shell-main\s*>\s*\.shell-notices\s*\+\s*\*\s*\{[^}]*\bmargin-top:\s*auto\s*;/);
+    assert.match(agentCss, /\.shell\[data-hero\]\s+\.shell-main\s*>\s*:last-child\s*\{[^}]*\bmargin-bottom:\s*auto\s*;/);
   });
 });

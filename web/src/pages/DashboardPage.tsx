@@ -22,8 +22,7 @@ import { usePreference } from '../hooks/usePreference';
 import { useLiveRevision } from '../hooks/useLiveRevision';
 import { useIsPhoneViewport } from '../hooks/useIsPhoneViewport';
 import { type ChartTone } from '../charts/chartTheme';
-import { type DashboardTrendChartProps } from '../charts/DashboardTrendChart';
-import { LazyDashboardTrendChart } from '../charts/lazyCharts';
+import { DashboardTrendChart } from '../charts/DashboardTrendChart';
 import { maskKeyText } from '../utils/maskKey';
 import { resolveCacheRateReadout } from '../theme/cacheScale';
 import { useTokenDisplayStyle } from '../types/tokenDisplayContext';
@@ -37,9 +36,9 @@ import {
 } from '../types/tokenDisplay';
 import { successRateTone } from '../types/usageEventMetrics';
 import { TimeRangeControl } from '../components/dashboard/TimeRangeControl';
-import { RollingNumber } from '../components/dashboard/RollingNumber';
+import { RollingNumber, RollingNumberGroup } from '../components/dashboard/RollingNumber';
 import { TokenHeatmap, TOKEN_HEATMAP_QUERY_KEY } from '../components/dashboard/TokenHeatmap';
-import { RoutingPanel, ROUTING_WINDOW_CACHE_KEY } from '../components/dashboard/routing/RoutingPanel';
+import { RoutingPanel } from '../components/dashboard/routing/RoutingPanel';
 import { RoutingMapSkeleton } from '../components/dashboard/routing/RoutingMapSkeleton';
 import {
   CredentialQuota,
@@ -51,16 +50,13 @@ import { DashboardBoard, preloadDashboardBoardEditor } from '../components/dashb
 import { DashboardKpiTilePlaceholder } from '../components/dashboard/DashboardSkeleton';
 import { DashboardProviders } from '../components/dashboard/DashboardProviders';
 import { isCalendarPreset } from '../types/calendarPresets';
-import { withGroupBy } from '../types/dashboardModels';
 import {
-  dashboardHeatmapSwr,
-  dashboardModelsSwr,
   dashboardTailSwr,
   dashboardWindowSwr,
   managementOverviewSwr,
 } from '../components/dashboard/dashboardQueries';
 import { invalidateSwrScopes, useSwrQuery } from '../performance/swrContract';
-import { preloadRegisteredRoute, useTransitionNavigate } from '../performance/routeContract';
+import { preloadRegisteredRoute, useIsRouteActive, useTransitionNavigate } from '../performance/routeContract';
 import {
   applyTail,
   DASHBOARD_COMPARISON_PREFERENCE,
@@ -76,7 +72,7 @@ import {
   livePollInterval,
   parseDashboardComparisonPreference,
   parseDashboardRange,
-  costNoteKey,
+  resolveCostCaption,
   type DashboardMetricDelta,
   type DashboardRange,
   type DashboardWindow,
@@ -121,14 +117,6 @@ const ReceiptShowcase = React.lazy(loadReceiptShowcase);
 
 function pickCost(point: DashboardSeriesPoint): number { return (point.cost_nanos ?? 0) / 1_000_000_000; }
 function formatTrendTime(timeMs: number): string { return dayjs(timeMs).format('MM-DD HH:mm'); }
-
-const DashboardTrendChart = React.memo<DashboardTrendChartProps>((props) => (
-  <React.Suspense
-    fallback={<div className="chart-placeholder" style={{ height: props.height ?? 46 }} aria-hidden="true" />}
-  >
-    <LazyDashboardTrendChart {...props} />
-  </React.Suspense>
-));
 
 const Pip: React.FC<{ tone: ChartTone }> = ({ tone }) => (
   <i className={`legend-dot ${tone}`} />
@@ -183,9 +171,10 @@ const KpiDelta: React.FC<{
 };
 
 export const DashboardPage: React.FC = () => {
-  const timeZone = useTimeZone();
+  useTimeZone();
   const t = useT();
   const isPhone = useIsPhoneViewport();
+  const isRouteActive = useIsRouteActive();
   const rawNavigate = useNavigate();
   const { navigateTo } = useTransitionNavigate(rawNavigate);
   const queryClient = useQueryClient();
@@ -196,7 +185,7 @@ export const DashboardPage: React.FC = () => {
     staleTime: 60_000,
   });
   const unpricedModels = pricingAttention?.unpriced?.length ?? 0;
-  const { style: tokenStyle, modelView } = useTokenDisplayStyle();
+  const { style: tokenStyle } = useTokenDisplayStyle();
   const { currency } = useDisplayCurrency();
   const formatTrendCost = React.useCallback((value: number) => formatCurrency(value, currency), [currency]);
 
@@ -232,6 +221,14 @@ export const DashboardPage: React.FC = () => {
   const [selectedApiKey, setSelectedApiKey] = React.useState<string | undefined>(undefined);
   const [isReceiptOpen, setIsReceiptOpen] = React.useState(false);
   const openReceipt = React.useCallback(() => setIsReceiptOpen(true), []);
+
+  // When Dashboard is parked off-screen, close unsaved arrangement drafts and transient modals
+  // so returning to Dashboard always reveals the clean live board.
+  React.useEffect(() => {
+    if (isRouteActive) return;
+    setIsReceiptOpen((open) => (open ? false : open));
+    setLayoutDraft((draft) => (draft !== null ? null : draft));
+  }, [isRouteActive]);
 
   const keysQuery = useQuery({
     queryKey: ['management-client-keys'],
@@ -497,10 +494,6 @@ export const DashboardPage: React.FC = () => {
     );
   }
 
-  const hasWarmRouting = Boolean(queryClient.getQueryData(ROUTING_WINDOW_CACHE_KEY));
-  const hasWarmModels = Boolean(dashboardModelsSwr.readSnapshot(queryClient, withGroupBy(query, modelView)));
-  const hasWarmHeatmap = Boolean(dashboardHeatmapSwr.readSnapshot(queryClient, timeZone));
-  const hasWarmQuota = Boolean(queryClient.getQueryData([CREDENTIAL_FILES_QUERY_KEY]));
   const hasModelUsageHidden = layout.some((item) => item.id === 'model_usage' && item.hidden);
   const previousPreset = previousCalendarPreset(range.preset);
   const isQuietOpenCalendar = Boolean(
@@ -660,8 +653,9 @@ export const DashboardPage: React.FC = () => {
             />
           </Panel>
         );
-      case 'cost':
+      case 'cost': {
         if (!data) return <DashboardKpiTilePlaceholder id="cost" index={5} />;
+        const costCaption = resolveCostCaption(data, unpricedModels);
         return (
           <Panel className="dashboard-tile kpi-tile">
             <div className="tile-head">
@@ -690,18 +684,50 @@ export const DashboardPage: React.FC = () => {
               <KpiDelta delta={showComparisonBadge ? costDelta : null} formatPrevious={formatTrendCost} testId="dashboard-cost-delta" />
             </div>
             <div className="tile-caption">
-              <span>{costNoteKey(data.metrics.cost_source) ? t(costNoteKey(data.metrics.cost_source)!) : ''}</span>
-              {unpricedModels > 0 && data.metrics.cost_source !== 'estimated' && (
-                <Button
-                  variant="link"
-                  size="sm"
-                  className="tile-caption-link"
-                  onMouseEnter={() => preloadRegisteredRoute('/pricing')}
-                  onClick={() => navigateTo('/pricing')}
-                  data-testid="dashboard-unpriced-link"
-                >
-                  {t('dash.cost_unpriced_models', { n: unpricedModels })}
-                </Button>
+              {costCaption.kind === 'per_request' ? (
+                <span>{t('dash.cost_per_request')} <b>{formatCurrency(costCaption.perRequestUsd, currency)}</b></span>
+              ) : costCaption.kind === 'partial' ? (
+                <>
+                  <Tooltip title={t('dash.cost_partial_note')}>
+                    <span className="tile-caption-note is-partial" tabIndex={0}>
+                      {!costCaption.showUnpricedLink && costCaption.pricedRequests !== null ? (
+                        <>{t('dash.cost_priced_label')} <b>{formatCount(costCaption.pricedRequests)}/{formatCount(costCaption.totalRequests)}</b></>
+                      ) : (
+                        t('dash.cost_partial_short')
+                      )}
+                    </span>
+                  </Tooltip>
+                  {costCaption.showUnpricedLink && (
+                    <Button
+                      variant="link"
+                      size="sm"
+                      className="tile-caption-link"
+                      onMouseEnter={() => preloadRegisteredRoute('/pricing')}
+                      onClick={() => navigateTo('/pricing')}
+                      data-testid="dashboard-unpriced-link"
+                    >
+                      {t('dash.cost_unpriced_models', { n: unpricedModels })}
+                    </Button>
+                  )}
+                </>
+              ) : costCaption.showUnpricedLink ? (
+                <>
+                  <Tooltip title={t('dash.cost_placeholder_note')}>
+                    <span className="tile-caption-note" tabIndex={0}>{t('dash.cost_placeholder_short')}</span>
+                  </Tooltip>
+                  <Button
+                    variant="link"
+                    size="sm"
+                    className="tile-caption-link"
+                    onMouseEnter={() => preloadRegisteredRoute('/pricing')}
+                    onClick={() => navigateTo('/pricing')}
+                    data-testid="dashboard-unpriced-link"
+                  >
+                    {t('dash.cost_unpriced_models', { n: unpricedModels })}
+                  </Button>
+                </>
+              ) : (
+                <span>{t('dash.cost_placeholder_empty')}</span>
               )}
             </div>
             <DashboardTrendChart
@@ -715,11 +741,12 @@ export const DashboardPage: React.FC = () => {
             />
           </Panel>
         );
+      }
       case 'routing':
         return (
           <DeferredPanel
             priority="p1"
-            immediate={hasWarmRouting || isArranging}
+            immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile">
                 <Placeholder width="24%" className="placeholder-line is-meta" />
@@ -734,7 +761,7 @@ export const DashboardPage: React.FC = () => {
         return (
           <DeferredPanel
             priority="p1"
-            immediate={hasWarmModels || isArranging}
+            immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile">
                 <Placeholder width="32%" className="placeholder-line is-meta" />
@@ -754,7 +781,7 @@ export const DashboardPage: React.FC = () => {
         return (
           <DeferredPanel
             priority="p1"
-            immediate={hasWarmModels || isArranging}
+            immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile">
                 <Placeholder width="32%" className="placeholder-line is-meta" />
@@ -769,7 +796,7 @@ export const DashboardPage: React.FC = () => {
         return (
           <DeferredPanel
             priority="p2"
-            immediate={hasWarmHeatmap || isArranging}
+            immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile heatmap-panel">
                 <div className="heatmap-inner">
@@ -788,7 +815,7 @@ export const DashboardPage: React.FC = () => {
         return (
           <DeferredPanel
             priority="p2"
-            immediate={hasWarmQuota || isArranging}
+            immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile credential-quota-panel">
                 <Placeholder width="36%" className="placeholder-line is-meta" />
@@ -801,7 +828,18 @@ export const DashboardPage: React.FC = () => {
         );
       case 'providers':
         return overviewQuery.data ? (
-          <DeferredPanel priority="p2" immediate={Boolean(overviewQuery.data) || isArranging}>
+          <DeferredPanel
+            priority="p2"
+            immediate={isArranging}
+            fallback={(
+              <section className="dashboard-section dashboard-providers-section" aria-busy="true">
+                <Placeholder width="18%" className="placeholder-line is-meta" />
+                <div className="terminal-panel provider-list-panel">
+                  <Placeholder width="100%" height={176} />
+                </div>
+              </section>
+            )}
+          >
             <DashboardProviders overview={overviewQuery.data} query={query} range={range} enabled={rangeReady} />
           </DeferredPanel>
         ) : null;
@@ -846,15 +884,17 @@ export const DashboardPage: React.FC = () => {
       )}
 
       <ModelSeriesFocusProvider>
-        <LoadingRegion isLoading={!data}>
-          <DashboardBoard
-            layout={layout}
-            isEditing={isArranging}
-            isPhone={isPhone}
-            renderWidget={renderWidget}
-            onChange={setLayoutDraft}
-          />
-        </LoadingRegion>
+        <RollingNumberGroup>
+          <LoadingRegion isLoading={!data}>
+            <DashboardBoard
+              layout={layout}
+              isEditing={isArranging}
+              isPhone={isPhone}
+              renderWidget={renderWidget}
+              onChange={setLayoutDraft}
+            />
+          </LoadingRegion>
+        </RollingNumberGroup>
       </ModelSeriesFocusProvider>
 
       {data && !data.coverage.has_usage && data.partial_errors.length === 0 && (

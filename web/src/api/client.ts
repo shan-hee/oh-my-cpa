@@ -1002,8 +1002,8 @@ export const api = {
     return downloadBlob(`${apiBaseUrl}/management/request-logs/${encodeURIComponent(requestId)}`);
   },
 
-  async getUsageEvents(query: string): Promise<UsageEventPage> {
-    return request<UsageEventPage>(`/usage/events${query ? `?${query}` : ''}`, { method: 'GET' });
+  async getUsageEvents(query: string, signal?: AbortSignal): Promise<UsageEventPage> {
+    return request<UsageEventPage>(`/usage/events${query ? `?${query}` : ''}`, { method: 'GET', signal });
   },
 
   async getUsageEvent(id: number): Promise<UsageEventDetail> {
@@ -1015,8 +1015,8 @@ export const api = {
     return downloadBlob(`${apiBaseUrl}/usage/events/${id}/request-log`);
   },
 
-  async getUsageFacets(query: string): Promise<UsageFacetsResponse> {
-    return request<UsageFacetsResponse>(`/usage/facets${query ? `?${query}` : ''}`, { method: 'GET' });
+  async getUsageFacets(query: string, signal?: AbortSignal): Promise<UsageFacetsResponse> {
+    return request<UsageFacetsResponse>(`/usage/facets${query ? `?${query}` : ''}`, { method: 'GET', signal });
   },
 
   /**
@@ -1586,6 +1586,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ upstream_id: upstreamId }),
     });
+  },
+
+  /** Prices a model's retained requests that had no price when they happened, at its current price. */
+  async priceUnpricedUsage(model: string): Promise<{ priced: number }> {
+    return request<{ priced: number }>(`/pricing/models/${encodeURIComponent(model)}/price-unpriced`, { method: 'POST' });
+  },
+
+  /** Prices every model's retained requests that had no price when they happened, each at its current price. */
+  async priceAllUnpricedUsage(): Promise<{ priced: number }> {
+    return request<{ priced: number }>('/pricing/price-unpriced', { method: 'POST' });
   },
 
   async deletePricingModel(model: string, channel?: string): Promise<{ deleted: boolean }> {

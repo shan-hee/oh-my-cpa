@@ -11625,7 +11625,7 @@
             "CookieAuth": []
           }
         ],
-        "description": "Return current price, version history, token usage profile, automatic match, and reference prices for a model.",
+        "description": "Return current price, version history, token usage profile, and automatic match for a model.",
         "produces": [
           "application/json"
         ],
@@ -11851,6 +11851,107 @@
           },
           "401": {
             "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          }
+        }
+      }
+    },
+    "/v1/pricing/models/{model}/price-unpriced": {
+      "post": {
+        "security": [
+          {
+            "CookieAuth": []
+          }
+        ],
+        "description": "Price the retained requests of a model that had no price when they happened, using the model's current price and channel multipliers. Requests that already locked a price are unchanged.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "Pricing"
+        ],
+        "summary": "Price a model's unpriced requests",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "Model ID",
+            "name": "model",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/api.PricingUnpricedPricedResponseDTO"
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          }
+        }
+      }
+    },
+    "/v1/pricing/price-unpriced": {
+      "post": {
+        "security": [
+          {
+            "CookieAuth": []
+          }
+        ],
+        "description": "Price the retained requests of every model that had no price when they happened, using each model's current price and channel multipliers. Requests of models that still have no price stay unpriced.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "Pricing"
+        ],
+        "summary": "Price every model's unpriced requests",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/api.PricingUnpricedPricedResponseDTO"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
             "schema": {
               "$ref": "#/definitions/api.ErrorResponseDTO"
             }
@@ -14986,7 +15087,7 @@
           "type": "string"
         },
         "model": {
-          "$ref": "#/definitions/pricing.UpstreamModel"
+          "$ref": "#/definitions/api.pricingUpstreamModelDTO"
         }
       }
     },
@@ -15046,7 +15147,7 @@
         "models": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/pricing.UpstreamModel"
+            "$ref": "#/definitions/api.pricingUpstreamModelDTO"
           }
         }
       }
@@ -15082,7 +15183,7 @@
           "$ref": "#/definitions/api.PricingAutomaticMatchDTO"
         },
         "candidate": {
-          "$ref": "#/definitions/pricing.Candidate"
+          "$ref": "#/definitions/api.pricingCandidateDTO"
         },
         "channel": {
           "type": "string"
@@ -15099,16 +15200,10 @@
         "profile": {
           "$ref": "#/definitions/repository.TokenProfile"
         },
-        "reference_prices": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/api.pricingReferencePriceDTO"
-          }
-        },
         "suggestions": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/pricing.UpstreamModel"
+            "$ref": "#/definitions/api.pricingUpstreamModelDTO"
           }
         },
         "versions": {
@@ -15160,6 +15255,14 @@
       "properties": {
         "started": {
           "type": "boolean"
+        }
+      }
+    },
+    "api.PricingUnpricedPricedResponseDTO": {
+      "type": "object",
+      "properties": {
+        "priced": {
+          "type": "integer"
         }
       }
     },
@@ -19058,9 +19161,6 @@
     "api.modelSquareDTO": {
       "type": "object",
       "properties": {
-        "metadata_updated_at": {
-          "type": "string"
-        },
         "model_info": {
           "type": "object",
           "additionalProperties": {
@@ -19089,37 +19189,6 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/api.modelSquareRouteDTO"
-          }
-        }
-      }
-    },
-    "api.modelSquareLimitsDTO": {
-      "type": "object",
-      "properties": {
-        "context": {
-          "type": "integer"
-        },
-        "input": {
-          "type": "integer"
-        },
-        "output": {
-          "type": "integer"
-        }
-      }
-    },
-    "api.modelSquareModalitiesDTO": {
-      "type": "object",
-      "properties": {
-        "input": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "output": {
-          "type": "array",
-          "items": {
-            "type": "string"
           }
         }
       }
@@ -19161,82 +19230,73 @@
         }
       }
     },
+    "api.modelSquareReasoningDTO": {
+      "type": "object",
+      "properties": {
+        "default_effort": {
+          "type": "string"
+        },
+        "default_enabled": {
+          "type": "boolean"
+        },
+        "mandatory": {
+          "type": "boolean"
+        },
+        "supported_efforts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "api.modelSquareReferenceDTO": {
       "type": "object",
       "properties": {
-        "attachment": {
-          "type": "boolean"
+        "author": {
+          "type": "string"
+        },
+        "context_length": {
+          "type": "integer"
         },
         "description": {
           "type": "string"
         },
-        "family": {
+        "hugging_face_id": {
           "type": "string"
         },
         "id": {
           "type": "string"
         },
-        "knowledge": {
-          "type": "string"
-        },
-        "last_updated": {
-          "type": "string"
-        },
-        "license": {
-          "type": "string"
-        },
-        "limit": {
-          "$ref": "#/definitions/api.modelSquareLimitsDTO"
-        },
-        "links": {
+        "input_modalities": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/api.modelSquareReferenceLinkDTO"
+            "type": "string"
           }
         },
-        "modalities": {
-          "$ref": "#/definitions/api.modelSquareModalitiesDTO"
+        "knowledge_cutoff": {
+          "type": "string"
+        },
+        "max_completion_tokens": {
+          "type": "integer"
         },
         "name": {
           "type": "string"
         },
-        "open_weights": {
-          "type": "boolean"
-        },
-        "reasoning": {
-          "type": "boolean"
-        },
-        "release_date": {
-          "type": "string"
-        },
-        "structured_output": {
-          "type": "boolean"
-        },
-        "temperature": {
-          "type": "boolean"
-        },
-        "tool_call": {
-          "type": "boolean"
-        },
-        "weights": {
+        "output_modalities": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/api.modelSquareReferenceLinkDTO"
+            "type": "string"
           }
-        }
-      }
-    },
-    "api.modelSquareReferenceLinkDTO": {
-      "type": "object",
-      "properties": {
-        "label": {
-          "type": "string"
         },
-        "type": {
-          "type": "string"
+        "reasoning": {
+          "$ref": "#/definitions/api.modelSquareReasoningDTO"
         },
-        "url": {
-          "type": "string"
+        "supported_parameters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -19396,6 +19456,20 @@
         }
       }
     },
+    "api.pricingCandidateDTO": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "match_kind": {
+          "type": "string"
+        },
+        "model": {
+          "$ref": "#/definitions/api.pricingUpstreamModelDTO"
+        }
+      }
+    },
     "api.pricingChannelDTO": {
       "type": "object",
       "properties": {
@@ -19443,7 +19517,7 @@
           "description": "Candidate is an OpenRouter model a custom or linked price could follow\nthat the operator has not seen yet.",
           "allOf": [
             {
-              "$ref": "#/definitions/pricing.Candidate"
+              "$ref": "#/definitions/api.pricingCandidateDTO"
             }
           ]
         },
@@ -19663,35 +19737,6 @@
         }
       }
     },
-    "api.pricingReferencePriceDTO": {
-      "type": "object",
-      "properties": {
-        "cache_read_price_per_1m": {
-          "type": "number"
-        },
-        "cache_write_price_per_1m": {
-          "type": "number"
-        },
-        "completion_price_per_1m": {
-          "type": "number"
-        },
-        "model": {
-          "type": "string"
-        },
-        "prompt_price_per_1m": {
-          "type": "number"
-        },
-        "providers": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "source": {
-          "type": "string"
-        }
-      }
-    },
     "api.pricingScheduleRequest": {
       "type": "object",
       "properties": {
@@ -19709,11 +19754,49 @@
         "suggestions": {
           "type": "array",
           "items": {
-            "$ref": "#/definitions/pricing.UpstreamModel"
+            "$ref": "#/definitions/api.pricingUpstreamModelDTO"
           }
         },
         "usage_30d": {
           "$ref": "#/definitions/api.pricingUsageDTO"
+        }
+      }
+    },
+    "api.pricingUpstreamModelDTO": {
+      "type": "object",
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "cache_read_price_per_1m": {
+          "type": "number"
+        },
+        "cache_write_price_per_1m": {
+          "type": "number"
+        },
+        "canonical_slug": {
+          "type": "string"
+        },
+        "completion_price_per_1m": {
+          "type": "number"
+        },
+        "context_length": {
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "prompt_price_per_1m": {
+          "type": "number"
+        },
+        "tiers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/api.pricingPriceTierDTO"
+          }
         }
       }
     },
@@ -21077,20 +21160,6 @@
         }
       }
     },
-    "pricing.Candidate": {
-      "type": "object",
-      "properties": {
-        "kind": {
-          "type": "string"
-        },
-        "match_kind": {
-          "type": "string"
-        },
-        "model": {
-          "$ref": "#/definitions/pricing.UpstreamModel"
-        }
-      }
-    },
     "pricing.ChannelMultiplier": {
       "type": "object",
       "properties": {
@@ -21172,44 +21241,6 @@
         },
         "updated_at_ms": {
           "type": "integer"
-        }
-      }
-    },
-    "pricing.UpstreamModel": {
-      "type": "object",
-      "properties": {
-        "author": {
-          "type": "string"
-        },
-        "cache_read_price_per_1m": {
-          "type": "number"
-        },
-        "cache_write_price_per_1m": {
-          "type": "number"
-        },
-        "canonical_slug": {
-          "type": "string"
-        },
-        "completion_price_per_1m": {
-          "type": "number"
-        },
-        "context_length": {
-          "type": "integer"
-        },
-        "id": {
-          "type": "string"
-        },
-        "name": {
-          "type": "string"
-        },
-        "prompt_price_per_1m": {
-          "type": "number"
-        },
-        "tiers": {
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/pricing.PriceTier"
-          }
         }
       }
     },

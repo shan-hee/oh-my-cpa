@@ -16,7 +16,7 @@ import { Pager } from '../src/components/common/Pager';
 import { SearchInput } from '../src/components/common/SearchInput';
 import { SectionHeading } from '../src/components/common/SectionHeading';
 import { SelectionBar } from '../src/components/common/SelectionBar';
-import { Tag, ToggleTag } from '../src/components/common/Tag';
+import { EffortTag, Tag, ToggleTag } from '../src/components/common/Tag';
 import { PageHeader } from '../src/components/common/PageHeader';
 import { SummaryStrip } from '../src/components/common/SummaryStrip';
 import { MaskedText } from '../src/components/common/MaskedText';
@@ -29,6 +29,7 @@ import { AutoComplete } from '../src/components/ui/autocomplete';
 import { DataTable } from '../src/components/ui/table';
 import { I18nProvider, useT, type MessageKey } from '../src/i18n';
 import { ThemeProvider } from '../src/theme/ThemeContext';
+import { DashboardTrendChart } from '../src/charts/DashboardTrendChart';
 import { RoutingPanel } from '../src/components/dashboard/routing/RoutingPanel';
 import { renderWithOmc } from './support/render';
 import { installOmcApi, json } from './support/omcApi';
@@ -179,6 +180,18 @@ describe('Tag', () => {
     fireEvent.click(toggle);
 
     expect(onChange.mock.calls).toEqual([[true]]);
+  });
+
+  it('as an effort spells the parameter and colours only a ranked level that reasons', () => {
+    for (const [effort, label, hue] of [['max', 'Max', 'var(--effort-6)'], ['xhigh', 'xHigh', 'var(--effort-5)'], ['high', 'High', 'var(--effort-4)'], ['low', 'Low', 'var(--effort-2)'], ['none', 'None', ''], ['ultra', 'Ultra', '']]) {
+      const { container, unmount } = render(<EffortTag effort={effort} />);
+      const tag = container.querySelector<HTMLElement>('.effort-tag')!;
+      expect(tag.textContent, effort).toBe(label);
+      expect(tag.classList.contains('is-small'), effort).toBe(true);
+      expect(tag.style.getPropertyValue('--effort-hue'), effort).toBe(hue);
+      unmount();
+    }
+    expect(render(<EffortTag effort="" />).container.innerHTML).toBe('');
   });
 });
 
@@ -1173,5 +1186,55 @@ describe('Select and Combobox inline action controls', () => {
 
     fireEvent.click(clearAll);
     expect(onChange.mock.calls[1][0]).toEqual([]);
+  });
+});
+
+describe('DashboardTrendChart native SVG sparkline', () => {
+  it('renders monotone SVG paths synchronously and reveals bucket tooltip on pointer hover', () => {
+    const surface = renderWithOmc(
+      <ThemeProvider>
+        <DashboardTrendChart
+          ariaLabel="Total requests"
+          height={64}
+          points={[
+            { t: 1_700_000_000_000, v: 12, f: 0, tokens: 120 },
+            { t: 1_700_000_060_000, v: 48, f: 0, tokens: 480 },
+            { t: 1_700_000_120_000, v: 24, f: 0, tokens: 240 },
+          ]}
+          pick={(p) => p.v ?? 0}
+          label={(t) => `bucket-${t}`}
+          format={(v) => `${v} reqs`}
+        />
+      </ThemeProvider>,
+    );
+
+    const chart = screen.getByRole('img', { name: 'Total requests' });
+    chart.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 480, bottom: 64, width: 480, height: 64, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    const paths = surface.container.querySelectorAll('svg path');
+    expect(paths.length).toBeGreaterThanOrEqual(2);
+
+    // At 480px host width (2x the 240 viewBox), 12px maps to viewBox x=6 -> index 0 (12 reqs),
+    // and 240px maps to viewBox x=120 -> index 1 (48 reqs).
+    fireEvent.pointerMove(chart, { clientX: 12, clientY: 24, pointerType: 'mouse' });
+    expect(screen.getByText('12 reqs')).toBeTruthy();
+
+    fireEvent.pointerMove(chart, { clientX: 240, clientY: 24, pointerType: 'mouse' });
+    expect(screen.getByText('bucket-1700000060000')).toBeTruthy();
+    expect(screen.getByText('48 reqs')).toBeTruthy();
+
+    fireEvent.pointerLeave(chart, { pointerType: 'mouse' });
+    expect(screen.queryByText('48 reqs')).toBeNull();
+
+    // Keyboard navigation selects points with ArrowLeft / ArrowRight / Home / End and clears on Escape.
+    expect(chart.getAttribute('tabindex')).toBe('0');
+    fireEvent.keyDown(chart, { key: 'End' });
+    expect(screen.getByText('24 reqs')).toBeTruthy();
+    fireEvent.keyDown(chart, { key: 'ArrowLeft' });
+    expect(screen.getByText('48 reqs')).toBeTruthy();
+    fireEvent.keyDown(chart, { key: 'Home' });
+    expect(screen.getByText('12 reqs')).toBeTruthy();
+    fireEvent.keyDown(chart, { key: 'Escape' });
+    expect(screen.queryByText('12 reqs')).toBeNull();
   });
 });
