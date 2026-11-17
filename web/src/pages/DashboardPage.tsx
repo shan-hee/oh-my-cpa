@@ -24,7 +24,7 @@ import { useIsPhoneViewport } from '../hooks/useIsPhoneViewport';
 import { type ChartTone } from '../charts/chartTheme';
 import { DashboardTrendChart } from '../charts/DashboardTrendChart';
 import { maskKeyText } from '../utils/maskKey';
-import { resolveCacheRateReadout } from '../theme/cacheScale';
+import { formatCacheRate, resolveCacheRateReadout } from '../theme/cacheScale';
 import { useTokenDisplayStyle } from '../types/tokenDisplayContext';
 import {
   formatTokenRate,
@@ -47,7 +47,14 @@ import {
 } from '../components/dashboard/CredentialQuota';
 import { ModelTrendPanel, ModelUsagePanel, ModelSeriesFocusProvider, DASHBOARD_MODELS_QUERY_KEY } from '../components/dashboard/ModelUsagePanels';
 import { DashboardBoard, preloadDashboardBoardEditor } from '../components/dashboard/DashboardBoard';
-import { DashboardKpiTilePlaceholder } from '../components/dashboard/DashboardSkeleton';
+import {
+  CredentialQuotaPlaceholder,
+  DashboardKpiTilePlaceholder,
+  HeatmapPlaceholder,
+  ModelTrendPlaceholder,
+  ModelUsagePlaceholder,
+  ProvidersPlaceholder,
+} from '../components/dashboard/DashboardSkeleton';
 import { DashboardProviders } from '../components/dashboard/DashboardProviders';
 import { isCalendarPreset } from '../types/calendarPresets';
 import {
@@ -109,7 +116,10 @@ function formatRate(value: number | null | undefined): string {
 
 function pickRequests(point: DashboardSeriesPoint): number { return point.v ?? 0; }
 function pickTokens(point: DashboardSeriesPoint): number { return point.tokens ?? 0; }
-function pickCacheReads(point: DashboardSeriesPoint): number { return point.cache_read ?? 0; }
+function pickCacheRate(point: DashboardSeriesPoint): number | null { return point.cache_rate ?? null; }
+// Cache rate sits in a narrow band, so its sparkline fits that band; a token-heavy bucket counts
+// for more than a stray request, and 10 points is the least it zooms to.
+const CACHE_RATE_FIT = { minSpan: 10, floor: 0, ceiling: 100, weight: (point: DashboardSeriesPoint) => point.tokens ?? 0 };
 /** The receipt reads the Insights cube and embeds fonts to export; none of it is paid for until it is opened. */
 const loadReceiptShowcase = () => import('../components/dashboard/receipt/ReceiptShowcase');
 const preloadReceiptShowcase = () => void loadReceiptShowcase();
@@ -645,11 +655,12 @@ export const DashboardPage: React.FC = () => {
             <DashboardTrendChart
               ariaLabel={t('dash.cache_rate')}
               points={data.tokens.series}
-              pick={pickCacheReads}
+              pick={pickCacheRate}
               tone="neutral"
               height={44}
+              fit={CACHE_RATE_FIT}
               label={formatTrendTime}
-              format={formatTokens}
+              format={formatCacheRate}
             />
           </Panel>
         );
@@ -749,7 +760,10 @@ export const DashboardPage: React.FC = () => {
             immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile">
-                <Placeholder width="24%" className="placeholder-line is-meta" />
+                <div className="dash-skeleton-tile-head" aria-hidden="true">
+                  <Placeholder width={88} className="placeholder-line is-meta" />
+                  <Placeholder width={56} className="placeholder-line is-meta" />
+                </div>
                 <RoutingMapSkeleton className="tile-placeholder-spark" />
               </Panel>
             )}
@@ -762,12 +776,7 @@ export const DashboardPage: React.FC = () => {
           <DeferredPanel
             priority="p1"
             immediate={isArranging}
-            fallback={(
-              <Panel className="dashboard-tile">
-                <Placeholder width="32%" className="placeholder-line is-meta" />
-                <Placeholder width="100%" height={220} className="tile-placeholder-spark" />
-              </Panel>
-            )}
+            fallback={<ModelTrendPlaceholder />}
           >
             <ModelTrendPanel
               query={query}
@@ -782,12 +791,7 @@ export const DashboardPage: React.FC = () => {
           <DeferredPanel
             priority="p1"
             immediate={isArranging}
-            fallback={(
-              <Panel className="dashboard-tile">
-                <Placeholder width="32%" className="placeholder-line is-meta" />
-                <Placeholder width="100%" height={220} className="tile-placeholder-spark" />
-              </Panel>
-            )}
+            fallback={<ModelUsagePlaceholder />}
           >
             <ModelUsagePanel query={query} range={range} enabled={rangeReady} />
           </DeferredPanel>
@@ -803,7 +807,7 @@ export const DashboardPage: React.FC = () => {
                   <div className="heatmap-head">
                     <span className="tile-label">{t('dash.heatmap.title')}</span>
                   </div>
-                  <div className="heatmap-skeleton" aria-hidden="true" />
+                  <HeatmapPlaceholder hasHeader={false} />
                 </div>
               </Panel>
             )}
@@ -818,8 +822,14 @@ export const DashboardPage: React.FC = () => {
             immediate={isArranging}
             fallback={(
               <Panel className="dashboard-tile credential-quota-panel">
-                <Placeholder width="36%" className="placeholder-line is-meta" />
-                <Placeholder width="100%" height={156} className="tile-placeholder-spark" />
+                <div className="quota-inner">
+                  <div className="quota-head">
+                    <span className="tile-label">{t('dash.quota.title')}</span>
+                  </div>
+                  <LoadingRegion>
+                    <CredentialQuotaPlaceholder hasHeader={false} />
+                  </LoadingRegion>
+                </div>
               </Panel>
             )}
           >
@@ -831,14 +841,7 @@ export const DashboardPage: React.FC = () => {
           <DeferredPanel
             priority="p2"
             immediate={isArranging}
-            fallback={(
-              <section className="dashboard-section dashboard-providers-section" aria-busy="true">
-                <Placeholder width="18%" className="placeholder-line is-meta" />
-                <div className="terminal-panel provider-list-panel">
-                  <Placeholder width="100%" height={176} />
-                </div>
-              </section>
-            )}
+            fallback={<ProvidersPlaceholder />}
           >
             <DashboardProviders overview={overviewQuery.data} query={query} range={range} enabled={rangeReady} />
           </DeferredPanel>

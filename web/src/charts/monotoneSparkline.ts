@@ -1,5 +1,12 @@
 export interface SparklinePoint {
   readonly x: number;
+  readonly y: number | null;
+  readonly t: number;
+  readonly value: number | null;
+}
+
+interface SparklineMarker {
+  readonly x: number;
   readonly y: number;
   readonly t: number;
   readonly value: number;
@@ -14,7 +21,8 @@ export interface SparklineGeometry {
   readonly yTop: number;
   readonly yBottom: number;
   readonly hasPositiveValue: boolean;
-  readonly isSinglePoint: boolean;
+  /** Exactly one bucket carries a value; it is drawn as a dot at its own x. */
+  readonly singlePoint: SparklineMarker | null;
 }
 
 export interface SparklineMargin {
@@ -24,12 +32,57 @@ export interface SparklineMargin {
   readonly left: number;
 }
 
+/** Vertical value range mapped onto the plot; values outside it rest on the nearer edge. */
+export interface SparklineDomain {
+  readonly min: number;
+  readonly max: number;
+}
+
+/** How a ratio series fits its own range instead of hanging from zero. */
+export interface SparklineFit {
+  /** Smallest span shown, so a steady series reads as a gentle wave rather than noise blown up. */
+  readonly minSpan: number;
+  readonly floor: number;
+  readonly ceiling: number;
+}
+
 export const DEFAULT_SPARKLINE_MARGIN: SparklineMargin = {
   top: 6,
   right: 6,
   bottom: 2,
   left: 6,
 };
+
+// A bucket fed less than this share of the average bucket's volume does not set a ratio's range:
+// a stray request at night or the bucket that has only just begun can swing to any ratio, and
+// letting it set the scale would pin every well-fed bucket against one edge.
+const FIT_LIGHT_SHARE = 0.1;
+
+/**
+ * Fits a ratio series to the range its well-fed buckets span. A light bucket cannot stretch the
+ * scale; it still plots, on the nearer edge, and the readout still prints its exact value.
+ */
+export function fitSparklineDomain(
+  samples: ReadonlyArray<{ readonly value: number | null; readonly weight?: number }>,
+  fit: SparklineFit,
+): SparklineDomain {
+  const measured = samples.flatMap((sample) =>
+    sample.value !== null && Number.isFinite(sample.value)
+      ? [{ value: sample.value, weight: Math.max(0, sample.weight ?? 0) }]
+      : []);
+  if (measured.length === 0) return { min: fit.floor, max: fit.ceiling };
+
+  const meanWeight = measured.reduce((sum, sample) => sum + sample.weight, 0) / measured.length;
+  const wellFed = measured.filter((sample) => sample.weight >= meanWeight * FIT_LIGHT_SHARE);
+  const values = (wellFed.length > 0 ? wellFed : measured).map((sample) => sample.value);
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+
+  const span = Math.min(fit.ceiling - fit.floor, Math.max(fit.minSpan, high - low));
+  let min = (low + high - span) / 2;
+  min = Math.min(Math.max(min, fit.floor), fit.ceiling - span);
+  return { min, max: min + span };
+}
 
 function sign(x: number): number {
   return x < 0 ? -1 : 1;
@@ -59,12 +112,16 @@ function fmt(n: number): string {
 /**
  * Builds monotone cubic Hermite SVG line and closed area paths (`curveMonotoneX`) without
  * pulling in Recharts or d3-shape, preserving non-negativity and local extrema with zero overshoot.
+ * A null sample has no value to plot (a ratio over an idle bucket): it keeps its time slot and
+ * its readout, and the curve runs on between its measured neighbours instead of breaking.
+ * Without a `domain` the scale hangs from zero up to the largest value.
  */
 export function buildMonotoneSparkline(
-  samples: ReadonlyArray<{ readonly t: number; readonly value: number }>,
+  samples: ReadonlyArray<{ readonly t: number; readonly value: number | null }>,
   width: number,
   height: number,
   margin: SparklineMargin = DEFAULT_SPARKLINE_MARGIN,
+  domain?: SparklineDomain,
 ): SparklineGeometry {
   const x0 = margin.left;
   const x1 = Math.max(x0 + 1, width - margin.right);
@@ -72,103 +129,66 @@ export function buildMonotoneSparkline(
   const yBottom = Math.max(yTop + 1, height - margin.bottom);
   const n = samples.length;
 
-  if (n === 0) {
-    return {
-      points: [],
-      linePath: '',
-      areaPath: '',
-      x0,
-      x1,
-      yTop,
-      yBottom,
-      hasPositiveValue: false,
-      isSinglePoint: false,
-    };
-  }
-
   let maxValue = 0;
-  for (let i = 0; i < n; i += 1) {
-    const v = samples[i]!.value;
-    if (v > maxValue) maxValue = v;
+  for (const sample of samples) {
+    if (sample.value !== null && Number.isFinite(sample.value) && sample.value > maxValue) maxValue = sample.value;
   }
   const hasPositiveValue = maxValue > 0;
-  const domainMax = hasPositiveValue ? maxValue : 1;
+  const domainMin = domain ? domain.min : 0;
+  const domainSpan = domain ? Math.max(domain.max - domain.min, Number.EPSILON) : (hasPositiveValue ? maxValue : 1);
   const plotWidth = x1 - x0;
   const plotHeight = yBottom - yTop;
 
   const points: SparklinePoint[] = new Array<SparklinePoint>(n);
-  if (n === 1) {
-    const sample = samples[0]!;
-    const v = Math.max(0, sample.value);
-    points[0] = {
-      x: (x0 + x1) / 2,
-      y: yBottom - (v / domainMax) * plotHeight,
-      t: sample.t,
-      value: v,
-    };
-    return {
-      points,
-      linePath: '',
-      areaPath: '',
-      x0,
-      x1,
-      yTop,
-      yBottom,
-      hasPositiveValue,
-      isSinglePoint: true,
-    };
-  }
-
+  const measured: SparklineMarker[] = [];
   for (let i = 0; i < n; i += 1) {
     const sample = samples[i]!;
+    const x = n === 1 ? (x0 + x1) / 2 : x0 + (i / (n - 1)) * plotWidth;
+    if (sample.value === null || !Number.isFinite(sample.value)) {
+      points[i] = { x, y: null, t: sample.t, value: null };
+      continue;
+    }
     const v = Math.max(0, sample.value);
-    points[i] = {
-      x: x0 + (i / (n - 1)) * plotWidth,
-      y: yBottom - (v / domainMax) * plotHeight,
-      t: sample.t,
-      value: v,
-    };
+    const ratio = Math.min(1, Math.max(0, (v - domainMin) / domainSpan));
+    const marker: SparklineMarker = { x, y: yBottom - ratio * plotHeight, t: sample.t, value: v };
+    points[i] = marker;
+    measured.push(marker);
   }
 
-  if (n === 2) {
-    const p0 = points[0]!;
-    const p1 = points[1]!;
-    const linePath = `M${fmt(p0.x)},${fmt(p0.y)}L${fmt(p1.x)},${fmt(p1.y)}`;
-    const areaPath = `${linePath}L${fmt(p1.x)},${fmt(yBottom)}L${fmt(p0.x)},${fmt(yBottom)}Z`;
-    return {
-      points,
-      linePath,
-      areaPath,
-      x0,
-      x1,
-      yTop,
-      yBottom,
-      hasPositiveValue,
-      isSinglePoint: false,
-    };
+  const base = { points, x0, x1, yTop, yBottom, hasPositiveValue };
+  if (measured.length < 2) {
+    return { ...base, linePath: '', areaPath: '', singlePoint: measured[0] ?? null };
   }
 
-  const tangents = new Float64Array(n);
-  for (let i = 1; i < n - 1; i += 1) {
-    const prev = points[i - 1]!;
-    const curr = points[i]!;
-    const next = points[i + 1]!;
+  const m = measured.length;
+  const tangents = new Float64Array(m);
+  for (let i = 1; i < m - 1; i += 1) {
+    const prev = measured[i - 1]!;
+    const curr = measured[i]!;
+    const next = measured[i + 1]!;
     tangents[i] = slope3(prev.x, prev.y, curr.x, curr.y, next.x, next.y);
   }
-  tangents[0] = slope2(points[0]!.x, points[0]!.y, points[1]!.x, points[1]!.y, tangents[1]!);
-  tangents[n - 1] = slope2(
-    points[n - 2]!.x,
-    points[n - 2]!.y,
-    points[n - 1]!.x,
-    points[n - 1]!.y,
-    tangents[n - 2]!,
-  );
+  if (m === 2) {
+    const slope = (measured[1]!.y - measured[0]!.y) / (measured[1]!.x - measured[0]!.x || 1);
+    tangents[0] = slope;
+    tangents[1] = slope;
+  } else {
+    tangents[0] = slope2(measured[0]!.x, measured[0]!.y, measured[1]!.x, measured[1]!.y, tangents[1]!);
+    tangents[m - 1] = slope2(
+      measured[m - 2]!.x,
+      measured[m - 2]!.y,
+      measured[m - 1]!.x,
+      measured[m - 1]!.y,
+      tangents[m - 2]!,
+    );
+  }
 
-  const first = points[0]!;
+  const first = measured[0]!;
+  const last = measured[m - 1]!;
   const segments: string[] = [`M${fmt(first.x)},${fmt(first.y)}`];
-  for (let i = 0; i < n - 1; i += 1) {
-    const p0 = points[i]!;
-    const p1 = points[i + 1]!;
+  for (let i = 0; i < m - 1; i += 1) {
+    const p0 = measured[i]!;
+    const p1 = measured[i + 1]!;
     const dx = (p1.x - p0.x) / 3;
     const t0 = tangents[i]!;
     const t1 = tangents[i + 1]!;
@@ -176,21 +196,12 @@ export function buildMonotoneSparkline(
       `C${fmt(p0.x + dx)},${fmt(p0.y + dx * t0)},${fmt(p1.x - dx)},${fmt(p1.y - dx * t1)},${fmt(p1.x)},${fmt(p1.y)}`,
     );
   }
-
   const linePath = segments.join('');
-  const last = points[n - 1]!;
-  const areaPath = `${linePath}L${fmt(last.x)},${fmt(yBottom)}L${fmt(first.x)},${fmt(yBottom)}Z`;
-
   return {
-    points,
+    ...base,
     linePath,
-    areaPath,
-    x0,
-    x1,
-    yTop,
-    yBottom,
-    hasPositiveValue,
-    isSinglePoint: false,
+    areaPath: `${linePath}L${fmt(last.x)},${fmt(yBottom)}L${fmt(first.x)},${fmt(yBottom)}Z`,
+    singlePoint: null,
   };
 }
 

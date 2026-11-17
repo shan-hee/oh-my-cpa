@@ -29,6 +29,7 @@ import {
 } from '../../src/performance/index.ts';
 import {
   buildMonotoneSparkline,
+  fitSparklineDomain,
   resolveSparklineIndex,
   sparklineViewBoxToHostX,
 } from '../../src/charts/monotoneSparkline.ts';
@@ -38,6 +39,9 @@ import { dashboardWidgetSpec } from '../../src/types/dashboardLayout.ts';
 import { isDiscreteWheel, keyScrollFor, pageDistance, type WheelSample } from '../../src/utils/scrollSmoothing.ts';
 import { isSameDrawing } from '../../src/charts/useChartMorph.ts';
 import { isSameReadout } from '../../src/components/dashboard/RollingNumber.tsx';
+import { PAGE_SKELETON_REGISTRY } from '../../src/components/common/PageLoading.tsx';
+import { ROUTE_DESCRIPTORS, consoleRouteRegistry } from '../../src/routePreload.ts';
+import { buildNavGroupSpecs } from '../../src/types/sidebarNav.ts';
 
 test('frame scheduler separates priority tiers across slices, caps per-slice jobs, and yields across frames', () => {
   let clock = 0;
@@ -963,7 +967,7 @@ test('buildMonotoneSparkline produces overshoot-free monotone paths and maps poi
   assert.equal(empty.linePath, '');
 
   const single = buildMonotoneSparkline([{ t: 1_000, value: 42 }], 240, 64);
-  assert.equal(single.isSinglePoint, true);
+  assert.equal(single.singlePoint?.value, 42);
   assert.equal(single.hasPositiveValue, true);
   assert.equal(single.points[0]?.x, 120);
   assert.equal(single.linePath, '');
@@ -996,6 +1000,74 @@ test('buildMonotoneSparkline produces overshoot-free monotone paths and maps poi
   assert.equal(resolveSparklineIndex(12, 480, 73), 0);
   assert.equal(sparklineViewBoxToHostX(6, 480, 240), 12);
   assert.equal(sparklineViewBoxToHostX(234, 480, 240), 468);
+
+  // A null sample (a ratio over an idle bucket) keeps its slot and readout, and the curve runs on
+  // between its measured neighbours instead of breaking or dropping to 0%.
+  const allNull = buildMonotoneSparkline(
+    [{ t: 1, value: null }, { t: 2, value: null }, { t: 3, value: null }],
+    240,
+    64,
+  );
+  assert.equal(allNull.hasPositiveValue, false);
+  assert.equal(allNull.linePath, '');
+  assert.equal(allNull.singlePoint, null);
+
+  const lone = buildMonotoneSparkline(
+    [{ t: 1, value: null }, { t: 2, value: 40 }, { t: 3, value: null }],
+    240,
+    64,
+  );
+  assert.equal(lone.linePath, '');
+  assert.equal(lone.singlePoint?.x, 120, 'a lone measured bucket is a dot at its own x');
+
+  const bridged = buildMonotoneSparkline(
+    [
+      { t: 1, value: null },
+      { t: 2, value: 90 },
+      { t: 3, value: null },
+      { t: 4, value: null },
+      { t: 5, value: 50 },
+      { t: 6, value: 80 },
+    ],
+    240,
+    64,
+    undefined,
+    { min: 50, max: 100 },
+  );
+  assert.equal(bridged.points[0]?.y, null);
+  assert.equal(bridged.points[2]?.y, null);
+  assert.equal((bridged.linePath.match(/M/g) ?? []).length, 1, 'idle buckets never split the curve');
+  assert.ok(bridged.linePath.startsWith('M51.6,'), 'the curve starts at the first measured bucket');
+  assert.equal(bridged.points[4]?.y, bridged.yBottom, 'the domain floor maps to the plot bottom');
+
+  // A ratio fits the range its volume sits in; a near-idle outlier rests on the edge instead of
+  // stretching the scale, and a steady series zooms no further than minSpan.
+  const fit = { minSpan: 10, floor: 0, ceiling: 100 };
+  const steady = fitSparklineDomain(
+    [
+      { value: 90, weight: 1_000 },
+      { value: 92, weight: 1_000 },
+      { value: 5, weight: 3 },
+      { value: null, weight: 0 },
+    ],
+    fit,
+  );
+  assert.deepEqual(steady, { min: 86, max: 96 });
+  const clamped = buildMonotoneSparkline(
+    [{ t: 1, value: 90 }, { t: 2, value: 5 }, { t: 3, value: 92 }],
+    240,
+    64,
+    undefined,
+    steady,
+  );
+  assert.equal(clamped.points[1]?.y, clamped.yBottom);
+  assert.equal(clamped.points[1]?.value, 5);
+  assert.deepEqual(fitSparklineDomain([{ value: 99, weight: 1 }], fit), { min: 90, max: 100 });
+  assert.deepEqual(
+    fitSparklineDomain([{ value: 20, weight: 500 }, { value: 80, weight: 500 }], fit),
+    { min: 20, max: 80 },
+    'a real swing carried by volume sets the scale',
+  );
 });
 
 test('getIdentityDirectoryProjection caches derived Maps and Sets per response object via WeakMap', () => {
@@ -1036,4 +1108,22 @@ test('getIdentityDirectoryProjection caches derived Maps and Sets per response o
   assert.equal(first.providersByID.get('openai-0')?.name, 'OpenAI');
   assert.equal(first.pluginTitles.get('codex-plus'), 'Codex Plus');
   assert.equal(first.multiPortalKeys.has('codex-plus'), true);
+});
+
+test('every route descriptor and static navigation entry declares a registered skeleton archetype', () => {
+  const registeredBodies = new Set(Object.keys(PAGE_SKELETON_REGISTRY));
+  assert.ok(ROUTE_DESCRIPTORS.length > 0);
+  for (const descriptor of ROUTE_DESCRIPTORS) {
+    assert.ok(descriptor.loadingBody, `${descriptor.path} must declare loadingBody in ROUTE_DESCRIPTORS`);
+    assert.ok(
+      registeredBodies.has(descriptor.loadingBody),
+      `${descriptor.path} references unregistered loadingBody=${descriptor.loadingBody}`,
+    );
+  }
+  for (const group of buildNavGroupSpecs()) {
+    for (const item of group.items) {
+      const resolved = consoleRouteRegistry.resolve(item.key);
+      assert.ok(resolved?.loadingBody, `nav item ${item.key} must resolve to a ROUTE_DESCRIPTOR with loadingBody`);
+    }
+  }
 });

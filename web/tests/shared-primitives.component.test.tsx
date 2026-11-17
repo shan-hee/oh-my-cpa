@@ -30,8 +30,13 @@ import { DataTable } from '../src/components/ui/table';
 import { I18nProvider, useT, type MessageKey } from '../src/i18n';
 import { ThemeProvider } from '../src/theme/ThemeContext';
 import { DashboardTrendChart } from '../src/charts/DashboardTrendChart';
+import { formatCacheRate } from '../src/theme/cacheScale';
 import { RoutingPanel } from '../src/components/dashboard/routing/RoutingPanel';
-import { renderWithOmc } from './support/render';
+import { LoadingRegion, Placeholder } from '../src/components/common/Placeholder';
+import { PAGE_SKELETON_REGISTRY, RouteSkeleton, type RouteLoadingBody } from '../src/components/common/PageLoading';
+import { ShellLoading } from '../src/components/common/ShellLoading';
+import { ThreadPlaceholder } from '../src/components/workspace/ThreadPlaceholder';
+import { createTestQueryClient, renderWithOmc } from './support/render';
 import { installOmcApi, json } from './support/omcApi';
 
 describe('SearchInput', () => {
@@ -1236,5 +1241,298 @@ describe('DashboardTrendChart native SVG sparkline', () => {
     expect(screen.getByText('12 reqs')).toBeTruthy();
     fireEvent.keyDown(chart, { key: 'Escape' });
     expect(screen.queryByText('12 reqs')).toBeNull();
+  });
+
+  it('plots cache-rate percentages across idle buckets with dash readouts for them', () => {
+    const surface = renderWithOmc(
+      <ThemeProvider>
+        <DashboardTrendChart
+          ariaLabel="Cache rate"
+          height={44}
+          fit={{ minSpan: 10, floor: 0, ceiling: 100, weight: (p) => p.tokens ?? 0 }}
+          points={[
+            { t: 1_700_000_000_000, tokens: 0, cache_read: 0 },
+            { t: 1_700_000_060_000, tokens: 1000, cache_read: 952, cache_rate: 95.24 },
+            { t: 1_700_000_120_000, tokens: 500, cache_read: 400, cache_rate: 80 },
+            { t: 1_700_000_180_000, tokens: 0, cache_read: 0 },
+            { t: 1_700_000_240_000, tokens: 200, cache_read: 84, cache_rate: 42 },
+            { t: 1_700_000_300_000, tokens: 0, cache_read: 0 },
+            { t: 1_700_000_360_000, tokens: 300, cache_read: 0, cache_rate: 0 },
+          ]}
+          pick={(p) => p.cache_rate ?? null}
+          label={(t) => `bucket-${t}`}
+          format={formatCacheRate}
+        />
+      </ThemeProvider>,
+    );
+
+    const chart = screen.getByRole('img', { name: 'Cache rate' });
+    chart.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 480, bottom: 44, width: 480, height: 44, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
+    // Idle buckets never split the curve into fragments.
+    const curve = surface.container.querySelector('svg path[fill="none"]');
+    expect((curve?.getAttribute('d')?.match(/M/g) ?? []).length).toBe(1);
+
+    // Pointer hover on index 0 (null bucket at x=12px) shows '—' without an active curve dot.
+    fireEvent.pointerMove(chart, { clientX: 12, clientY: 20, pointerType: 'mouse' });
+    expect(screen.getByText('bucket-1700000000000')).toBeTruthy();
+    expect(screen.getByText('—')).toBeTruthy();
+    expect(surface.container.querySelector('[data-slot="sparkline-active-dot"]')).toBeNull();
+
+    // Pointer hover on index 1 (95.24% at x=88px) renders active dot and percentage readout.
+    fireEvent.pointerMove(chart, { clientX: 88, clientY: 20, pointerType: 'mouse' });
+    expect(screen.getByText('95.2%')).toBeTruthy();
+    expect(surface.container.querySelector('[data-slot="sparkline-active-dot"]')).not.toBeNull();
+
+    fireEvent.pointerLeave(chart, { pointerType: 'mouse' });
+    expect(screen.queryByText('95.2%')).toBeNull();
+
+    // Keyboard Home lands on index 0 (null cache_rate): shows '—' without an active curve dot.
+    fireEvent.keyDown(chart, { key: 'Home' });
+    expect(screen.getByText('bucket-1700000000000')).toBeTruthy();
+    expect(screen.getByText('—')).toBeTruthy();
+    expect(surface.container.querySelector('[data-slot="sparkline-active-dot"]')).toBeNull();
+
+    // Stepping to index 1 (95.24) renders active dot and formats percentage to 95.2%.
+    fireEvent.keyDown(chart, { key: 'ArrowRight' });
+    expect(screen.getByText('95.2%')).toBeTruthy();
+    expect(surface.container.querySelector('[data-slot="sparkline-active-dot"]')).not.toBeNull();
+
+    // Stepping to End (measured 0%) formats as 0% and keeps the active dot.
+    fireEvent.keyDown(chart, { key: 'End' });
+    expect(screen.getByText('0%')).toBeTruthy();
+    expect(surface.container.querySelector('[data-slot="sparkline-active-dot"]')).not.toBeNull();
+    fireEvent.keyDown(chart, { key: 'Escape' });
+
+    // An all-idle window draws only the baseline and prints '—' on selection.
+    const emptySurface = renderWithOmc(
+      <ThemeProvider>
+        <DashboardTrendChart
+          ariaLabel="Empty cache rate"
+          height={44}
+          fit={{ minSpan: 10, floor: 0, ceiling: 100, weight: (p) => p.tokens ?? 0 }}
+          points={[
+            { t: 1_700_000_000_000, tokens: 0, cache_read: 0 },
+            { t: 1_700_000_060_000, tokens: 0, cache_read: 0 },
+          ]}
+          pick={(p) => p.cache_rate ?? null}
+          label={(t) => `empty-${t}`}
+          format={formatCacheRate}
+        />
+      </ThemeProvider>,
+    );
+    expect(emptySurface.container.querySelectorAll('svg path')).toHaveLength(0);
+    fireEvent.keyDown(screen.getByRole('img', { name: 'Empty cache rate' }), { key: 'Home' });
+    expect(screen.getByText('empty-1700000000000')).toBeTruthy();
+    expect(screen.getByText('—')).toBeTruthy();
+  });
+});
+
+describe('ShellLoading and LoadingRegion continuity', () => {
+  it('renders route-aware dashboard skeleton inside ShellLoading and respects cached collapsed state', () => {
+    const originalPath = window.location.pathname;
+    window.history.replaceState(null, '', '/');
+    try {
+      const client = createTestQueryClient();
+      client.setQueryData(['preferences'], { omc_sidebar_collapsed: true });
+      const { container } = renderWithOmc(
+        <ThemeProvider>
+          <ShellLoading />
+        </ThemeProvider>,
+        { client },
+      );
+
+      expect(screen.getAllByRole('status')).toHaveLength(1);
+      const region = screen.getByRole('status');
+      expect(region.getAttribute('aria-busy')).toBe('true');
+      expect(region.getAttribute('data-handover')).toBe('true');
+      expect(screen.getByTestId('routing-skeleton')).toBeTruthy();
+      expect((container.firstElementChild as HTMLElement).style.getPropertyValue('--sider-width')).toBe('58px');
+    } finally {
+      window.history.replaceState(null, '', originalPath);
+    }
+  });
+
+  it('renders the standalone authorization frame without a sidebar on /authorize/* routes', () => {
+    const originalPath = window.location.pathname;
+    window.history.replaceState(null, '', '/authorize/op_test');
+    try {
+      const { container } = renderWithOmc(
+        <ThemeProvider>
+          <ShellLoading />
+        </ThemeProvider>,
+      );
+
+      expect(container.querySelector('aside')).toBeNull();
+      expect(screen.queryByTestId('routing-skeleton')).toBeNull();
+      expect(screen.getByRole('status').getAttribute('data-handover')).toBe('true');
+    } finally {
+      window.history.replaceState(null, '', originalPath);
+    }
+  });
+
+  it('delays isolated loading regions while handing over sequential loading regions without a flash gap', () => {
+    let clock = 5_000_000;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    try {
+      const first = render(
+        <I18nProvider>
+          <LoadingRegion>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.getByRole('status').getAttribute('data-handover')).toBeNull();
+
+      clock += 50;
+      first.unmount();
+
+      clock += 40;
+      const second = render(
+        <I18nProvider>
+          <LoadingRegion>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.getByRole('status').getAttribute('data-handover')).toBe('true');
+      second.unmount();
+
+      clock += 1_000;
+      const third = render(
+        <I18nProvider>
+          <LoadingRegion>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.getByRole('status').getAttribute('data-handover')).toBeNull();
+      third.unmount();
+
+      // Restoring an earlier clock (or rerunning in the same worker) must not trigger handover via negative elapsed time.
+      clock = 100;
+      const fourth = render(
+        <I18nProvider>
+          <LoadingRegion>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.getByRole('status').getAttribute('data-handover')).toBeNull();
+      fourth.unmount();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('renders every registered route skeleton archetype cleanly with a single busy status region', () => {
+    const bodies = Object.keys(PAGE_SKELETON_REGISTRY) as RouteLoadingBody[];
+    for (const body of bodies) {
+      const { unmount } = renderWithOmc(
+        <ThemeProvider>
+          <RouteSkeleton body={body} isImmediate />
+        </ThemeProvider>,
+      );
+      const statuses = screen.getAllByRole('status');
+      expect(statuses, `archetype ${body} must expose one status region`).toHaveLength(1);
+      expect(statuses[0].getAttribute('aria-busy')).toBe('true');
+      expect(statuses[0].getAttribute('data-handover')).toBe('true');
+      unmount();
+    }
+  });
+
+  it('projects cached hidden and reordered sidebar items inside ShellLoading', () => {
+    const originalPath = window.location.pathname;
+    window.history.replaceState(null, '', '/insights');
+    try {
+      const client = createTestQueryClient();
+      client.setQueryData(['preferences'], {
+        omc_nav_hidden: ['/agent', '/playground'],
+        omc_nav_order: { operate: ['/model-square', '/dashboard'] },
+      });
+      const { container } = renderWithOmc(
+        <ThemeProvider>
+          <ShellLoading />
+        </ThemeProvider>,
+        { client },
+      );
+
+      // 18 static items minus 2 hidden (`/agent`, `/playground`) = 16 rendered rail rows.
+      expect(container.querySelectorAll('.shell-loading-nav-item')).toHaveLength(16);
+      expect(container.querySelector('.placeholder-insights-rankings')).not.toBeNull();
+    } finally {
+      window.history.replaceState(null, '', originalPath);
+    }
+  });
+
+  it('hands over parent-to-child LoadingRegion without remounting and keeps ThreadPlaceholder header inside status', () => {
+    let clock = 8_000_000;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    try {
+      const view = render(
+        <I18nProvider>
+          <LoadingRegion isLoading>
+            <LoadingRegion testId="child-region" isLoading>
+              <Placeholder width={120} />
+            </LoadingRegion>
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+
+      const childBefore = screen.getByTestId('child-region');
+      expect(screen.getAllByRole('status')).toHaveLength(1);
+      expect(childBefore.getAttribute('role')).toBeNull();
+
+      clock += 50;
+      view.rerender(
+        <I18nProvider>
+          <LoadingRegion isLoading={false}>
+            <LoadingRegion testId="child-region" isLoading>
+              <Placeholder width={120} />
+            </LoadingRegion>
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+
+      const childAfter = screen.getByTestId('child-region');
+      expect(childAfter).toBe(childBefore);
+      expect(childAfter.getAttribute('role')).toBe('status');
+      expect(childAfter.getAttribute('aria-busy')).toBe('true');
+      expect(childAfter.getAttribute('data-handover')).toBe('true');
+      view.unmount();
+
+      clock += 1_000;
+      const standalone = render(
+        <I18nProvider>
+          <LoadingRegion testId="late-region" isLoading={false}>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.queryByRole('status')).toBeNull();
+      standalone.rerender(
+        <I18nProvider>
+          <LoadingRegion testId="late-region" isLoading>
+            <Placeholder width={120} />
+          </LoadingRegion>
+        </I18nProvider>,
+      );
+      expect(screen.getByTestId('late-region').getAttribute('data-handover')).toBeNull();
+      standalone.unmount();
+
+      clock += 1_000;
+      const thread = render(
+        <I18nProvider>
+          <ThreadPlaceholder hasHeader testId="thread-skel" />
+        </I18nProvider>,
+      );
+      const threadStatus = screen.getByTestId('thread-skel');
+      expect(threadStatus.getAttribute('role')).toBe('status');
+      expect(threadStatus.getAttribute('data-handover')).toBeNull();
+      expect(threadStatus.querySelector('.thread-placeholder-head')).not.toBeNull();
+      thread.unmount();
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 });
