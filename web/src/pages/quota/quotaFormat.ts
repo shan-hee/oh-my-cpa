@@ -1,6 +1,6 @@
 import dayjs from '../../utils/time';
 import type { TFunc } from '../../i18n';
-import type { QuotaItem, QuotaMetric, QuotaWindow } from '../../types/quota';
+import type { CodexResetCredit, QuotaItem, QuotaMetric, QuotaPlan, QuotaWindow } from '../../types/quota';
 import { formatUsd } from '../../types/pricingDisplay';
 import { quotaWindowFullName, quotaWindowKindOf } from './quotaWindowSelection';
 
@@ -176,6 +176,13 @@ export function quotaWindowLabel(kind: string | undefined, label: string | undef
   return label || '';
 }
 
+/** Localizes the backend's sentinel unknown-plan label (`\u672a\u77e5\u5957\u9910`) without altering custom/provider plan titles. */
+export function quotaPlanLabel(plan: Pick<QuotaPlan, 'plan_label'> | undefined, t: TFunc): string | undefined {
+  const raw = plan?.plan_label?.trim();
+  if (!raw) return undefined;
+  return raw === '\u672a\u77e5\u5957\u9910' ? t('quota.plan_unknown') : raw;
+}
+
 /**
  * When a window resets, as "09/24 20:11 (4h left)". A derived or approximate instant
  * keeps its `~`, so a compact row cannot read as a verified deadline.
@@ -232,4 +239,25 @@ export function formatQuotaMoney(amount: number | undefined, currency?: string):
   } catch {
     return `${amount.toFixed(2)} ${currency}`;
   }
+}
+
+function creditSortTimestamp(ms: number | undefined): number {
+  return ms != null && Number.isFinite(ms) && ms > 0 ? ms : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Available Codex reset credits ordered soonest-expiring first so an operator can plan manual
+ * redemptions without missing an earlier expiry; undated entries trail deterministically.
+ */
+export function orderCodexResetCredits(credits: readonly CodexResetCredit[] | undefined): CodexResetCredit[] {
+  return (credits ?? [])
+    .filter((credit) => !credit.status || credit.status === 'available')
+    .slice()
+    .sort((left, right) => {
+      const expDiff = creditSortTimestamp(left.expires_at_ms) - creditSortTimestamp(right.expires_at_ms);
+      if (expDiff !== 0) return expDiff;
+      const grantDiff = creditSortTimestamp(left.granted_at_ms) - creditSortTimestamp(right.granted_at_ms);
+      if (grantDiff !== 0) return grantDiff;
+      return left.id.localeCompare(right.id);
+    });
 }

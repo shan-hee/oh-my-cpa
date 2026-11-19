@@ -3,6 +3,8 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createMemoryRouter, RouterProvider, useRouteError } from 'react-router-dom';
 import { DeferredMount } from '../src/components/common/DeferredMount';
+import { RouteErrorPage } from '../src/components/common/RouteErrorPage';
+import * as chunkRecovery from '../src/utils/chunkRecovery';
 import { Tooltip } from '../src/components/common/Tooltip';
 import { progressTasks } from '../src/utils/progressTasks';
 import { AppDrawer } from '../src/components/common/AppDrawer';
@@ -530,6 +532,38 @@ describe('DeferredMount', () => {
 
     expect((await screen.findByRole('alert')).textContent).toBe('Editor render failed');
     expect(screen.queryByTestId('optional-surface-failure')).toBeNull();
+  });
+
+  it('recovers a route module-script error with a guarded reload and shows diagnostics if throttled', async () => {
+    const attemptSpy = vi.spyOn(chunkRecovery, 'attemptChunkReload');
+    function ThrowingRoute(): React.ReactNode {
+      throw new TypeError('Importing a module script failed.');
+    }
+
+    try {
+      attemptSpy.mockReturnValueOnce(true);
+      const reloadingRouter = createMemoryRouter([{ path: '/', element: <ThrowingRoute />, errorElement: <RouteErrorPage /> }]);
+      const reloadingView = renderWithOmc(
+        <ThemeProvider>
+          <RouterProvider router={reloadingRouter} />
+        </ThemeProvider>,
+      );
+      await waitFor(() => expect(attemptSpy).toHaveBeenCalledTimes(1));
+      expect(screen.queryByTestId('route-error-message')).toBeNull();
+      reloadingView.unmount();
+
+      attemptSpy.mockReturnValueOnce(false);
+      const throttledRouter = createMemoryRouter([{ path: '/', element: <ThrowingRoute />, errorElement: <RouteErrorPage /> }]);
+      renderWithOmc(
+        <ThemeProvider>
+          <RouterProvider router={throttledRouter} />
+        </ThemeProvider>,
+      );
+      expect((await screen.findByTestId('route-error-message')).textContent).toBe('Importing a module script failed.');
+    } finally {
+      attemptSpy.mockRestore();
+      chunkRecovery.clearChunkReloadPending();
+    }
   });
 });
 
@@ -1457,8 +1491,8 @@ describe('ShellLoading and LoadingRegion continuity', () => {
         { client },
       );
 
-      // 18 static items minus 2 hidden (`/agent`, `/playground`) = 16 rendered rail rows.
-      expect(container.querySelectorAll('.shell-loading-nav-item')).toHaveLength(16);
+      // 19 static items minus 2 hidden (`/agent`, `/playground`) = 17 rendered rail rows.
+      expect(container.querySelectorAll('.shell-loading-nav-item')).toHaveLength(17);
       expect(container.querySelector('.placeholder-insights-rankings')).not.toBeNull();
     } finally {
       window.history.replaceState(null, '', originalPath);

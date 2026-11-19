@@ -22,6 +22,7 @@ import { DashboardSkeleton } from '../dashboard/DashboardSkeleton';
 export type RouteLoadingBody =
   | 'dashboard'
   | 'insights'
+  | 'trends'
   | 'workspace'
   | 'catalog'
   | 'directory'
@@ -323,7 +324,52 @@ export function PanelsPlaceholder({ count = 3 }: { count?: number }) {
   );
 }
 
-/** Insights (`/insights`): range controls, 4-col MetricTiles, trend curve panel, and 2x2 rankings. */
+/** Trends (`/trends`): range controls, 4-col tiles, the quota trend card with its lens, and the speed bench above the fold. */
+export function TrendsSkeleton({
+  hasHeader = true,
+  isImmediate = false,
+}: {
+  hasHeader?: boolean;
+  isImmediate?: boolean;
+}) {
+  return (
+    <div className={clsx(hasHeader && 'terminal-page')}>
+      <LoadingRegion isImmediate={isImmediate} className="placeholder-stack">
+        {hasHeader && (
+          <PageHeadPlaceholder
+            titleWidth={88}
+            actions={(
+              <div className="placeholder-head-tools">
+                <Placeholder width={186} height={32} className="is-control" />
+                <Placeholder width={32} height={32} className="is-control" />
+              </div>
+            )}
+          />
+        )}
+        <StatTilesPlaceholder count={4} withDelta row={0} />
+        <Panel
+          title={<Placeholder width={148} row={1} className="placeholder-line" />}
+          extra={<Placeholder width={132} height={28} row={1} className="is-control" />}
+        >
+          <div className="placeholder-stack">
+            <Placeholder width={220} height={28} row={2} className="is-control" />
+            <Placeholder width={96} height={24} row={2} />
+            <ChartLinesPlaceholder height={260} kind="trend" row={2} />
+            <Placeholder width="100%" height={28} row={2} className="is-control" />
+          </div>
+        </Panel>
+        <Panel
+          title={<Placeholder width={120} row={3} className="placeholder-line" />}
+          extra={<Placeholder width="min(420px, calc(100vw - 72px))" height={28} row={3} className="is-control" />}
+        >
+          <ChartLinesPlaceholder height={280} kind="trend" row={3} />
+        </Panel>
+      </LoadingRegion>
+    </div>
+  );
+}
+
+/** Insights (`/insights`): range controls, 4-col MetricTiles, trend curve panel, token parts, and the rankings' fixed places. */
 export function InsightsSkeleton({
   hasHeader = true,
   isImmediate = false,
@@ -352,8 +398,24 @@ export function InsightsSkeleton({
         >
           <ChartLinesPlaceholder height={260} kind="trend" row={2} />
         </Panel>
+        <Panel
+          title={<Placeholder width={120} row={3} className="placeholder-line" />}
+          extra={<Placeholder width={132} height={26} row={3} className="is-control" />}
+        >
+          <div className="placeholder-anatomy">
+            <Placeholder width="100%" height={12} row={3} />
+            <div className="placeholder-anatomy-parts">
+              {[0, 1, 2, 3, 4].map((part) => (
+                <div key={part} className="placeholder-ranking-row">
+                  <Placeholder width={72 + (part % 3) * 12} row={3} className="placeholder-line is-meta" />
+                  <Placeholder width={56} height={18} row={3} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </Panel>
         <div className="placeholder-insights-rankings" aria-hidden="true">
-          {[0, 1, 2, 3].map((panel) => (
+          {[0, 1, 2, 3, 4].map((panel) => (
             <Panel
               key={panel}
               title={<Placeholder width={84 + (panel % 2) * 20} row={3} className="placeholder-line" />}
@@ -883,6 +945,7 @@ export function ListSkeleton({ isImmediate = false }: { isImmediate?: boolean })
 export const PAGE_SKELETON_REGISTRY: Record<RouteLoadingBody, React.FC<{ isImmediate?: boolean }>> = {
   dashboard: ({ isImmediate }) => <DashboardSkeleton isImmediate={isImmediate} />,
   insights: ({ isImmediate }) => <InsightsSkeleton isImmediate={isImmediate} />,
+  trends: ({ isImmediate }) => <TrendsSkeleton isImmediate={isImmediate} />,
   workspace: ({ isImmediate }) => <ThreadPlaceholder hasHeader hasComposer isImmediate={isImmediate} />,
   catalog: ({ isImmediate }) => <CatalogSkeleton isImmediate={isImmediate} />,
   directory: ({ isImmediate }) => <DirectorySkeleton isImmediate={isImmediate} />,

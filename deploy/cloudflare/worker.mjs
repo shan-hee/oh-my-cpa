@@ -24,7 +24,7 @@
  */
 import { applyQueryFilters } from './filters.mjs';
 import { routingAt, signalInstantsBetween } from './liveRouting.mjs';
-import { DATASET, INSIGHTS_PATH_PREFIX, REFERENCE_MS, dashboardPresetOf, responseNameFor } from './routes.mjs';
+import { DATASET, INSIGHTS_PATH_PREFIX, REFERENCE_MS, TRENDS_PATH_PREFIX, dashboardPresetOf, insightsPresetOf, responseNameFor } from './routes.mjs';
 import { rebase } from './time.mjs';
 /** Marker the console reads to render its own demonstration notices. */
 const DEMO_HEADER = 'X-OMCPA-Demo';
@@ -33,11 +33,11 @@ const DEMO_HEADER = 'X-OMCPA-Demo';
 const UNCAPTURED_CODE = 'demo_uncaptured';
 
 /**
- * The Insights rhythm's filters. The cube is filtered in the browser, so every filter
- * works on it; the rhythm is filtered on the server, and the dataset holds it for the
- * whole deployment only, so a filtered ask is told so rather than answered for everyone.
+ * The Insights rhythm's filters. The cube supports dimension filters in the browser and
+ * `client_agent` via the Worker filter; the rhythm and clients views are captured for
+ * the whole deployment only, so a filtered ask is told so rather than answered for everyone.
  */
-const RHYTHM_FILTERS = ['api_key', 'model_alias', 'model', 'provider', 'auth_index'];
+const RHYTHM_FILTERS = ['api_key', 'model_alias', 'model', 'provider', 'auth_index', 'client_agent'];
 
 const WEEK_MS = 7 * 86_400_000;
 const INSIGHTS_REPLAY_PRESETS = new Set(['24h', '7d', '30d', '90d', 'all']);
@@ -160,6 +160,7 @@ const EVENT_IDENTITY_FIELDS = [
   'source',
   'user_agent',
   'client_agent',
+  'client_agent_category',
   'stream',
   'latency_ms',
   'ttft_ms',
@@ -214,13 +215,35 @@ function matchEventIdentity(decoded, pathname, dataset) {
   return decoded;
 }
 
+function filterTrendsQuota(payload, url) {
+  const values = (name) => url.searchParams.getAll(name).map((value) => value.trim()).filter(Boolean);
+  const providers = values('provider');
+  const indexes = values('auth_index');
+  if (!providers.length && !indexes.length) return payload;
+  const items = payload.items.filter((item) => (!providers.length || providers.includes(item.provider))
+    && (!indexes.length || indexes.includes(item.auth_index)));
+  const windows = items.flatMap((item) => item.windows);
+  const count = (status) => windows.filter((window) => window.status === status).length;
+  return { ...payload, items, summary: {
+    active_credentials: items.length,
+    observable_windows: windows.length,
+    healthy_windows: count('normal'),
+    limit_reached_windows: count('limit_reached'),
+    projected_exhaust_windows: count('projected_exhaust'),
+    underutilized_windows: count('underutilized'),
+  } };
+}
+
 function serve(entry, nowMs, url) {
   const isInsights = url.pathname.startsWith(INSIGHTS_PATH_PREFIX);
-  if (isInsights && (url.searchParams.has('from') || url.searchParams.has('to')
+  const isTrendsQuota = url.pathname === `${TRENDS_PATH_PREFIX}quota`;
+  const isTrendsWindow = !isTrendsQuota && url.pathname.startsWith(TRENDS_PATH_PREFIX);
+  const isCalendarReplay = isInsights || isTrendsWindow;
+  if (isCalendarReplay && (url.searchParams.has('from') || url.searchParams.has('to')
     || !INSIGHTS_REPLAY_PRESETS.has((url.searchParams.get('preset') || '7d').trim().toLowerCase())
     || !['', 'auto'].includes((url.searchParams.get('bucket') || '').trim().toLowerCase()))) {
     return new Response(
-      JSON.stringify({ error: 'this Insights window or granularity is not captured in the demonstration', code: UNCAPTURED_CODE }),
+      JSON.stringify({ error: `this ${isInsights ? 'Insights' : 'Trends'} window or granularity is not captured in the demonstration`, code: UNCAPTURED_CODE }),
       { status: 404, headers: JSON_HEADERS },
     );
   }
@@ -231,9 +254,22 @@ function serve(entry, nowMs, url) {
       { status: 404, headers: JSON_HEADERS },
     );
   }
+  if (isTrendsWindow && (RHYTHM_FILTERS.some((name) => url.searchParams.has(name))
+    || (url.searchParams.has('top') && Number(url.searchParams.get('top')) !== 5))) {
+    return new Response(
+      JSON.stringify({ error: 'this trends filter is not captured in the demonstration', code: UNCAPTURED_CODE }),
+      { status: 404, headers: JSON_HEADERS },
+    );
+  }
   // Whole weeks preserve local hours, Monday buckets and the rhythm grid
   // together. Calendar presets need a fresh aggregation, so they are refused above.
-  const deltaMs = isInsights
+  // Usage drill-downs and detail reads from Trends/Insights pass replay=calendar so
+  // their rebased timestamps and [from, to] window align with the same whole-week offset.
+  const isUsageReplay = url.pathname === '/api/v1/usage/events'
+    || url.pathname === '/api/v1/usage/facets'
+    || EVENT_DETAIL_PATH.test(url.pathname);
+  const useCalendarDelta = isCalendarReplay || (isUsageReplay && url.searchParams.get('replay') === 'calendar');
+  const deltaMs = useCalendarDelta
     ? Math.trunc((nowMs - REFERENCE_MS) / WEEK_MS) * WEEK_MS
     : nowMs - REFERENCE_MS;
   let body = entry.body;
@@ -251,11 +287,19 @@ function serve(entry, nowMs, url) {
         { status: 404, headers: { ...JSON_HEADERS, 'Content-Type': entry.content_type } },
       );
     }
-    const decoded = rebase(applyQueryFilters(identity, url, { deltaMs, dataset: DATASET }), deltaMs);
+    const filtered = applyQueryFilters(identity, url, { deltaMs, dataset: DATASET });
+    if (filtered === undefined) {
+      return new Response(
+        JSON.stringify({ error: 'this Insights filter is not captured in the demonstration', code: UNCAPTURED_CODE }),
+        { status: 404, headers: JSON_HEADERS },
+      );
+    }
+    const decoded = rebase(isTrendsQuota ? filterTrendsQuota(filtered, url) : filtered, deltaMs);
     // Replays are closed snapshots: their final bucket does not extend to the visitor's now.
-    if (isInsights) decoded.window.open_end = false;
+    if (isCalendarReplay) decoded.window.open_end = false;
     // Insights captures are taken by preset name and already carry it.
-    const preset = url.searchParams.has('preset') && !isInsights ? dashboardPresetOf(url) : '';
+    const preset = isTrendsWindow ? insightsPresetOf(url)
+      : url.searchParams.has('preset') && !isInsights ? dashboardPresetOf(url) : '';
     body = JSON.stringify(labelPreset(decoded, preset));
   } catch {
     // A body that is not JSON is served as captured. There are none today; this keeps
@@ -348,6 +392,33 @@ function isStaticAssetSubpath(innerPath) {
   return /\.[a-z0-9]{1,12}$/i.test(lastSegment);
 }
 
+function withoutConditionalHeaders(headers) {
+  const next = new Headers(headers);
+  next.delete('if-none-match');
+  next.delete('if-modified-since');
+  return next;
+}
+
+/**
+ * Ensures error responses (such as missing chunk 404s that matched an immutable `_headers` rule)
+ * and SPA HTML entry documents are never pinned in browser or edge caches across deployments.
+ */
+function withStaticAssetCacheHeaders(response, { isHtmlShell = false } = {}) {
+  const isError = response.status >= 400;
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  const isHtml = isHtmlShell || contentType.includes('text/html');
+  if (!isError && !(response.status === 200 && isHtml)) {
+    return response;
+  }
+  const headers = new Headers(response.headers);
+  headers.set('Cache-Control', 'no-store');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 /**
  * Builds the Worker fetch handler for either a root deployment (`''`, e.g. `omc-demo.junze.dev`)
  * or a subpath mount (`'/demo'`, e.g. `omc.junze.dev/demo/`).
@@ -377,20 +448,31 @@ export function createDemoHandler({ basePath = '' } = {}) {
         // Not an API path, so it belongs to the static assets. Under a subpath mount,
         // deep-linked SPA routes (e.g. `/demo/dashboard`) fall back to `/demo/` rather
         // than the site root's `index.html`.
-        const assetResponse = await env.ASSETS.fetch(request);
-        if (!prefix || assetResponse.status !== 404) {
-          return assetResponse;
-        }
         const method = request.method.toUpperCase();
-        if ((method !== 'GET' && method !== 'HEAD') || isStaticAssetSubpath(innerPath)) {
-          return assetResponse;
+        const isReadMethod = method === 'GET' || method === 'HEAD';
+        const isShellPath = innerPath === '/' || innerPath === '/index.html';
+        const assetRequest = isReadMethod && isShellPath
+          ? new Request(request.url, {
+              method: request.method,
+              headers: withoutConditionalHeaders(request.headers),
+            })
+          : request;
+        const assetResponse = await env.ASSETS.fetch(assetRequest);
+        if (!prefix || assetResponse.status !== 404) {
+          return withStaticAssetCacheHeaders(assetResponse, {
+            isHtmlShell: innerPath === '/' && assetResponse.status === 200,
+          });
         }
-        return env.ASSETS.fetch(
+        if (!isReadMethod || isStaticAssetSubpath(innerPath)) {
+          return withStaticAssetCacheHeaders(assetResponse);
+        }
+        const fallbackResponse = await env.ASSETS.fetch(
           new Request(new URL(`${prefix}/`, request.url), {
             method: request.method,
-            headers: request.headers,
+            headers: withoutConditionalHeaders(request.headers),
           }),
         );
+        return withStaticAssetCacheHeaders(fallbackResponse, { isHtmlShell: true });
       }
 
       const apiUrl = new URL(request.url);

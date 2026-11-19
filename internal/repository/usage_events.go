@@ -108,6 +108,8 @@ type UsageEventFilter struct {
 
 	// Models matches the upstream model name exactly.
 	Models []string
+	// ResponseModels matches the upstream served model name exactly.
+	ResponseModels []string
 	// ModelAliases matches the client-requested alias when CPA reported one.
 	ModelAliases []string
 	// Providers is the upstream provider family CPA reported.
@@ -430,7 +432,7 @@ func (r *Repository) queryUsageEventRows(ctx context.Context, query string, args
 			&row.ResponseModel, &row.ModelSubstituted, &row.FailStatusCode, &accounting); errScan != nil {
 			return nil, fmt.Errorf("scan usage event: %w", errScan)
 		}
-		row.ClientAgent = usage.ResolveClientAgentID(storedClientAgent, pointerValue(row.UserAgent), row.Endpoint)
+		row.ClientAgent = usage.ClientAgentFromPersisted(storedClientAgent)
 		var errAccounting error
 		row.Accounting, errAccounting = decodeStoredTokenAccounting(accounting)
 		if errAccounting != nil {
@@ -590,7 +592,7 @@ func (r *Repository) GetUsageEvent(ctx context.Context, id int64) (UsageEventRow
 	}
 	row.Failed = failed == 1
 	row.Generate = generate == 1
-	row.ClientAgent = usage.ResolveClientAgentID(storedClientAgent, pointerValue(row.UserAgent), row.Endpoint)
+	row.ClientAgent = usage.ClientAgentFromPersisted(storedClientAgent)
 	row.IsNativeKey = isNativeKey.Valid && isNativeKey.Int64 != 0
 	if streamVal.Valid {
 		isStream := streamVal.Int64 == 1
@@ -961,6 +963,7 @@ func usageEventWhere(filter UsageEventFilter) ([]string, []any, error) {
 		values []string
 	}{
 		{"e.model", filter.Models},
+		{"e.response_model", filter.ResponseModels},
 		{`COALESCE(NULLIF(TRIM(COALESCE(e.model_alias, '')), ''), e.model)`, filter.ModelAliases},
 		{`COALESCE(NULLIF(TRIM(e.provider), ''), 'unknown')`, filter.Providers},
 		{"e.api_group_key", filter.APIGroupKeys},

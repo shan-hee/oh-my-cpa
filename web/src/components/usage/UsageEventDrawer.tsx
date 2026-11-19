@@ -77,6 +77,7 @@ export interface UsageEventDrawerProps {
   pluginTitles?: ReadonlyMap<string, string>;
   isProviderCatalogUnknown?: boolean;
   archive?: ProviderResolutionArchive;
+  replay?: 'calendar';
 }
 
 export const UsageEventDrawer: React.FC<UsageEventDrawerProps> = ({
@@ -92,6 +93,7 @@ export const UsageEventDrawer: React.FC<UsageEventDrawerProps> = ({
   pluginTitles,
   isProviderCatalogUnknown,
   archive,
+  replay,
 }) => {
   useTimeZone();
   const { currency } = useDisplayCurrency();
@@ -116,8 +118,8 @@ export const UsageEventDrawer: React.FC<UsageEventDrawerProps> = ({
   if (eventId != null && eventId !== shownId) setShownId(eventId);
   const recordId = eventId ?? shownId;
   const result = useQuery({
-    queryKey: ['usage-event', recordId],
-    queryFn: () => api.getUsageEvent(recordId!),
+    queryKey: replay === 'calendar' ? ['usage-event', recordId, 'calendar'] : ['usage-event', recordId],
+    queryFn: () => api.getUsageEvent(recordId!, replay),
     enabled: eventId != null,
   });
   const event = result.data?.event;

@@ -96,6 +96,8 @@
   --shadow-field-focus: var(--shadow-field-focus);
   --shadow-field-invalid: var(--shadow-field-invalid);
   --shadow-field-invalid-focus: var(--shadow-field-invalid-focus);
+  --shadow-field-warning: var(--shadow-field-warning);
+  --shadow-field-warning-focus: var(--shadow-field-warning-focus);
   --shadow-focus: var(--shadow-focus);
 
   --text-*: initial;
@@ -342,6 +344,8 @@
   --shadow-field-focus: inset 0 0 0 1px var(--select-ring), 0 0 0 3px var(--select-halo);
   --shadow-field-invalid: inset 0 0 0 1px var(--danger), var(--well-drop);
   --shadow-field-invalid-focus: inset 0 0 0 1px var(--danger), 0 0 0 2px color-mix(in srgb, var(--danger) 16%, transparent);
+  --shadow-field-warning: inset 0 0 0 1px var(--warn), var(--well-drop);
+  --shadow-field-warning-focus: inset 0 0 0 1px var(--warn), 0 0 0 2px color-mix(in srgb, var(--warn) 16%, transparent);
   --shadow-focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
   --tooltip-bg: var(--surface);
   --tooltip-fg: var(--fg);
@@ -789,8 +793,23 @@
 :root:not([data-reduced-motion='true']) .omc-chart-morph :is(.recharts-surface, .omc-sparkline-surface) {
   transition: opacity var(--motion-slow) var(--ease-out);
 }
+/* A stack drawn as one rank-stable path per rank (`ModelTokenTrend`) slides its shapes to the next
+   drawing in script; its colour follows its rank on the same roll. */
+:root:not([data-reduced-motion='true']) .omc-stack .omc-stack-series {
+  transition: fill var(--motion-slow) var(--ease-standard), fill-opacity var(--motion-slow) var(--ease-standard);
+}
 @starting-style {
   :root:not([data-reduced-motion='true']) .omc-chart-morph :is(.recharts-surface, .omc-sparkline-surface) { opacity: 0; }
+}
+/* A gliding segment (`charts/barGlide.tsx`) transforms about the plot's own origin, the space its
+   boxes are measured in. While the bars glide to a new scale, an axis label that changes arrives in a
+   short fade rather than a cut. */
+.omc-chart-glide [data-glide] { transform-box: view-box; transform-origin: 0 0; }
+:root:not([data-reduced-motion='true']) .omc-chart-glide .recharts-yAxis .recharts-cartesian-axis-tick-value {
+  animation: chart-tick-arrive var(--motion-base) var(--ease-out) backwards;
+}
+@keyframes chart-tick-arrive {
+  from { opacity: 0; }
 }
 .omc-chart-morph::view-transition-group(root) {
   animation-duration: var(--motion-slow);
@@ -1604,6 +1623,9 @@ body.is-row-dragging, body.is-row-dragging * { cursor: grabbing !important; user
    likewise ringed by its container (a card whose stretched button opens it). */
 :focus-visible:not(input):not(textarea):not([data-slot="select-trigger"]):not([data-slot="combobox-trigger"]):not([data-slot="color-picker-trigger"]):not([data-focus-ring="outer"]) { outline: none; box-shadow: 0 0 0 2px var(--accent) !important; border-radius: var(--radius-md); }
 input:focus-visible, textarea:focus-visible { outline: none; }
+@media (forced-colors: active) {
+  textarea:focus-visible { outline: 2px solid Highlight; outline-offset: 2px; }
+}
 
 /* ── shell: a rail on the canvas, the page on one sheet ─────────────────────
    Two layers and no rules between them. The navigation stands on the canvas, which is chrome;
@@ -1765,10 +1787,12 @@ input:focus-visible, textarea:focus-visible { outline: none; }
    same element to the rail and to the sidebar-visibility dialog, so the glyph box belongs to the
    logo itself rather than to the rail that first drew it. */
 .app-menu-plugin-logo { width: 16px; height: 16px; flex: none; }
-/* An available update marks the entry with a `--warn` dot just outside the icon's corner,
-   where it touches neither the glyph nor the row's hover fill. */
-.app-menu .app-menu-flagged-icon { position: relative; display: inline-flex; align-items: center; flex: none; }
-.app-menu .app-menu-update-dot { position: absolute; top: -3px; inset-inline-end: -4px; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+/* AttentionDot: a dot that asks for a look, inline beside a label or pinned to a mark's corner by
+   FlaggedMark, just outside the glyph and the row's hover fill. */
+.attention-dot { display: inline-block; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+.attention-dot[data-tone='danger'] { background: var(--danger); }
+.flagged-mark { position: relative; display: inline-flex; align-items: center; flex: none; }
+.flagged-mark > .attention-dot { position: absolute; top: -3px; inset-inline-end: -4px; }
 /* Stands in for every page while the gateway is older than CPA v8. The steps read
    left-aligned under the centred result, like instructions rather than a slogan. */
 .cpa-blocked { max-width: 680px; margin: 48px auto; padding: 0 16px; }
@@ -2390,10 +2414,23 @@ input:focus-visible, textarea:focus-visible { outline: none; }
   animation-delay: calc(var(--placeholder-epoch, 0ms) + var(--placeholder-row, 0) * 85ms);
 }
 .placeholder-rhythm-cell.is-mid { background: color-mix(in oklab, var(--fg) 10%, transparent); }
+.placeholder-anatomy { display: flex; flex-direction: column; gap: 18px; }
+.placeholder-anatomy-parts { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px 24px; }
+/* The rankings' fixed places, as `insights.module.css` lays them out. */
 .placeholder-insights-rankings {
+  container: placeholder-rankings / inline-size;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 16px;
+}
+.placeholder-insights-rankings > * { grid-column: span 2; min-width: 0; }
+.placeholder-insights-rankings > :nth-child(-n + 2) { grid-column: span 3; }
+@container placeholder-rankings (max-width: 1180px) {
+  .placeholder-insights-rankings > :nth-child(n + 4) { grid-column: span 3; }
+  .placeholder-insights-rankings > :nth-child(3) { grid-column: 1 / -1; }
+}
+@container placeholder-rankings (max-width: 720px) {
+  .placeholder-insights-rankings > :nth-child(n) { grid-column: 1 / -1; }
 }
 .placeholder-ranking-rows { display: flex; flex-direction: column; gap: 14px; }
 .placeholder-ranking-row { display: flex; flex-direction: column; gap: 6px; }
@@ -2507,8 +2544,7 @@ input:focus-visible, textarea:focus-visible { outline: none; }
 @media (max-width: 900px) {
   .placeholder-routing-workspace,
   .placeholder-workbench,
-  .placeholder-system-grid,
-  .placeholder-insights-rankings {
+  .placeholder-system-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -2517,6 +2553,7 @@ input:focus-visible, textarea:focus-visible { outline: none; }
   .placeholder-phone-only { display: block; }
   .placeholder-stat-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .placeholder-toolbar-search { flex: 1 1 100%; width: 100%; }
+  .placeholder-anatomy-parts { grid-template-columns: minmax(0, 1fr); }
   .placeholder-toolbar-trailing { margin-left: 0; }
   .placeholder-routing-tier { grid-template-columns: 1fr; }
   .placeholder-routing-lens { display: none; }

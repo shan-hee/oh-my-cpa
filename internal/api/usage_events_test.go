@@ -334,6 +334,10 @@ func TestUsageEventListOmitsDiagnosticFields(t *testing.T) {
 	if got := list.Items[0]["user_agent"]; got != "secret-client/9.9" {
 		t.Fatalf("list user_agent = %v, want minimized product label", got)
 	}
+	// The list names the client by its normalised identifier and says what kind it is.
+	if got, category := list.Items[0]["client_agent"], list.Items[0]["client_agent_category"]; got != "secret-client" || category != "sdk" {
+		t.Fatalf("list client = %v/%v, want secret-client/sdk", got, category)
+	}
 	// The caller key reaches the console as a display mask only: the raw key is
 	// never stored, and the mask is not the identity used for grouping.
 	if got := list.Items[0]["api_key_mask"]; got != "sk-12345••••••••7890" {
@@ -639,7 +643,7 @@ func TestUsageEventDetailFailureClassificationAllowlist(t *testing.T) {
 		{"future_classification", ""},
 	} {
 		row := repository.UsageEventRow{Failed: true, FailCode: test.code, FailStatusCode: 400, FailBody: "request_scoped"}
-		detail := projectUsageEventDetail(row, "")
+		detail := projectUsageEventDetail(row, projectUsageEvent(row))
 		got, hasCode := detail["fail_code"]
 		if hasCode != (test.want != "") || (hasCode && got != test.want) {
 			t.Fatalf("project code %q = %v (%v), want %q", test.code, got, hasCode, test.want)
@@ -648,8 +652,8 @@ func TestUsageEventDetailFailureClassificationAllowlist(t *testing.T) {
 			t.Fatalf("failure evidence changed: %+v", detail)
 		}
 	}
-	if detail := projectUsageEventDetail(repository.UsageEventRow{FailCode: usage.FailureRequestScoped}, ""); detail["fail_code"] != nil {
-		t.Fatalf("success projected failure code: %+v", detail)
+	if row := (repository.UsageEventRow{FailCode: usage.FailureRequestScoped}); projectUsageEventDetail(row, projectUsageEvent(row))["fail_code"] != nil {
+		t.Fatal("success projected a failure code")
 	}
 }
 

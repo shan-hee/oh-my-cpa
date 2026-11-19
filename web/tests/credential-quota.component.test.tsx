@@ -8,7 +8,7 @@ import {
   type CredentialQuotaPanelProps,
 } from '../src/components/dashboard/CredentialQuota';
 import {
-  ModelSeriesFocusProvider,
+  ModelPanelsProvider,
   ModelTrendPanel,
   ModelUsagePanel,
 } from '../src/components/dashboard/ModelUsagePanels';
@@ -239,6 +239,120 @@ describe('credential quota body details', () => {
     expect(screen.getByText('100%')).toBeTruthy();
   });
 
+  it('lists every Codex reset credit in expiry order instead of only the earliest one', () => {
+    const onRedeem = vi.fn();
+    const { rerender } = render(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 3,
+                applicable_available_count: 1,
+                credits: [
+                  { id: 'c-3', status: 'available', expires_at_ms: NOW_MS + 20 * 24 * HOUR_MS },
+                  { id: 'c-1', status: 'available', expires_at_ms: NOW_MS + 3 * 24 * HOUR_MS },
+                  { id: 'c-2', status: 'available', expires_at_ms: NOW_MS + 10 * 24 * HOUR_MS },
+                ],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+
+    const card = document.querySelector<HTMLElement>('[data-quota-reset="credits"]')!;
+    expect(card).toBeTruthy();
+    expect(within(card).getByText('Reset credits')).toBeTruthy();
+    expect(within(card).getByText('3')).toBeTruthy();
+    expect(within(card).getByText('Applicable 1')).toBeTruthy();
+
+    const rows = Array.from(card.querySelectorAll<HTMLElement>('[data-quota-reset-credit]'));
+    expect(rows.map((row) => row.getAttribute('data-quota-reset-credit'))).toEqual(['c-1', 'c-2', 'c-3']);
+    expect(rows[0].textContent).toContain('Credit #1');
+    expect(rows[0].textContent).toContain('3d left');
+    expect(rows[1].textContent).toContain('Credit #2');
+    expect(rows[1].textContent).toContain('10d left');
+    expect(rows[2].textContent).toContain('Credit #3');
+    expect(rows[2].textContent).toContain('20d left');
+    expect(within(card).getByRole('button', { name: 'Reset quota' })).toBeTruthy();
+
+    // Also retains stale/expired and undated entries when available_count > 0, and stays clean when credits list is absent.
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 2,
+                applicable_available_count: 2,
+                credits: [
+                  { id: 'c-expired', status: 'available', expires_at_ms: NOW_MS - HOUR_MS },
+                  { id: 'c-undated', status: 'available' },
+                ],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    const staleRows = Array.from(document.querySelectorAll<HTMLElement>('[data-quota-reset-credit]'));
+    expect(staleRows).toHaveLength(2);
+    expect(staleRows[0].querySelector('[data-expired="true"]')?.textContent).toMatch(/^Expired /);
+    expect(staleRows[1].textContent).toContain('—');
+
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: { available_count: 2, applicable_available_count: 2 },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    expect(document.querySelector('[data-quota-reset="credits"]')).toBeTruthy();
+    expect(document.querySelector('[data-quota-reset-list="credits"]')).toBeNull();
+
+    rerender(
+      <MemoryRouter>
+        <I18nProvider>
+          <CredentialQuotaBody
+            item={quota('codex-credits', [quotaWindow('five_hour', 20, 3)], {
+              capabilities: { refresh_supported: true, clear_cooldown_supported: true, reset_credit_supported: true },
+              reset_credits: {
+                available_count: 0,
+                applicable_available_count: 0,
+                credits: [{ id: 'c-stale', status: 'available', expires_at_ms: NOW_MS + HOUR_MS }],
+              },
+            })}
+            credentialLabel="codex-credits"
+            nowMS={NOW_MS}
+            isDemo={false}
+            onRedeemCredit={onRedeem}
+          />
+        </I18nProvider>
+      </MemoryRouter>,
+    );
+    expect(document.querySelector('[data-quota-reset="credits"]')).toBeNull();
+  });
+
 });
 
 function renderCredentialRow(
@@ -362,7 +476,11 @@ describe('credential list row', () => {
     const onOpen = vi.fn();
     const onRename = vi.fn<CredentialActions['onRename']>(async () => true);
     const { container } = renderCredentialRow(
-      quota('codex-stale', [quotaWindow('five_hour', 40, 2)], {
+      quota('codex-stale', [
+        quotaWindow('five_hour', 40, 2),
+        { id: 'ag_req', label: 'Gemini Models · Requests', kind: 'five_hour', scope: 'group', period_hours: 5, remaining_percent: 80 },
+        { id: 'ag_tok', label: 'Gemini Models · Tokens', kind: 'five_hour', scope: 'group', period_hours: 5, remaining_percent: 60 },
+      ], {
         status: 'stale',
         observed_at_ms: NOW_MS - 8 * HOUR_MS,
         last_refresh: { attempted_at_ms: NOW_MS - 5 * 60_000, outcome: 'failed', error: 'HTTP 401: unauthorized' },
@@ -379,6 +497,11 @@ describe('credential list row', () => {
         },
       },
     );
+
+    expect(screen.getByRole('group', { name: 'Gemini Models 5-hour limit (Requests)' })).toBeTruthy();
+    expect(screen.getByRole('group', { name: 'Gemini Models 5-hour limit (Tokens)' })).toBeTruthy();
+    expect(screen.getByRole('meter', { name: 'Gemini Models 5-hour limit (Requests)' })).toBeTruthy();
+    expect(screen.getByRole('meter', { name: 'Gemini Models 5-hour limit (Tokens)' })).toBeTruthy();
 
     const refreshBtn = screen.getByTestId('oauth-credential-refresh');
     expect(refreshBtn.getAttribute('data-needs-refresh')).toBe('true');
@@ -579,10 +702,10 @@ describe('dashboard model panels and heatmap alignment states', () => {
         <ThemeProvider>
           <TokenDisplayProvider>
             <CurrencyDisplayProvider>
-              <ModelSeriesFocusProvider>
+              <ModelPanelsProvider>
                 <ModelTrendPanel query="preset=1h" range={{ preset: '1h' }} enabled />
                 <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
-              </ModelSeriesFocusProvider>
+              </ModelPanelsProvider>
             </CurrencyDisplayProvider>
           </TokenDisplayProvider>
         </ThemeProvider>
@@ -615,10 +738,10 @@ describe('dashboard model panels and heatmap alignment states', () => {
           <ThemeProvider>
             <TokenDisplayProvider>
               <CurrencyDisplayProvider>
-                <ModelSeriesFocusProvider>
+                <ModelPanelsProvider>
                   <ModelTrendPanel query="preset=24h" range={{ preset: '24h' }} enabled />
                   <ModelUsagePanel query="preset=24h" range={{ preset: '24h' }} enabled />
-                </ModelSeriesFocusProvider>
+                </ModelPanelsProvider>
               </CurrencyDisplayProvider>
             </TokenDisplayProvider>
           </ThemeProvider>
@@ -634,6 +757,90 @@ describe('dashboard model panels and heatmap alignment states', () => {
       } finally {
         nextView.unmount();
       }
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('switches both cards to the client lens from the usage card title and back', async () => {
+    const api = installOmcApi();
+    const window = { from: NOW_MS - HOUR_MS, to: NOW_MS, bucket_ms: 60_000, minutes: 60 };
+    const group = (model: string, extra: Record<string, unknown> = {}) => ({
+      model, folded: false, tokens: 1200, requests: 4, priced_requests: 4, cost_usd: 0.12,
+      series: [{ t: NOW_MS - 60_000, tokens: 1200 }], ...extra,
+    });
+    api.on('GET', '/management/dashboard/models', (request) => ({
+      window,
+      total_tokens: 1200,
+      models: [
+        request.query.get('group_by') === 'client' ? group('claude-code', { category: 'agent' }) : group('gpt-5'),
+        group('', { folded: true }),
+      ],
+      partial_errors: [],
+    }));
+    const t = makeT('en');
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <CurrencyDisplayProvider>
+              <ModelPanelsProvider>
+                <ModelTrendPanel query="preset=1h" range={{ preset: '1h' }} enabled />
+                <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
+              </ModelPanelsProvider>
+            </CurrencyDisplayProvider>
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    try {
+      const legend = await screen.findByTestId('model-trend-legend');
+      fireEvent.click(within(legend).getByRole('button', { name: /gpt-5/ }));
+      expect(screen.getByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeTruthy();
+
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_clients') }));
+      // The model ranking stays on screen, and clickable, until the client one lands. A choice made
+      // in it belongs to the models, even where the client ranking has a group of the same key.
+      fireEvent.click(within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: t('dash.models.folded') }));
+      const clientEntry = await waitFor(() => within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: /Claude Code/ }));
+      expect(clientEntry.getAttribute('aria-pressed')).toBe('false');
+      expect(within(screen.getByTestId('model-trend-legend')).getByRole('button', { name: t('dash.clients.folded') }).getAttribute('aria-pressed')).toBe('false');
+      expect(screen.queryByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeNull();
+      expect(api.requests.some((request) => request.query.get('group_by') === 'client')).toBe(true);
+
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_models') }));
+      await waitFor(() => expect(screen.getAllByText('gpt-5').length).toBeGreaterThan(0));
+      expect(screen.getByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeTruthy();
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it('speaks for the chosen lens when its read fails with no ranking held', async () => {
+    const api = installOmcApi();
+    api.on('GET', '/management/dashboard/models', () => {
+      throw new Error('models unavailable');
+    });
+    const t = makeT('en');
+
+    const view = renderWithOmc(
+      <MemoryRouter>
+        <ThemeProvider>
+          <TokenDisplayProvider>
+            <CurrencyDisplayProvider>
+              <ModelPanelsProvider>
+                <ModelUsagePanel query="preset=1h" range={{ preset: '1h' }} enabled />
+              </ModelPanelsProvider>
+            </CurrencyDisplayProvider>
+          </TokenDisplayProvider>
+        </ThemeProvider>
+      </MemoryRouter>,
+    );
+    try {
+      await within(view.container).findByText(t('dash.models.error'));
+      fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_clients') }));
+      await within(view.container).findByText(t('dash.clients.error'));
     } finally {
       view.unmount();
     }

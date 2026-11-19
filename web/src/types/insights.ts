@@ -7,6 +7,7 @@
  * fact of the deployment's calendar, not of whatever clock the browser runs.
  */
 import { CALENDAR_PRESETS } from './calendarPresets';
+import type { ClientCategory } from './clientAgents';
 
 export const INSIGHTS_SPAN_PRESETS = ['24h', '7d', '30d', '90d', 'all'] as const;
 export const INSIGHTS_PRESETS = [...CALENDAR_PRESETS, ...INSIGHTS_SPAN_PRESETS] as const;
@@ -65,6 +66,8 @@ export interface InsightsWindow {
   timezone: string;
   /** Request records behind the retention horizon could not split an edge, so the window was widened. */
   widened: boolean;
+  /** A client filter started the read at the request-record horizon, which client attribution shares. */
+  clipped?: boolean;
 }
 
 export interface InsightsCompareWindow {
@@ -123,7 +126,7 @@ export interface InsightsRhythmResponse {
 export interface InsightsClientItem {
   /** The normalised client: `claude-code`, `codex-cli`, `python-httpx`, … or `unknown` / `other`. */
   id: string;
-  category: 'agent' | 'sdk' | 'unknown';
+  category: ClientCategory;
   /** The redacted User-Agent prefix the request list can be searched by. */
   raw_prefix?: string;
   requests: number;

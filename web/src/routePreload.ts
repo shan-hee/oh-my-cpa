@@ -1,5 +1,5 @@
 import { api } from './api/client';
-import { preloadDashboardCharts, preloadInsightsCharts } from './charts/lazyCharts';
+import { preloadDashboardCharts, preloadInsightsCharts, preloadTrendsCharts } from './charts/lazyCharts';
 import {
   dashboardHeatmapSwr,
   dashboardModelsSwr,
@@ -22,6 +22,7 @@ import {
   loadRoutingPage,
   loadDashboardPage,
   loadInsightsPage,
+  loadTrendsPage,
   loadAgentPage,
   loadAuthorizePage,
   loadPlaygroundPage,
@@ -53,6 +54,7 @@ import {
   DEFAULT_MODEL_CHART_VIEW,
   parseModelChartView,
 } from './types/tokenDisplay';
+import { MODEL_VIEW_PREFERENCE } from './types/tokenDisplayContext';
 import { getAppConfig } from './types/config';
 
 function readCachedPreferences(ctx: RoutePrefetchContext): Record<string, unknown> | undefined {
@@ -63,7 +65,7 @@ async function prefetchDashboardData(ctx: RoutePrefetchContext): Promise<void> {
   const prefs = readCachedPreferences(ctx);
   if (!prefs) return;
   const range = parseDashboardRange(prefs[DASHBOARD_RANGE_PREFERENCE]) ?? DEFAULT_DASHBOARD_RANGE;
-  const modelView = parseModelChartView(prefs.omc_model_chart_view) ?? DEFAULT_MODEL_CHART_VIEW;
+  const modelView = parseModelChartView(prefs[MODEL_VIEW_PREFERENCE]) ?? DEFAULT_MODEL_CHART_VIEW;
   const query = dashboardRangeParams(range);
   await Promise.allSettled([
     dashboardWindowSwr.prefetch(ctx.queryClient, query),
@@ -121,6 +123,12 @@ export const ROUTE_DESCRIPTORS: readonly RouteDescriptor[] = [
     loadingBody: 'insights',
     preloadChunk: () => Promise.all([loadInsightsPage(), preloadInsightsCharts()]),
     prefetchData: prefetchInsightsData,
+  },
+  {
+    path: '/trends',
+    priority: 'high',
+    loadingBody: 'trends',
+    preloadChunk: () => Promise.all([loadTrendsPage(), preloadTrendsCharts()]),
   },
   {
     path: '/pricing',

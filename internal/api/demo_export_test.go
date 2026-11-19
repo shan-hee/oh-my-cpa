@@ -182,6 +182,7 @@ func demoExportCases() []demoExportCase {
 		{Name: "quota", Path: "/api/v1/management/quota"},
 		// One credential's quota detail, for the page the quota list links into.
 		{Name: "quota-codex", Path: "/api/v1/management/quota/auth-codex-01"},
+		{Name: "trends-quota", Path: "/api/v1/management/trends/quota"},
 		// Consumption details for observable windows. Every
 		// sibling window of each demo credential is exported so switching periods inside
 		// the consumption dialog works on the static demo Worker too.
@@ -240,6 +241,7 @@ func demoExportCases() []demoExportCase {
 			demoExportCase{Name: "dashboard-tail-" + preset, Path: "/api/v1/management/dashboard/tail?" + window},
 			demoExportCase{Name: "dashboard-models-call-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=call"},
 			demoExportCase{Name: "dashboard-models-model-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=model"},
+			demoExportCase{Name: "dashboard-models-client-" + preset, Path: "/api/v1/management/dashboard/models?" + window + "&group_by=client"},
 			demoExportCase{Name: "dashboard-providers-" + preset, Path: "/api/v1/management/dashboard/providers?" + window},
 			demoExportCase{Name: "client-key-usage-" + preset, Path: "/api/v1/management/client-key-usage?" + window},
 		)
@@ -267,6 +269,7 @@ func demoExportCases() []demoExportCase {
 		demoExportCase{Name: "dashboard-tail-all", Path: "/api/v1/management/dashboard/tail?" + allTime},
 		demoExportCase{Name: "dashboard-models-call-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=call"},
 		demoExportCase{Name: "dashboard-models-model-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=model"},
+		demoExportCase{Name: "dashboard-models-client-all", Path: "/api/v1/management/dashboard/models?" + allTime + "&group_by=client"},
 		demoExportCase{Name: "dashboard-providers-all", Path: "/api/v1/management/dashboard/providers?" + allTime},
 	)
 	// The static replay serves relative presets and all-time as closed snapshots.
@@ -277,6 +280,21 @@ func demoExportCases() []demoExportCase {
 			demoExportCase{Name: "insights-rhythm-" + preset, Path: "/api/v1/management/insights/rhythm?preset=" + preset},
 			demoExportCase{Name: "insights-clients-" + preset, Path: "/api/v1/management/insights/clients?preset=" + preset},
 		)
+		for _, view := range []struct {
+			name   string
+			groups []string
+		}{
+			{"usage", []string{"model", "call_point", "client_agent", "key", "provider", "credential"}},
+			{"telemetry", []string{"model", "call_point", "provider", "credential"}},
+		} {
+			for _, group := range view.groups {
+				name := "trends-" + view.name + "-"
+				if group != "model" {
+					name += group + "-"
+				}
+				cases = append(cases, demoExportCase{Name: name + preset, Path: "/api/v1/management/trends/" + view.name + "?preset=" + preset + "&group_by=" + group})
+			}
+		}
 	}
 	// The heatmap is asked for in the viewer's own zone; the export keeps a UTC and a
 	// non-UTC zone so the Worker's calendar maths has a reference for both an offset
@@ -427,7 +445,7 @@ func buildDemoExportDataset(t *testing.T) (demoExportResponses, []byte) {
 			one.Path = resolved
 		}
 		responses[one.Name] = demoExportFetch(t, server.URL, one)
-		if strings.HasPrefix(one.Name, "insights-") && responses[one.Name].Status != http.StatusOK {
+		if (strings.HasPrefix(one.Name, "insights-") || strings.HasPrefix(one.Name, "trends-")) && responses[one.Name].Status != http.StatusOK {
 			t.Fatalf("%s returned HTTP %d", one.Name, responses[one.Name].Status)
 		}
 		if strings.HasPrefix(one.Name, "insights-cube-") {

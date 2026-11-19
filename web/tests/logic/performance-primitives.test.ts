@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import React from 'react';
 import { MutationObserver, QueryClient, QueryObserver } from '@tanstack/react-query';
 import { test } from 'vitest';
+import { lineSlotChildren } from '../../src/components/ui/line-slot.tsx';
 
 import { MUTATION_KEYS, QUERY_KEYS } from '../../src/api/queryKeys.ts';
 import {
@@ -912,6 +914,7 @@ test('frame scheduler enforces per-tier maxJobsByPriority caps independently', (
 test('reconcileHotRouteSlots preserves slot order, keeps outlet identity on warm return, and pins dashboard during LRU eviction', () => {
   assert.equal(HOT_ACTIVITY_ROUTES.has('/dashboard'), true);
   assert.equal(HOT_ACTIVITY_ROUTES.has('/insights'), true);
+  assert.equal(HOT_ACTIVITY_ROUTES.has('/trends'), true);
   assert.equal(HOT_ACTIVITY_ROUTES.has('/api-keys'), false, 'secret-bearing routes never enter hot route pool');
   assert.equal(PINNED_HOT_ROUTES.has('/dashboard'), true);
 
@@ -959,6 +962,11 @@ test('reconcileHotRouteSlots preserves slot order, keeps outlet identity on warm
     { maxSlots: 2, pinnedKeys: PINNED_HOT_ROUTES },
   );
   assert.deepEqual(evicted.map((s) => s.key), ['/dashboard', '/extra'], 'evicts unpinned /insights in place, keeping /dashboard pinned');
+
+  // The shell sizes the pool to every hot route, so the three observability pages all stay warm.
+  const trendsLoc = { locationContext: { location: { pathname: '/trends', search: '', hash: '', state: null } } };
+  const allHot = reconcileHotRouteSlots(slotsInsightsNewest, { key: '/trends', outlet: { id: 'trends-1' }, locationContext: trendsLoc }, { maxSlots: HOT_ACTIVITY_ROUTES.size });
+  assert.deepEqual(allHot.map((s) => s.key), ['/dashboard', '/insights', '/trends']);
 });
 
 test('buildMonotoneSparkline produces overshoot-free monotone paths and maps pointer x to nearest bucket', () => {
@@ -1126,4 +1134,22 @@ test('every route descriptor and static navigation entry declares a registered s
       assert.ok(resolved?.loadingBody, `nav item ${item.key} must resolve to a ROUTE_DESCRIPTOR with loadingBody`);
     }
   }
+});
+
+test('lineSlotChildren recursively wraps fragment text children in spans while preserving keys', () => {
+  const normalized = lineSlotChildren([
+    React.createElement(React.Fragment, { key: 'frag-1' }, 'a-long-credential-name', 42),
+    React.createElement('strong', { key: 'el-2' }, 'badge'),
+  ]) as React.ReactElement<{ children?: React.ReactNode }>[];
+  assert.equal(normalized.length, 2);
+  assert.equal(normalized[0]?.type, React.Fragment);
+  assert.equal(normalized[0]?.key, '.$frag-1');
+  assert.equal(normalized[1]?.type, 'strong');
+  assert.equal(normalized[1]?.key, '.$el-2');
+  const inner = React.Children.toArray(normalized[0]?.props.children) as React.ReactElement<{ children?: React.ReactNode }>[];
+  assert.equal(inner.length, 2);
+  assert.equal(inner[0]?.type, 'span');
+  assert.equal(inner[0]?.props.children, 'a-long-credential-name');
+  assert.equal(inner[1]?.type, 'span');
+  assert.equal(inner[1]?.props.children, 42);
 });

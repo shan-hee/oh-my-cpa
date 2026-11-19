@@ -94,6 +94,7 @@ function withoutInstants(value) {
   const INSTANT_NAMED = new Set([
     't', 'to_ms', 'from_ms', 'as_of_ms', 'timestamp_ms', 'latest_after', 'from', 'to', 'modified',
     'exported_at', 'time', 'last_capture_at', 'last_run_at',
+    'start_ms', 'end_ms', 'cycle_start_ms', 'cycle_reset_ms', 'retention_start_ms',
   ]);
   const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
@@ -148,6 +149,150 @@ describe('routing', () => {
         assert.deepEqual(await response.json(), expected, `${view}/${preset}`);
       }
     }
+  });
+
+  it('replays Trends windows on the same calendar grid and keeps telemetry durations intact', async (t) => {
+    const dayMs = 86_400_000;
+    t.mock.method(Date, 'now', () => REFERENCE_MS + 10 * dayMs + 3_600_000);
+    const { default: worker } = await import('./worker.mjs');
+    const env = { ASSETS: { fetch: () => new Response('', { status: 200 }) } };
+    for (const preset of ['24h', '7d', '30d', '90d', 'all']) {
+      for (const view of ['usage', 'telemetry']) {
+        const path = `/api/v1/management/trends/${view}?preset=${preset}`;
+        const response = await worker.fetch(request(path), env);
+        assert.equal(response.status, 200, path);
+        const captured = JSON.parse(DATASET.responses[`trends-${view}-${preset}`].body);
+        const decoded = await response.json();
+        assert.equal(decoded.window.preset, preset);
+        assert.equal(decoded.window.open_end, false);
+        assert.equal(decoded.window.from, captured.window.from + 7 * dayMs);
+        assert.equal(decoded.buckets[0].start_ms, captured.buckets[0].start_ms + 7 * dayMs);
+        assert.deepEqual(withoutInstants(decoded.buckets), withoutInstants(captured.buckets));
+        if (view === 'telemetry') {
+          assert.ok(decoded.scatter.length > 0 && decoded.scatter.length <= 240);
+          assert.equal(decoded.scatter[0].timestamp_ms, captured.scatter[0].timestamp_ms + 7 * dayMs);
+          assert.deepEqual(withoutInstants(decoded.scatter), withoutInstants(captured.scatter));
+          assert.equal(decoded.summary.latency_p95_ms, captured.summary.latency_p95_ms);
+          assert.equal(decoded.summary.ttft_p50_ms, captured.summary.ttft_p50_ms);
+          if (preset === '7d') {
+            for (const metric of ['rate_limited_429', 'upstream_5xx', 'stream_truncated', 'force_cooldown', 'model_substituted']) {
+              assert.ok(decoded.summary[metric] > 0, `missing demonstration example for ${metric}`);
+            }
+            assert.ok(decoded.substitution_pairs.length > 0);
+          }
+        } else if (captured.compare_window !== null) {
+          assert.equal(decoded.compare_window.from, captured.compare_window.from + 7 * dayMs);
+        }
+      }
+    }
+    const grouped = await worker.fetch(request('/api/v1/management/trends/usage?group_by=client_agent&top=5'), env);
+    assert.equal(grouped.status, 200);
+    assert.equal((await grouped.json()).group_by, 'client_agent');
+    const filtered = await worker.fetch(request('/api/v1/management/trends/telemetry?client_agent=claude-code'), env);
+    assert.equal(filtered.status, 404);
+    assert.equal((await filtered.json()).code, 'demo_uncaptured');
+  });
+
+  it('rebases quota cycle and bucket boundaries with the viewer clock and filters credential summaries', async (t) => {
+    const deltaMs = 9 * 86_400_000 + 654_321;
+    t.mock.method(Date, 'now', () => REFERENCE_MS + deltaMs);
+    const { default: worker } = await import('./worker.mjs');
+    const env = { ASSETS: { fetch: () => new Response('', { status: 200 }) } };
+    const path = '/api/v1/management/trends/quota';
+    const captured = JSON.parse(DATASET.responses['trends-quota'].body);
+    const response = await worker.fetch(request(`${path}?provider=codex&auth_index=auth-codex-01`), env);
+    assert.equal(response.status, 200);
+    const decoded = await response.json();
+    assert.equal(decoded.as_of_ms, captured.as_of_ms + deltaMs);
+    assert.equal(decoded.summary.active_credentials, 1);
+    const [credential] = decoded.items;
+    assert.equal(credential.auth_index, 'auth-codex-01');
+    assert.equal(decoded.summary.observable_windows, credential.windows.length);
+    const before = captured.items.find((item) => item.auth_index === credential.auth_index).windows[0];
+    const [window] = credential.windows;
+    assert.ok(window.cycles.length >= 3);
+    assert.ok(window.buckets.some((bucket) => bucket.is_forecast));
+    assert.equal(window.cycle_start_ms, before.cycle_start_ms + deltaMs);
+    assert.equal(window.cycle_reset_ms, before.cycle_reset_ms + deltaMs);
+    assert.equal(window.buckets[0].start_ms, before.buckets[0].start_ms + deltaMs);
+    assert.equal(window.buckets[0].end_ms, before.buckets[0].end_ms + deltaMs);
+    assert.deepEqual(withoutInstants(window.buckets), withoutInstants(before.buckets));
+    assert.equal(window.cycles[1].cycle_reset_ms, before.cycles[1].cycle_reset_ms + deltaMs);
+  });
+
+  it('filters the Insights cube by client_agent in agreement with insights-clients and marks filtered rhythm uncaptured', async (t) => {
+    const dayMs = 86_400_000;
+    t.mock.method(Date, 'now', () => REFERENCE_MS + 10 * dayMs + 3_600_000);
+    const { default: worker } = await import('./worker.mjs');
+    const env = { ASSETS: { fetch: () => new Response('', { status: 200 }) } };
+
+    for (const preset of ['24h', '7d', '30d', '90d', 'all']) {
+      const clientsPayload = JSON.parse(DATASET.responses[`insights-clients-${preset}`].body);
+      for (const client of clientsPayload.clients) {
+        const cubeRes = await worker.fetch(
+          request(`/api/v1/management/insights/cube?preset=${preset}&client_agent=${encodeURIComponent(client.id)}`),
+          env,
+        );
+        assert.equal(cubeRes.status, 200, `${preset}/${client.id}`);
+        const cube = await cubeRes.json();
+        const reqCol = cube.columns.indexOf('requests');
+        const tokCol = cube.columns.indexOf('total_tokens');
+        const costCol = cube.columns.indexOf('cost_nanos');
+        const sum = (col) => cube.rows.reduce((acc, row) => acc + row[col], 0);
+        assert.equal(sum(reqCol), client.requests, `${preset}/${client.id} requests`);
+        assert.equal(sum(tokCol), client.total_tokens, `${preset}/${client.id} tokens`);
+        assert.equal(sum(costCol), client.cost_nanos, `${preset}/${client.id} cost`);
+        assert.equal(cube.coverage.fact_requests, client.requests, `${preset}/${client.id} coverage`);
+        if (preset !== 'all') {
+          assert.ok(cube.previous_rows.length > 0, `${preset}/${client.id} retains comparison rows`);
+        }
+
+        const rhythmRes = await worker.fetch(
+          request(`/api/v1/management/insights/rhythm?preset=${preset}&client_agent=${encodeURIComponent(client.id)}`),
+          env,
+        );
+        assert.equal(rhythmRes.status, 404, `rhythm ${preset}/${client.id}`);
+        assert.equal((await rhythmRes.json()).code, 'demo_uncaptured');
+      }
+    }
+
+    // Multiple clients combine additively; an unknown client returns an empty cube.
+    const multiRes = await worker.fetch(
+      request('/api/v1/management/insights/cube?preset=7d&client_agent=claude-code&client_agent=opencode'),
+      env,
+    );
+    assert.equal(multiRes.status, 200);
+    const multi = await multiRes.json();
+    const reqCol = multi.columns.indexOf('requests');
+    assert.equal(multi.rows.reduce((acc, row) => acc + row[reqCol], 0), 325 + 810);
+
+    const unknownRes = await worker.fetch(
+      request('/api/v1/management/insights/cube?preset=7d&client_agent=nonexistent-client'),
+      env,
+    );
+    assert.equal(unknownRes.status, 200);
+    const unknown = await unknownRes.json();
+    assert.equal(unknown.rows.length, 0);
+    assert.equal(unknown.previous_rows.length, 0);
+
+    // When the usage-events mapping is missing or incomplete for an active client, answer demo_uncaptured rather than 0 rows.
+    const { filterInsightsCube } = await import('./filters.mjs');
+    const capturedCube7d = JSON.parse(DATASET.responses['insights-cube-7d'].body);
+    assert.equal(
+      filterInsightsCube(capturedCube7d, new URL('https://demo.example/api/v1/management/insights/cube?preset=7d&client_agent=claude-code'), { dataset: { responses: {} } }),
+      undefined,
+    );
+    assert.equal(
+      filterInsightsCube(capturedCube7d, new URL('https://demo.example/api/v1/management/insights/cube?preset=7d&client_agent=claude-code'), {
+        dataset: {
+          responses: {
+            'usage-events': { body: JSON.stringify({ items: [] }) },
+            'insights-clients-7d': DATASET.responses['insights-clients-7d'],
+          },
+        },
+      }),
+      undefined,
+    );
   });
 
   it('refuses Insights windows and granularities absent from the capture', async (t) => {
@@ -499,6 +644,9 @@ describe('re-basing onto the viewer’s clock', () => {
     const untouched = {
       tokens: 1234,
       latency_ms: 812,
+      ttft_ms: 135,
+      latency_p95_ms: 812,
+      ttft_p50_ms: 135,
       cost_usd: 0.02983525,
       id: 13580,
       version: 1,
@@ -602,7 +750,7 @@ describe('usage-events client_agent search and call-point fallback parity', () =
       items: [
         { id: 3, timestamp_ms: 6000, model: 'gpt-4o', model_alias: '', provider: 'openai', api_group_key: 'hmac:a', user_agent: '', failed: false, pricing_status: 'priced' },
         { id: 2, timestamp_ms: 5000, model: 'gpt-5', model_alias: '', provider: 'codex', api_group_key: 'claude', client_agent: 'claude-code', user_agent: 'claude-cli/2.1.3', failed: false, pricing_status: 'priced' },
-        { id: 1, timestamp_ms: 4000, model: 'gpt-5', model_alias: 'fast', provider: 'codex', api_group_key: 'hmac:a', client_agent: 'hindsight', user_agent: 'hindsight/1.2.0', failed: false, pricing_status: 'priced' },
+        { id: 1, timestamp_ms: 4000, model: 'gpt-5', model_alias: 'fast', provider: 'codex', api_group_key: 'hmac:a', client_agent: ' hindsight ', user_agent: 'hindsight/1.2.0', failed: false, pricing_status: 'priced' },
       ],
     };
     const byQuery = filterUsageEvents(sample, new URL('https://demo.example/api/v1/usage/events?q=claude-code'), 0);
@@ -619,5 +767,129 @@ describe('usage-events client_agent search and call-point fallback parity', () =
 
     const byAlias = filterUsageEvents(sample, new URL('https://demo.example/api/v1/usage/events?model_alias=fast'), 0);
     assert.deepEqual(byAlias.items.map((row) => row.id), [1]);
+
+    const byTrimmedAgent = filterUsageEvents(sample, new URL('https://demo.example/api/v1/usage/events?client_agent=%20hindsight%20'), 0);
+    assert.deepEqual(byTrimmedAgent.items.map((row) => row.id), [1]);
+
+    const subSample = {
+      window: { from: 1000, to: 10000 },
+      items: [
+        { id: 1, timestamp_ms: 4000, model: 'gpt-5', response_model: 'gpt-5-mini', model_substituted: true, provider: 'codex', failed: false, pricing_status: 'priced' },
+        { id: 2, timestamp_ms: 5000, model: 'gpt-5', response_model: 'gpt-5-nano', model_substituted: true, provider: 'codex', failed: false, pricing_status: 'priced' },
+        { id: 3, timestamp_ms: 6000, model: 'gpt-5', response_model: 'gpt-5', model_substituted: false, provider: 'codex', failed: false, pricing_status: 'priced' },
+      ],
+    };
+    const bySub = filterUsageEvents(subSample, new URL('https://demo.example/api/v1/usage/events?served=substituted&response_model=gpt-5-mini'), { deltaMs: 0 });
+    assert.deepEqual(bySub.items.map((row) => row.id), [1]);
+    const byMatched = filterUsageEvents(subSample, new URL('https://demo.example/api/v1/usage/events?served=matched'), { deltaMs: 0 });
+    assert.deepEqual(byMatched.items.map((row) => row.id), [3]);
+    const openFrom = filterUsageEvents(subSample, new URL('https://demo.example/api/v1/usage/events?from=14500'), { deltaMs: 10000 });
+    assert.deepEqual(openFrom.items.map((row) => row.id), [2, 3]);
+  });
+
+  it('aligns Trends drill-downs and event details with calendar whole-week replay offset when replay=calendar is set', async (t) => {
+    const dayMs = 86_400_000;
+    const weekMs = 7 * dayMs;
+    const nowMs = REFERENCE_MS + 10 * dayMs + 3_600_000;
+    t.mock.method(Date, 'now', () => nowMs);
+    const { default: worker } = await import('./worker.mjs');
+    const env = { ASSETS: { fetch: () => new Response('', { status: 200 }) } };
+    const trendsResp = await worker.fetch(request('/api/v1/management/trends/usage?preset=7d'), env);
+    const trendsData = await trendsResp.json();
+    const drillUrl = `/api/v1/usage/events?from=${trendsData.window.from}&to=${trendsData.window.to}&replay=calendar`;
+    const eventsResp = await worker.fetch(request(drillUrl), env);
+    assert.equal(eventsResp.status, 200);
+    const eventsData = await eventsResp.json();
+    const capturedEvents = JSON.parse(DATASET.responses['usage-events'].body).items;
+    const expectedCaptured = capturedEvents.filter((row) =>
+      row.timestamp_ms + weekMs >= trendsData.window.from && row.timestamp_ms + weekMs <= trendsData.window.to);
+    assert.ok(expectedCaptured.length > 0, 'captured events should overlap calendar 7d window');
+    const pageLimit = eventsData.limit ?? 200;
+    const expectedPage = expectedCaptured.slice(0, pageLimit);
+    assert.deepEqual(
+      eventsData.items.map((row) => row.id),
+      expectedPage.map((row) => row.id),
+    );
+    assert.deepEqual(
+      eventsData.items.map((row) => row.timestamp_ms),
+      expectedPage.map((row) => row.timestamp_ms + weekMs),
+    );
+
+    // Without replay=calendar, the Worker applies the full 10d+1h offset instead of 7d, selecting different rows.
+    const ordinaryEventsResp = await worker.fetch(
+      request(`/api/v1/usage/events?from=${trendsData.window.from}&to=${trendsData.window.to}`),
+      env,
+    );
+    const ordinaryEventsData = await ordinaryEventsResp.json();
+    assert.notDeepEqual(
+      ordinaryEventsData.items.map((row) => row.id),
+      eventsData.items.map((row) => row.id),
+    );
+
+    const detailCalendarResp = await worker.fetch(request(`/api/v1/usage/events/${eventsData.items[0].id}?replay=calendar`), env);
+    assert.equal(detailCalendarResp.status, 200);
+    const detailCalendarData = await detailCalendarResp.json();
+    assert.equal(detailCalendarData.event.timestamp_ms, eventsData.items[0].timestamp_ms);
+
+    const detailOrdinaryResp = await worker.fetch(request(`/api/v1/usage/events/${eventsData.items[0].id}`), env);
+    assert.equal(detailOrdinaryResp.status, 200);
+    const detailOrdinaryData = await detailOrdinaryResp.json();
+    assert.equal(detailOrdinaryData.event.timestamp_ms, expectedCaptured[0].timestamp_ms + (nowMs - REFERENCE_MS));
+  });
+});
+
+describe('static asset and SPA shell cache policy', () => {
+  it('never caches 404 asset responses as immutable and marks the HTML shell no-store', async () => {
+    const { default: worker } = await import('./worker.mjs');
+    const seen = [];
+    const env = {
+      ASSETS: {
+        fetch: (req) => {
+          const url = new URL(req.url);
+          seen.push({
+            path: url.pathname,
+            ifNoneMatch: req.headers.get('if-none-match'),
+            ifModifiedSince: req.headers.get('if-modified-since'),
+          });
+          if (url.pathname === '/') {
+            return new Response('<html></html>', {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Cache-Control': 'public, max-age=0, must-revalidate',
+              },
+            });
+          }
+          if (url.pathname === '/assets/chunk.js') {
+            return new Response('export default 1;', {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/javascript; charset=utf-8',
+                'Cache-Control': 'public, max-age=31536000, immutable',
+              },
+            });
+          }
+          return new Response('Not Found', {
+            status: 404,
+            headers: { 'Cache-Control': 'public, max-age=31536000, immutable' },
+          });
+        },
+      },
+    };
+
+    const html = await worker.fetch(new Request('https://demo.example/', {
+      headers: { 'If-None-Match': '"old"', 'If-Modified-Since': 'Tue, 17 Nov 2026 00:00:00 GMT' },
+    }), env);
+    assert.equal(html.status, 200);
+    assert.equal(html.headers.get('Cache-Control'), 'no-store');
+    assert.deepEqual(seen[0], { path: '/', ifNoneMatch: null, ifModifiedSince: null });
+
+    const okAsset = await worker.fetch(request('/assets/chunk.js'), env);
+    assert.equal(okAsset.status, 200);
+    assert.equal(okAsset.headers.get('Cache-Control'), 'public, max-age=31536000, immutable');
+
+    const missingAsset = await worker.fetch(request('/assets/retired-chunk.js'), env);
+    assert.equal(missingAsset.status, 404);
+    assert.equal(missingAsset.headers.get('Cache-Control'), 'no-store');
   });
 });

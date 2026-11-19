@@ -28,7 +28,6 @@ import {
   UNKNOWN_EVENT_GROUP,
   eventCredentialIdentity,
   eventProviderIdentity,
-  eventUserAgentGroupKey,
   formatEventSourceGroupTitle,
   providersWithMultipleAuthSources,
 } from '../types/usageEventGrouping';
@@ -40,7 +39,8 @@ import { useRequestListScroll } from '../components/usage/useRequestListScroll';
 import { useUsageEventSync } from '../components/usage/useUsageEventSync';
 import { isListStale, isViewChange } from '../components/usage/pollingPolicy';
 import { chipDisplayValue } from '../components/usage/chipDisplay';
-import { clientProductName, isLocalizedClient } from '../types/clientAgents';
+import { clientDisplayName, eventClientId } from '../types/clientAgents';
+import { ClientMark } from '../components/common/ClientMark';
 import { RequestRow } from '../components/usage/RequestRow';
 import { RequestTooltipLayer } from '../components/usage/RequestTooltip';
 import { useProviderBranding } from '../hooks/useProviderBranding';
@@ -193,6 +193,7 @@ export const UsageEventsPage: React.FC = () => {
     () => ({
       ...query,
       ...eventWindowQuery(query),
+      ...(query.replay ? { replay: query.replay } : {}),
       cursor,
     }),
     [cursor, query],
@@ -395,6 +396,7 @@ export const UsageEventsPage: React.FC = () => {
    */
   const chipLabels: Record<EventFilterKey, MessageKey> = {
     model: 'events.filter_chip_model',
+    response_model: 'events.filter_chip_response_model',
     model_alias: 'events.filter_chip_model_alias',
     provider: 'events.filter_chip_provider',
     auth_index: 'events.filter_chip_credential',
@@ -455,7 +457,7 @@ export const UsageEventsPage: React.FC = () => {
           substituted: t('events.served_substituted'),
           matched: t('events.served_matched'),
         },
-        clientAgentName: (value) => (isLocalizedClient(value) ? t(`insights.client.${value}`) : clientProductName(value) ?? value),
+        clientAgentName: (value) => clientDisplayName(value, t),
         transportLabels: {
           websocket: t('events.transport_websocket'),
           sse: t('events.transport_sse'),
@@ -511,18 +513,23 @@ export const UsageEventsPage: React.FC = () => {
     if (grouping === 'time') return undefined;
     return {
       key: (event: UsageEvent) => {
-        if (grouping === 'ua') return eventUserAgentGroupKey(event);
+        if (grouping === 'ua') return eventClientId(event) ?? UNKNOWN_EVENT_GROUP;
         const provider = eventProviderIdentity(event, providerName, unknownProviderLabel).key;
         const credential = eventCredentialIdentity(event, credentials, unknownCredentialLabel).key;
         return JSON.stringify([provider, credential]);
       },
       title: (_key: string, items: UsageEvent[]) => {
         if (grouping === 'ua') {
-          const label = eventUserAgentGroupKey(items[0]);
+          const clientId = eventClientId(items[0]);
           return (
             <div className="request-group-title">
-              <strong>
-                {label === UNKNOWN_EVENT_GROUP ? t('events.unknown_ua') : items[0].user_agent?.trim()}
+              <strong className="request-group-client">
+                {clientId ? (
+                  <span className="req-client-mark" aria-hidden="true">
+                    <ClientMark id={clientId} category={items[0].client_agent_category} />
+                  </span>
+                ) : null}
+                <span>{clientId ? clientDisplayName(clientId, t) : t('events.unknown_ua')}</span>
               </strong>
               <span>{t('events.record_count', { n: items.length })}</span>
             </div>
@@ -750,7 +757,7 @@ export const UsageEventsPage: React.FC = () => {
               onToggleAll={handleToggleAll}
             />
             <div ref={listHostRef} className="request-list-host">
-              <RequestTooltipLayer hostRef={listHostRef} />
+              <RequestTooltipLayer hostRef={listHostRef} replay={query.replay} />
               {!isQueryEnabled || result.isLoading ? (
                 <TablePlaceholder rows={8} className="request-loading" />
               ) : events.length ? (
@@ -816,6 +823,7 @@ export const UsageEventsPage: React.FC = () => {
         pluginTitles={pluginTitles}
         isProviderCatalogUnknown={isProviderCatalogUnproven}
         archive={archive}
+        replay={query.replay}
       />
       <RequestExportDialog
         open={isExportOpen}

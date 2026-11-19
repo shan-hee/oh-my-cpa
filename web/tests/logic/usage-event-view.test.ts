@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { eventClientId } from '../../src/types/clientAgents';
 import {
   readEventQuery,
   readFilterParams,
@@ -33,7 +34,6 @@ import {
   requestGroupName,
   eventKeyLabel,
   eventResultLabelKey,
-  eventUserAgentLabel,
   usageFacetLabel,
   providerFacetLabel,
 } from '../../src/types/usageEventLabels.ts';
@@ -53,7 +53,6 @@ import { requestFailureCause, tokenComposition } from '../../src/types/requestDe
 import {
   eventProviderIdentity,
   eventCredentialIdentity,
-  eventUserAgentGroupKey,
   formatEventSourceGroupTitle,
   providersWithMultipleAuthSources,
   UNKNOWN_EVENT_GROUP,
@@ -221,15 +220,17 @@ test('usage event view', () => {
   // Every filter dimension the panel owns must survive a URL round trip, or a
   // reload would silently drop part of the operator's filter.
   const everyFilter = [
-    'model=gpt-5&provider=openai&auth_index=auth-a&source=src&api_key=key&executor=codex',
+    'model=gpt-5&response_model=gpt-5-mini&provider=openai&auth_index=auth-a&source=src&api_key=key&executor=codex',
     'auth_type=oauth&reasoning=high&service_tier=flex&resolved_service_tier=priority&model_alias=fast',
     'q=codex&ua=codex-cli&endpoint=%2Fv1%2Fresponses&request_id=req-1',
     'latency_min=100&latency_max=60000&tokens_min=0&tokens_max=500000',
     'cost_min=0.000001&cost_max=12.5&cost=unpriced&served=substituted&transport=websocket',
   ].join('&');
   const everyQuery = read(everyFilter);
+  assert.deepEqual(everyQuery.filters?.response_model, ['gpt-5-mini']);
   assert.deepEqual(everyQuery.filters?.resolved_service_tier, ['priority']);
   const everyParams = new URLSearchParams(usageEventParams(everyQuery));
+  assert.deepEqual(everyParams.getAll('response_model'), ['gpt-5-mini']);
   assert.deepEqual(everyParams.getAll('resolved_service_tier'), ['priority']);
   const everyAgain = read(everyParams.toString());
   assert.deepEqual(everyAgain, everyQuery);
@@ -480,16 +481,9 @@ test('usage event view', () => {
   assert.equal(requestGroupName({ ...event, api_group_label: 'provider', api_group_key: 'openai' }), 'openai');
   assert.equal(requestGroupName({ ...event, api_group_key: 'unknown' }), undefined);
 
-  // List-row labels: result capsule, UA column and Key column
+  // List-row labels: result capsule and Key column
   assert.equal(eventResultLabelKey({ failed: false }), 'events.filter_success');
   assert.equal(eventResultLabelKey({ failed: true }), 'events.filter_failed');
-  assert.equal(eventUserAgentLabel({ user_agent: 'codex-cli/0.46' }), 'codex-cli/0.46');
-  assert.equal(eventUserAgentLabel({ user_agent: '  ' }), '—');
-  assert.equal(eventUserAgentLabel({}), '—');
-  assert.equal(eventUserAgentLabel({ user_agent: null }), '—');
-  // A minimized-but-long label is shown verbatim; the column ellipsizes visually
-  const longUA = 'some-client/1.2.3-' + 'x'.repeat(100);
-  assert.equal(eventUserAgentLabel({ user_agent: longUA }), longUA);
   // Key shows the stored display mask; the raw key is never available to show.
   assert.equal(
     eventKeyLabel({
@@ -905,18 +899,13 @@ test('usage event view', () => {
 
 
 
-  // ---- UA grouping ----
+  // ---- client column and grouping ----
 
-  // The stored value is already the minimised product label, so it is used
-  // verbatim; bucketing lower-cases so two spellings of one client are one bucket.
-  assert.equal(eventUserAgentGroupKey(sourceEvents[0]), 'claude-code/1.2');
-  assert.equal(eventUserAgentGroupKey({ user_agent: 'Codex-CLI/0.9' }), 'codex-cli/0.9');
-  assert.equal(eventUserAgentGroupKey({ user_agent: '  spaced/1.0  ' }), 'spaced/1.0');
-
-  // A record captured without a client is its own bucket, never dropped and never
-  // folded into a named client.
-  for (const absent of [undefined, null, '', '   ']) {
-    assert.equal(eventUserAgentGroupKey({ user_agent: absent }), UNKNOWN_EVENT_GROUP);
+  // A record names its client by the identifier the server normalised, whatever
+  // version its User-Agent carried; one without a recognisable client names none.
+  assert.equal(eventClientId({ client_agent: 'claude-code' }), 'claude-code');
+  for (const absent of [undefined, '', '  ', 'unknown']) {
+    assert.equal(eventClientId({ client_agent: absent }), undefined);
   }
 
 
@@ -1600,11 +1589,11 @@ test('usage event view', () => {
   assert.deepEqual(foldedAt(null), [], 'nothing folds before the list is measured');
   assert.deepEqual(foldedAt(1470), [], 'every column fits at the grid floor');
   assert.deepEqual(foldedAt(2400), []);
-  assert.deepEqual(foldedAt(1469), ['ua'], 'one pixel short folds the first column only');
-  assert.deepEqual(foldedAt(1334), ['ua']);
-  assert.deepEqual(foldedAt(1333), ['ua', 'key']);
-  assert.deepEqual(foldedAt(1140), ['ua', 'key', 'cache'], 'a 1440px window with the rail open keeps the speed and the mode');
-  assert.deepEqual(foldedAt(921), ['ua', 'key', 'cache', 'mode', 'tps']);
+  assert.deepEqual(foldedAt(1469), ['client'], 'one pixel short folds the first column only');
+  assert.deepEqual(foldedAt(1334), ['client']);
+  assert.deepEqual(foldedAt(1333), ['client', 'key']);
+  assert.deepEqual(foldedAt(1140), ['client', 'key', 'cache'], 'a 1440px window with the rail open keeps the speed and the mode');
+  assert.deepEqual(foldedAt(921), ['client', 'key', 'cache', 'mode', 'tps']);
   // A stacked record labels every field, so the card width folds nothing.
   assert.deepEqual(foldedAt(REQUEST_STACK_WIDTH), []);
   assert.deepEqual(foldedAt(400), []);
@@ -1618,12 +1607,12 @@ test('usage event view', () => {
     );
   }
   // A width the operator dragged out counts against the room, and folds sooner.
-  assert.deepEqual(foldedAt(1418, { provider: 300 }), ['ua', 'key']);
+  assert.deepEqual(foldedAt(1418, { provider: 300 }), ['client', 'key']);
   // The folded columns have no track, and the floor shrinks by their width and gap.
-  const foldedGrid = buildGridTemplateColumns({}, undefined, new Set(['ua', 'key']));
+  const foldedGrid = buildGridTemplateColumns({}, undefined, new Set(['client', 'key']));
   const trackCount = (grid: string) => grid.match(/minmax\([^)]*\)|\S+/g)!.length;
   assert.equal(trackCount(foldedGrid), trackCount(defaultGrid) - 2);
-  assert.equal(computeGridMinWidth({}, 16, 20, undefined, new Set(['ua'])), baseMin + 208 + 40 - 120 - 16);
+  assert.equal(computeGridMinWidth({}, 16, 20, undefined, new Set(['client'])), baseMin + 208 + 40 - 120 - 16);
 
 
 

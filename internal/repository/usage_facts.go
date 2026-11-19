@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -26,8 +27,10 @@ const QuarterHourBucketMS int64 = 15 * 60 * 1000
 const LifecycleUsageDetail = "usage_detail"
 
 const (
-	usageFactsFineTable  = "usage_facts_15m"
-	usageFactsDailyTable = "usage_facts_daily"
+	usageFactsFineTable        = "usage_facts_15m"
+	usageFactsDailyTable       = "usage_facts_daily"
+	usageClientFactsFineTable  = "usage_client_facts_15m"
+	usageClientFactsDailyTable = "usage_client_facts_daily"
 	// usageFactsLocalTable holds whole local days in the one zone its checkpoint
 	// marker names; see migration 047.
 	usageFactsLocalTable = "usage_facts_local_daily"
@@ -39,6 +42,9 @@ const (
 // usageFactDimensions are the columns a fact row is keyed on besides its bucket.
 // usage_events carries the same names, so one expression groups either source.
 const usageFactDimensions = `api_group_key, model, model_alias, auth_index, provider, auth_type`
+
+// usageClientFactDimensions extends usageFactDimensions with persisted client attribution.
+const usageClientFactDimensions = usageFactDimensions + `, client_agent, client_prefix`
 
 // Per-event additive token partition SQL shared by unfolded usage_events reads,
 // 15-minute fact folding, historical upgrade reconstruction, and caller agent
@@ -168,6 +174,33 @@ var usageFactMeasures = []string{
 	"prompt_tokens", "completion_tokens", "effective_cache_read_tokens", "effective_total_tokens",
 }
 
+// usageClientFactMeasures lists the additive columns rolled into usage_client_facts_*.
+var usageClientFactMeasures = []string{
+	"retained_requests", "requests", "failures", "prompt_tokens", "completion_tokens",
+	"reasoning_tokens", "effective_cache_read_tokens", "cache_creation_tokens",
+	"effective_total_tokens", "latency_sum_ms", "ttft_sum_ms", "ttft_count",
+	"cost_nanos", "priced_requests", "costed_requests",
+}
+
+// usageClientFactProjection reads a client fact row under usageFactMeasures'
+// names and order. Client facts hold the normalised accounting only, so the
+// normalised partitions stand in for the raw columns and every row is canonical.
+var usageClientFactProjection = func() string {
+	sources := []string{
+		"requests", "failures", "prompt_tokens", "completion_tokens", "reasoning_tokens",
+		"effective_cache_read_tokens", "effective_cache_read_tokens", "cache_creation_tokens", "effective_total_tokens",
+		"latency_sum_ms", "ttft_sum_ms", "ttft_count", "cost_nanos", "priced_requests",
+		"costed_requests", "requests", "0",
+		"0", "0", "0",
+		"prompt_tokens", "completion_tokens", "effective_cache_read_tokens", "effective_total_tokens",
+	}
+	columns := make([]string, len(sources))
+	for index, source := range sources {
+		columns[index] = source + " AS " + usageFactMeasures[index]
+	}
+	return strings.Join(columns, ", ")
+}()
+
 // buildStagedUsageEventsArm builds a single-MATERIALIZED pipeline over usage_events
 // so protocol classification executes at most once per legacy row with non-zero
 // cache/reasoning, while integer arithmetic stays streaming without extra temp B-trees.
@@ -235,11 +268,20 @@ const (
 	// carries, so the provider label alone cannot say which configured provider
 	// answered.
 	UsageDimensionServingKey UsageDimension = "serving_key"
+	// UsageDimensionClientAgent is the normalised client program behind a
+	// generation request, `unknown` when its User-Agent named none. Client
+	// attribution is rolled up beside the request records rather than into the
+	// permanent facts, so a read that names it is a client read: it counts
+	// generation requests only and starts no earlier than the request-record
+	// horizon.
+	UsageDimensionClientAgent UsageDimension = "client_agent"
 )
 
 // usageDimensionExpressions maps a dimension to its SQL expression. The
 // expressions only use columns present on both the fact tables and usage_events;
-// model_alias is nullable on the latter, hence the COALESCE.
+// model_alias is nullable on the latter, hence the COALESCE. client_agent is the
+// exception: of the fact tables only the client ones carry it, which is why
+// naming it turns the read into a client read (see UsageFactQuery.isClientRead).
 var usageDimensionExpressions = map[UsageDimension]string{
 	UsageDimensionKey:        `api_group_key`,
 	UsageDimensionModel:      `model`,
@@ -248,6 +290,9 @@ var usageDimensionExpressions = map[UsageDimension]string{
 	UsageDimensionCredential: `TRIM(auth_index)`,
 	UsageDimensionAuthType:   `auth_type`,
 	UsageDimensionServingKey: `CASE WHEN auth_type = 'apikey' THEN TRIM(auth_index) ELSE '' END`,
+	// A request record without an attribution folds as "unknown", the label its
+	// client fact row carries.
+	UsageDimensionClientAgent: `CASE WHEN client_agent = '' THEN 'unknown' ELSE client_agent END`,
 }
 
 // UsageCalendarUnit is a civil bucket on the deployment's calendar.
@@ -417,6 +462,33 @@ func (m *UsageMeasures) add(other UsageMeasures) {
 	m.Accounting.EffectiveTotalTokens += other.Accounting.EffectiveTotalTokens
 }
 
+func (m *UsageMeasures) subtractClamped(other UsageMeasures) {
+	m.Requests = max(0, m.Requests-other.Requests)
+	m.Failures = max(0, m.Failures-other.Failures)
+	m.InputTokens = max(0, m.InputTokens-other.InputTokens)
+	m.OutputTokens = max(0, m.OutputTokens-other.OutputTokens)
+	m.ReasoningTokens = max(0, m.ReasoningTokens-other.ReasoningTokens)
+	m.CachedTokens = max(0, m.CachedTokens-other.CachedTokens)
+	m.CacheReadTokens = max(0, m.CacheReadTokens-other.CacheReadTokens)
+	m.CacheCreationTokens = max(0, m.CacheCreationTokens-other.CacheCreationTokens)
+	m.TotalTokens = max(0, m.TotalTokens-other.TotalTokens)
+	m.LatencySumMS = max(0, m.LatencySumMS-other.LatencySumMS)
+	m.TTFTSumMS = max(0, m.TTFTSumMS-other.TTFTSumMS)
+	m.TTFTCount = max(0, m.TTFTCount-other.TTFTCount)
+	m.CostNanos = max(0, m.CostNanos-other.CostNanos)
+	m.PricedRequests = max(0, m.PricedRequests-other.PricedRequests)
+	m.CostedRequests = max(0, m.CostedRequests-other.CostedRequests)
+	m.Accounting.CanonicalRequests = max(0, m.Accounting.CanonicalRequests-other.Accounting.CanonicalRequests)
+	m.Accounting.UnresolvedRequests = max(0, m.Accounting.UnresolvedRequests-other.Accounting.UnresolvedRequests)
+	m.Accounting.RawInputTokens = max(0, m.Accounting.RawInputTokens-other.Accounting.RawInputTokens)
+	m.Accounting.RawOutputTokens = max(0, m.Accounting.RawOutputTokens-other.Accounting.RawOutputTokens)
+	m.Accounting.RawTotalTokens = max(0, m.Accounting.RawTotalTokens-other.Accounting.RawTotalTokens)
+	m.Accounting.PromptTokens = max(0, m.Accounting.PromptTokens-other.Accounting.PromptTokens)
+	m.Accounting.CompletionTokens = max(0, m.Accounting.CompletionTokens-other.Accounting.CompletionTokens)
+	m.Accounting.EffectiveCacheReadTokens = max(0, m.Accounting.EffectiveCacheReadTokens-other.Accounting.EffectiveCacheReadTokens)
+	m.Accounting.EffectiveTotalTokens = max(0, m.Accounting.EffectiveTotalTokens-other.Accounting.EffectiveTotalTokens)
+}
+
 // UsageFactQuery is one read of deployment usage.
 type UsageFactQuery struct {
 	InstanceID string
@@ -434,6 +506,23 @@ type UsageFactQuery struct {
 	// Filters keep only rows whose dimension value is one of the listed values.
 	// An empty list for a dimension is no constraint.
 	Filters map[UsageDimension][]string
+	// ClientAgents keeps only the generation requests of these client programs.
+	// Client attribution is rolled up beside the request records and pruned with
+	// them, so such a read starts no earlier than the request-record horizon.
+	ClientAgents []string
+	// HorizonMS pins the retention horizon when set so multi-step reads (such as
+	// Trends telemetry combining permanent facts and retained records) plan
+	// against one consistent boundary instead of re-reading a moving horizon.
+	HorizonMS *int64
+}
+
+// isClientRead reports whether the read is answered from the client facts:
+// it narrows to client programs or partitions by them.
+func (query UsageFactQuery) isClientRead() bool {
+	if len(query.ClientAgents) > 0 || len(query.Filters[UsageDimensionClientAgent]) > 0 {
+		return true
+	}
+	return slices.Contains(query.Dimensions, UsageDimensionClientAgent)
 }
 
 // UsageFactRow is one group's usage inside one bucket.
@@ -459,6 +548,12 @@ type UsageFactResult struct {
 	// request records, so a caller can say how much of a window was pre-aggregated.
 	FactRequests   int64
 	DetailRequests int64
+	// Clipped reports that a client read started at the request-record horizon
+	// rather than at the requested FromMS, and HorizonMS is that horizon. A window
+	// that ends before it reads nothing and keeps its requested bounds, so only
+	// HorizonMS says where attribution starts.
+	Clipped   bool
+	HorizonMS int64
 }
 
 // Totals sums every row of the read.
@@ -642,11 +737,25 @@ func (grid calendarGrid) bucket(column string) string {
 }
 
 // instant turns a wall-clock bucket start back into the instant it names. A local
-// midnight or hour that a daylight-saving jump skips resolves forward, as Go's
-// time.Date does.
+// midnight or hour that a daylight-saving jump skips resolves forward to the first
+// instant of that local civil date/hour (even when Go's time.Date resolves a skipped
+// 00:00 backwards to 23:00 of the prior day).
 func (grid calendarGrid) instant(wallMS int64) int64 {
 	wall := time.UnixMilli(wallMS).UTC()
-	return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), 0, 0, 0, grid.location).UnixMilli()
+	if grid.unit == UsageCalendarHour {
+		return time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), 0, 0, 0, grid.location).UnixMilli()
+	}
+	y, m, d := wall.Date()
+	start := time.Date(y, m, d, 0, 0, 0, 0, grid.location)
+	if start.Year() != y || start.Month() != m || start.Day() != d {
+		for offsetMin := 15; offsetMin <= 240; offsetMin += 15 {
+			probe := time.Date(y, m, d, 0, offsetMin, 0, 0, grid.location)
+			if probe.Year() == y && probe.Month() == m && probe.Day() == d {
+				return probe.UnixMilli()
+			}
+		}
+	}
+	return start.UnixMilli()
 }
 
 // bucketFromWall renders the bucket for a column that already holds a wall-clock
@@ -660,12 +769,25 @@ func (grid calendarGrid) bucketFromWall(column string) string {
 }
 
 // localMidnight is the instant a local day begins, and the same day's midnight on
-// the wall clock. A midnight that a daylight-saving jump skips resolves to the
-// first instant of that day, which is also where its records start.
+// the wall clock. When a midnight DST spring-forward (such as America/Havana) causes
+// Go's time.Date(..., 0, 0, ...) to resolve backwards to 23:00 of the prior civil
+// day, advance until the local calendar date matches (year, month, day) so the day's
+// first instant is returned cleanly.
 func localMidnight(at time.Time, location *time.Location, dayOffset int) (int64, int64) {
 	local := at.In(location)
-	start := time.Date(local.Year(), local.Month(), local.Day()+dayOffset, 0, 0, 0, 0, location)
-	wall := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
+	ref := time.Date(local.Year(), local.Month(), local.Day()+dayOffset, 12, 0, 0, 0, location)
+	y, m, d := ref.Date()
+	start := time.Date(y, m, d, 0, 0, 0, 0, location)
+	if start.Year() != y || start.Month() != m || start.Day() != d {
+		for offsetMin := 15; offsetMin <= 240; offsetMin += 15 {
+			probe := time.Date(y, m, d, 0, offsetMin, 0, 0, location)
+			if probe.Year() == y && probe.Month() == m && probe.Day() == d {
+				start = probe
+				break
+			}
+		}
+	}
+	wall := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 	return start.UnixMilli(), wall.UnixMilli()
 }
 
@@ -699,12 +821,44 @@ func planLocalDays(plan *usageFactPlan, location *time.Location) {
 // The boundary between facts and records is the event id, not a timestamp. CPA
 // reports a request's start time, so records arrive out of time order; an id
 // boundary is exact regardless, because a fold covers precisely the ids up to
+type sqlQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // its checkpoint.
 func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) (UsageFactResult, error) {
 	result := UsageFactResult{Rows: []UsageFactRow{}}
 	if r == nil || r.SQL() == nil {
 		return result, errors.New("repository is not initialized")
 	}
+	tx, err := r.SQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return result, fmt.Errorf("begin usage facts read snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	return queryUsageFactsWithQuerier(ctx, tx, query)
+}
+
+// QueryUsageFactsSnapshot executes multiple usage-fact reads against one shared
+// SQLite read transaction so current, comparison, and baseline windows observe
+// the same retention horizon and checkpoint.
+func (r *Repository) QueryUsageFactsSnapshot(ctx context.Context, fn func(queryFacts func(UsageFactQuery) (UsageFactResult, error)) error) error {
+	if r == nil || r.SQL() == nil {
+		return errors.New("repository is not initialized")
+	}
+	tx, err := r.SQL().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return fmt.Errorf("begin usage facts read snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	return fn(func(query UsageFactQuery) (UsageFactResult, error) {
+		return queryUsageFactsWithQuerier(ctx, tx, query)
+	})
+}
+
+func queryUsageFactsWithQuerier(ctx context.Context, q sqlQuerier, query UsageFactQuery) (UsageFactResult, error) {
+	result := UsageFactResult{Rows: []UsageFactRow{}}
 	if query.ToMS < query.FromMS {
 		return result, errors.New("usage window is negative")
 	}
@@ -721,9 +875,27 @@ func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) 
 			return result, fmt.Errorf("unknown usage filter %q", dimension)
 		}
 	}
-	horizonMS, err := r.LifecycleHorizonMS(ctx, LifecycleUsageDetail)
-	if err != nil {
-		return result, err
+	var horizonMS int64
+	if query.HorizonMS != nil {
+		horizonMS = *query.HorizonMS
+	} else {
+		var err error
+		horizonMS, err = lifecycleHorizonMS(ctx, q, LifecycleUsageDetail)
+		if err != nil {
+			return result, err
+		}
+	}
+	isClientRead := query.isClientRead()
+	if isClientRead && horizonMS > 0 && query.FromMS < horizonMS {
+		result.Clipped, result.HorizonMS = true, horizonMS
+		if query.ToMS < horizonMS {
+			result.FromMS, result.ToMS, result.BucketMS = query.FromMS, query.ToMS, query.BucketMS
+			if query.Calendar != nil {
+				result.BucketMS = 0
+			}
+			return result, nil
+		}
+		query.FromMS = horizonMS
 	}
 	var grid *calendarGrid
 	bucketMS := query.BucketMS
@@ -740,12 +912,13 @@ func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) 
 		isDailyUsable = query.Calendar.Unit != UsageCalendarHour && compiled.isZeroOffset()
 	}
 	plan := planUsageFactRead(horizonMS, query.FromMS, query.ToMS, bucketMS, isDailyUsable)
-	if grid != nil && !isDailyUsable && grid.unit != UsageCalendarHour {
+	// The local-day grain has no client counterpart; the fine table answers instead.
+	if grid != nil && !isDailyUsable && grid.unit != UsageCalendarHour && !isClientRead {
 		planLocalDays(&plan, grid.location)
 	}
 	hasLocalMarker := false
 	if plan.localMarker != "" {
-		if err := r.SQL().QueryRowContext(ctx, `
+		if err := q.QueryRowContext(ctx, `
 			SELECT EXISTS (SELECT 1 FROM usage_aggregation_checkpoints WHERE name = ?)`,
 			plan.localMarker).Scan(&hasLocalMarker); err != nil {
 			return result, fmt.Errorf("read local usage fact marker: %w", err)
@@ -757,7 +930,7 @@ func (r *Repository) QueryUsageFacts(ctx context.Context, query UsageFactQuery) 
 	}
 
 	statement, args := buildUsageFactStatement(plan, query, grid, hasLocalMarker, true)
-	rows, err := r.SQL().QueryContext(ctx, statement, args...)
+	rows, err := q.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return result, fmt.Errorf("read usage facts: %w", err)
 	}
@@ -870,6 +1043,26 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 	}
 
 	filterClause, filterArgs := usageFilterClause(query.Filters)
+	factFilter, eventFilter := filterClause, filterClause
+	fineTable, dailyTable := usageFactsFineTable, usageFactsDailyTable
+	factMeasures := strings.Join(usageFactMeasures, ", ")
+	if query.isClientRead() {
+		// Client facts count generation requests only and fold an unattributed one as
+		// "unknown", so the request-record arms read the same way. A fact row with an
+		// empty client_agent holds the non-generation requests, which carry no usage.
+		factFilter += " AND client_agent <> ''"
+		eventFilter += " AND generate = 1"
+		if len(query.ClientAgents) > 0 {
+			in := " IN (" + strings.TrimSuffix(strings.Repeat("?, ", len(query.ClientAgents)), ", ") + ")"
+			factFilter += " AND client_agent" + in
+			eventFilter += " AND " + usageDimensionExpressions[UsageDimensionClientAgent] + in
+			for _, agent := range query.ClientAgents {
+				filterArgs = append(filterArgs, agent)
+			}
+		}
+		fineTable, dailyTable = usageClientFactsFineTable, usageClientFactsDailyTable
+		factMeasures = usageClientFactProjection
+	}
 	withFilters := func(args ...any) []any { return append(args, filterArgs...) }
 
 	var parts []string
@@ -879,9 +1072,9 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 			return
 		}
 		parts = append(parts, `
-			SELECT 1 AS from_facts, `+keySelect+aligned("bucket_start_ms")+` AS aligned, `+strings.Join(usageFactMeasures, ", ")+`
+			SELECT 1 AS from_facts, `+keySelect+aligned("bucket_start_ms")+` AS aligned, `+factMeasures+`
 			FROM `+table+`
-			WHERE instance_id = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?`+filterClause)
+			WHERE instance_id = ? AND bucket_start_ms >= ? AND bucket_start_ms < ?`+factFilter)
 		args = append(args, withFilters(query.InstanceID, fromMS, toMS)...)
 	}
 	// Each arm over usage_events names its index. The planner cannot know that the
@@ -889,7 +1082,7 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 	// and the wrong choice turns the dashboard's five-second poll into a scan of
 	// every retained record.
 	eventArm := func(index, predicate string, predicateArgs ...any) {
-		parts = append(parts, buildStagedUsageEventsArm(keySelect, keyPass, aligned("timestamp_ms"), "INDEXED BY "+index, "instance_id = ? AND "+predicate+filterClause))
+		parts = append(parts, buildStagedUsageEventsArm(keySelect, keyPass, aligned("timestamp_ms"), "INDEXED BY "+index, "instance_id = ? AND "+predicate+eventFilter))
 		args = append(args, withFilters(append([]any{query.InstanceID}, predicateArgs...)...)...)
 	}
 	const checkpoint = `(SELECT COALESCE((SELECT last_usage_event_id FROM usage_aggregation_checkpoints WHERE name = '` + CheckpointFacts + `'), 0))`
@@ -923,9 +1116,9 @@ func buildUsageFactStatement(plan usageFactPlan, query UsageFactQuery, grid *cal
 			args = append(args, plan.localMarker)
 		}
 	} else if plan.fineFrom < plan.fineTo {
-		factArm(usageFactsDailyTable, plan.dailyFrom, plan.dailyTo)
-		factArm(usageFactsFineTable, plan.fineFrom, plan.dailyFrom)
-		factArm(usageFactsFineTable, plan.dailyTo, plan.fineTo)
+		factArm(dailyTable, plan.dailyFrom, plan.dailyTo)
+		factArm(fineTable, plan.fineFrom, plan.dailyFrom)
+		factArm(fineTable, plan.dailyTo, plan.fineTo)
 	}
 	if plan.fineFrom < plan.fineTo {
 		// Folded records on the sub-bucket edges, which no whole fact bucket covers.
@@ -1007,16 +1200,28 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 	}
 
 	measureColumns := strings.Join(usageFactMeasures, ", ")
+	clientMeasureColumns := strings.Join(usageClientFactMeasures, ", ")
+	if err := resetUsageStageBuffer(ctx, tx); err != nil {
+		return 0, err
+	}
+	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_stage_15m`) }()
 	if err := resetUsageFoldBuffer(ctx, tx); err != nil {
 		return 0, err
 	}
 	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_fold_15m`) }()
+	if err := resetClientUsageFoldBuffer(ctx, tx); err != nil {
+		return 0, err
+	}
+	defer func() { _, _ = tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_client_fold_15m`) }()
 
 	_, err = tx.ExecContext(ctx, `
 		WITH s1 AS MATERIALIZED (
 			SELECT instance_id, (timestamp_ms / ?1) * ?1 AS bucket_start_ms,
 			       api_group_key, model, COALESCE(model_alias, '') AS model_alias,
 			       auth_index, provider, auth_type,
+			       generate,
+			       CASE WHEN generate = 1 THEN CASE WHEN client_agent = '' THEN 'unknown' ELSE client_agent END ELSE '' END AS client_agent,
+			       CASE WHEN generate = 1 THEN client_prefix ELSE '' END AS client_prefix,
 			       failed, input_tokens, output_tokens, reasoning_tokens,
 			       cached_tokens, cache_read_tokens, cache_creation_tokens, total_tokens,
 			       latency_ms, ttft_ms, cost_nanos, pricing_status,
@@ -1027,8 +1232,9 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 			FROM usage_events
 			WHERE id > ?2 AND id <= ?3
 		)
-		INSERT INTO temp._omc_usage_fold_15m (instance_id, bucket_start_ms, `+usageFactDimensions+`, `+measureColumns+`)
+		INSERT INTO temp._omc_usage_stage_15m (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, generate, `+measureColumns+`)
 		SELECT instance_id, bucket_start_ms, api_group_key, model, model_alias, auth_index, provider, auth_type,
+		       client_agent, client_prefix, generate,
 		       COUNT(1), SUM(failed), SUM(input_tokens), SUM(output_tokens), SUM(reasoning_tokens),
 		       SUM(cached_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(total_tokens),
 		       SUM(latency_ms), SUM(COALESCE(ttft_ms, 0)), SUM(ttft_ms IS NOT NULL),
@@ -1045,13 +1251,51 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 				)
 			)
 		)
-		GROUP BY instance_id, bucket_start_ms, api_group_key, model, model_alias, auth_index, provider, auth_type`,
+		GROUP BY instance_id, bucket_start_ms, api_group_key, model, model_alias, auth_index, provider, auth_type, client_agent, client_prefix, generate`,
 		QuarterHourBucketMS, lastID, highID.Int64)
 	if err != nil {
 		return 0, fmt.Errorf("stage usage fold batch: %w", err)
 	}
 
+	factSums := make([]string, 0, len(usageFactMeasures))
+	for _, measure := range usageFactMeasures {
+		factSums = append(factSums, "SUM("+measure+")")
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO temp._omc_usage_fold_15m (instance_id, bucket_start_ms, `+usageFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageFactDimensions+`, `+strings.Join(factSums, ", ")+`
+		FROM temp._omc_usage_stage_15m
+		GROUP BY instance_id, bucket_start_ms, `+usageFactDimensions); err != nil {
+		return 0, fmt.Errorf("stage usage facts fold batch: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO temp._omc_usage_client_fold_15m (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+clientMeasureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`,
+		       SUM(requests),
+		       SUM(CASE WHEN generate = 1 THEN requests ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN failures ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN prompt_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN completion_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN reasoning_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN effective_cache_read_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN cache_creation_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN effective_total_tokens ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN latency_sum_ms ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN ttft_sum_ms ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN ttft_count ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN cost_nanos ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN priced_requests ELSE 0 END),
+		       SUM(CASE WHEN generate = 1 THEN costed_requests ELSE 0 END)
+		FROM temp._omc_usage_stage_15m
+		GROUP BY instance_id, bucket_start_ms, `+usageClientFactDimensions); err != nil {
+		return 0, fmt.Errorf("stage client usage fold batch: %w", err)
+	}
+
 	if err := foldUsageBuffer(ctx, tx, minTS.Int64, maxTS.Int64); err != nil {
+		return 0, err
+	}
+	if err := foldClientUsageBuffer(ctx, tx); err != nil {
 		return 0, err
 	}
 
@@ -1072,6 +1316,21 @@ func (r *Repository) AggregateUsageFacts(ctx context.Context, batchSize int) (in
 	return absorbed, nil
 }
 
+// resetUsageStageBuffer prepares the connection-local TEMP table that stages
+// one raw batch once before populating both usage_facts_* and usage_client_facts_*.
+func resetUsageStageBuffer(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS _omc_usage_stage_15m AS
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, 0 AS generate, `+strings.Join(usageFactMeasures, ", ")+`
+		FROM `+usageFactsFineTable+`, (SELECT '' AS client_agent, '' AS client_prefix) WHERE 0`); err != nil {
+		return fmt.Errorf("prepare temp usage stage buffer: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_stage_15m`); err != nil {
+		return fmt.Errorf("reset temp usage stage buffer: %w", err)
+	}
+	return nil
+}
+
 // resetUsageFoldBuffer readies the connection-local TEMP table a fold stages its
 // 15-minute rows in. Because every civil UTC offset is a multiple of 15 minutes,
 // 15m, UTC-daily and local-daily all roll up from those rows.
@@ -1084,6 +1343,55 @@ func resetUsageFoldBuffer(ctx context.Context, tx *sql.Tx) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_fold_15m`); err != nil {
 		return fmt.Errorf("reset temp usage fold buffer: %w", err)
+	}
+	return nil
+}
+
+// resetClientUsageFoldBuffer prepares the connection-local TEMP table that
+// stages 15-minute client attribution rows before folding into 15m and daily grains.
+func resetClientUsageFoldBuffer(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS _omc_usage_client_fold_15m AS
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+strings.Join(usageClientFactMeasures, ", ")+`
+		FROM `+usageClientFactsFineTable+` WHERE 0`); err != nil {
+		return fmt.Errorf("prepare temp client usage fold buffer: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM temp._omc_usage_client_fold_15m`); err != nil {
+		return fmt.Errorf("reset temp client usage fold buffer: %w", err)
+	}
+	return nil
+}
+
+// foldClientUsageBuffer adds the staged 15-minute client attribution rows into
+// both usage_client_facts_15m and usage_client_facts_daily inside one transaction.
+func foldClientUsageBuffer(ctx context.Context, tx *sql.Tx) error {
+	updates := make([]string, 0, len(usageClientFactMeasures))
+	sums := make([]string, 0, len(usageClientFactMeasures))
+	for _, measure := range usageClientFactMeasures {
+		updates = append(updates, measure+" = "+measure+" + excluded."+measure)
+		sums = append(sums, "SUM("+measure+")")
+	}
+	updateSet := strings.Join(updates, ", ")
+	sumSelect := strings.Join(sums, ", ")
+	measureColumns := strings.Join(usageClientFactMeasures, ", ")
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO `+usageClientFactsFineTable+` (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`
+		FROM temp._omc_usage_client_fold_15m
+		WHERE true
+		ON CONFLICT DO UPDATE SET `+updateSet); err != nil {
+		return fmt.Errorf("fold usage into %s: %w", usageClientFactsFineTable, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO `+usageClientFactsDailyTable+` (instance_id, bucket_start_ms, `+usageClientFactDimensions+`, `+measureColumns+`)
+		SELECT instance_id, (bucket_start_ms / ?1) * ?1, `+usageClientFactDimensions+`, `+sumSelect+`
+		FROM temp._omc_usage_client_fold_15m
+		GROUP BY instance_id, (bucket_start_ms / ?1) * ?1, `+usageClientFactDimensions+`
+		ON CONFLICT DO UPDATE SET `+updateSet,
+		DayBucketMS); err != nil {
+		return fmt.Errorf("fold usage into %s: %w", usageClientFactsDailyTable, err)
 	}
 	return nil
 }
@@ -1299,8 +1607,12 @@ func (r *Repository) LifecycleHorizonMS(ctx context.Context, policy string) (int
 	if r == nil || r.SQL() == nil {
 		return 0, errors.New("repository is not initialized")
 	}
+	return lifecycleHorizonMS(ctx, r.SQL(), policy)
+}
+
+func lifecycleHorizonMS(ctx context.Context, q sqlQuerier, policy string) (int64, error) {
 	var horizonMS int64
-	err := r.SQL().QueryRowContext(ctx,
+	err := q.QueryRowContext(ctx,
 		`SELECT horizon_ms FROM data_lifecycle_state WHERE policy = ?`, policy).Scan(&horizonMS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil

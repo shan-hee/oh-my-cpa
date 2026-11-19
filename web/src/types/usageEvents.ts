@@ -2,6 +2,7 @@ import type { StructuredUsageDetails } from './structuredUsage';
 import type { MessageKey } from '../i18n/catalog';
 import type { TokenAccounting, TokenAccountingStatus } from './tokenAccounting';
 import type { RequestCostBreakdown } from './pricing';
+import type { ClientCategory } from './clientAgents';
 
 /**
  * Request-record types shared by the dashboard drill-down, the event table and
@@ -60,6 +61,7 @@ export interface UsageEvent {
   user_agent?: string | null;
   /** The client program normalised from the User-Agent at ingestion (`claude-code`, `python-httpx`, …). */
   client_agent?: string;
+  client_agent_category?: ClientCategory;
   source?: string;
   model: string;
   model_alias?: string;
@@ -306,6 +308,7 @@ export function isUsageTransport(value: unknown): value is UsageTransport {
  *  the operator adds a filter and widen as they remove one. */
 export const USAGE_MULTI_FILTER_KEYS = [
   'model',
+  'response_model',
   'model_alias',
   'provider',
   'auth_index',
@@ -546,6 +549,8 @@ export interface UsageEventQuery {
    * row id, as `arrived_count`. It does not change which rows come back.
    */
   since?: number;
+  /** Demo worker clock alignment hint when drilling from calendar-rebased views. */
+  replay?: 'calendar';
 }
 
 /**
@@ -595,6 +600,7 @@ export function usageEventParams(query: UsageEventQuery): string {
   if (isUsageTransport(query.transport)) assign('transport', query.transport);
   assign('cursor', query.cursor);
   assign('limit', query.limit);
+  if (query.replay === 'calendar') search.set('replay', 'calendar');
   assign('since', query.since);
   return search.toString();
 }

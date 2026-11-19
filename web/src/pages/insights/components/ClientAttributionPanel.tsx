@@ -5,17 +5,28 @@ import { Panel } from '../../../components/common/Panel';
 import { PanelTitle } from '../../../components/common/PanelTitle';
 import { EmptyState } from '../../../components/common/EmptyState';
 import { ToolButton } from '../../../components/common/ToolButton';
-import { LobeIcon } from '../../../components/LobeIcon';
 import { LoadFailure } from '../../../components/feedback';
-import { CodeOutlined, CodeSandboxOutlined, GlobalOutlined, RightOutlined } from '../../../components/icons';
+import { RightOutlined } from '../../../components/icons';
 import { useT } from '../../../i18n';
-import type { InsightsClientItem, InsightsClientsResponse } from '../../../types/insights';
+import type { InsightsClientsResponse } from '../../../types/insights';
 import { useTokenDisplayStyle } from '../../../types/tokenDisplayContext';
 import { rankGroups, rankingMetric, type CubeMetric, type Measures } from '../../../types/insightsCube';
 import { formatShare } from '../../../types/insightsFormat';
-import { ownClientMark } from './ClientMarks';
-import { clientCoverageShare, clientIconId, clientMeasures, clientProductName, isLocalizedClient } from '../../../types/clientAgents';
+import { ClientMark } from '../../../components/common/ClientMark';
+import { clientCoverageShare, clientDisplayName, clientMeasures, type ClientCategory } from '../../../types/clientAgents';
+import { PanelNarrowing } from './PanelNarrowing';
 import styles from '../insights.module.css';
+
+/** A client program as the page names it: its mark and name, the raw User-Agent prefix on hover. */
+export const ClientValue: React.FC<{ id: string; category?: ClientCategory; rawPrefix?: string; className?: string }> = ({ id, category, rawPrefix, className }) => {
+  const t = useT();
+  return (
+    <span className={clsx(styles['value'], className)} data-tip={rawPrefix?.trim() || undefined}>
+      <span className={styles['value-mark']} aria-hidden="true"><ClientMark id={id} category={category} /></span>
+      <span className={clsx(styles['value-name'], category === 'unknown' && styles['is-muted'])}>{clientDisplayName(id, t)}</span>
+    </span>
+  );
+};
 
 interface ClientAttributionPanelProps {
   data: InsightsClientsResponse | undefined;
@@ -32,18 +43,12 @@ interface ClientAttributionPanelProps {
   /** The request list for one client, inside the page's window and filters. */
   hrefFor: (clientAgent: string) => string;
   onNavigate: (href: string) => void;
-  className?: string;
-}
-
-function ClientMark({ item }: { item: InsightsClientItem }) {
-  const own = ownClientMark(item.id);
-  if (own) return own;
-  const iconId = clientIconId(item.id);
-  if (iconId) return <LobeIcon iconId={iconId} size={16} />;
-  if (item.id === 'browser') return <GlobalOutlined />;
-  if (item.category === 'agent') return <CodeSandboxOutlined />;
-  if (item.category === 'sdk') return <CodeOutlined />;
-  return null;
+  /** The clients the page is narrowed to; the read ranks every client regardless. */
+  selected?: readonly string[];
+  /** A row narrows the whole page to its client. */
+  onSelect?: (clientAgent: string) => void;
+  /** Drops the client filter. */
+  onClear?: () => void;
 }
 
 /**
@@ -52,7 +57,8 @@ function ClientMark({ item }: { item: InsightsClientItem }) {
  * them says how much of it the ranking covers rather than letting the missing part read as idle.
  */
 export const ClientAttributionPanel: React.FC<ClientAttributionPanelProps> = ({
-  data, metric, isLoading, isUncaptured, error, onRetry, isPlaceholder = false, limit = 8, canViewRequests = true, hrefFor, onNavigate, className,
+  data, metric, isLoading, isUncaptured, error, onRetry, isPlaceholder = false, limit = 8, canViewRequests = true, hrefFor, onNavigate,
+  selected = [], onSelect, onClear,
 }) => {
   const t = useT();
   const { style } = useTokenDisplayStyle();
@@ -66,15 +72,17 @@ export const ClientAttributionPanel: React.FC<ClientAttributionPanelProps> = ({
   }, [data, metric]);
   const coverage = data ? clientCoverageShare(data.coverage) : null;
   const top = groups[0]?.value ?? 0;
-  const nameOf = (id: string) => (isLocalizedClient(id) ? t(`insights.client.${id}`) : clientProductName(id)!);
+  const isNarrowed = selected.length > 0;
 
   return (
     <Panel
-      className={className}
       data-testid="insights-ranking-client"
+      data-narrowed={isNarrowed || undefined}
       title={(
         <PanelTitle
-          extra={coverage !== null ? (
+          extra={isNarrowed && onClear ? (
+            <PanelNarrowing count={selected.length} unit={t(`insights.metric.${ranking}`)} onClear={onClear} />
+          ) : coverage !== null ? (
             <span className={styles['panel-meta']} data-testid="insights-client-coverage">
               {t('insights.client.coverage', { n: formatShare(coverage / 100) })}
             </span>
@@ -95,14 +103,22 @@ export const ClientAttributionPanel: React.FC<ClientAttributionPanelProps> = ({
           {groups.slice(0, limit).map((group) => {
             const item = items.get(group.id)!;
             const width = top > 0 && group.value !== null ? Math.max(2, (group.value / top) * 100) : 0;
+            // `other` folds many programs together, so it names no one client to narrow to or list.
             const canDrill = group.id !== 'other';
+            const isSelected = selected.includes(group.id);
+            const canSelect = Boolean(onSelect) && canDrill;
+            const RowElement = canSelect ? 'button' : 'div';
             return (
-              <li key={group.id}>
-                <div className={styles['ranking-row']}>
-                  <span className={styles['value']} data-tip={item.raw_prefix?.trim() || group.id}>
-                    <span className={styles['value-mark']} aria-hidden="true"><ClientMark item={item} /></span>
-                    <span className={clsx(styles['value-name'], item.category === 'unknown' && styles['is-muted'])}>{nameOf(group.id)}</span>
-                  </span>
+              <li key={group.id} data-selected={isSelected || undefined} data-dimmed={isNarrowed && !isSelected ? 'true' : undefined}>
+                <RowElement
+                  {...(canSelect ? {
+                    type: 'button' as const,
+                    'aria-pressed': isSelected,
+                    onClick: () => onSelect?.(group.id),
+                  } : {})}
+                  className={clsx(styles['ranking-row'], canSelect && styles['ranking-row-interactive'])}
+                >
+                  <ClientValue id={item.id} category={item.category} rawPrefix={item.raw_prefix || group.id} />
                   <span className={styles['ranking-value']} data-tip={formatMetricExact(ranking, group.value)}>
                     {formatMetric(ranking, group.value, style)}
                   </span>
@@ -112,12 +128,12 @@ export const ClientAttributionPanel: React.FC<ClientAttributionPanelProps> = ({
                     </span>
                     {formatShare(group.share)}
                   </span>
-                </div>
+                </RowElement>
                 {canDrill ? (
                   <ToolButton
                     variant="ghost"
                     size="sm"
-                    className={styles['ranking-open']}
+                    className={clsx(styles['ranking-open'], styles['ranking-open-tool'])}
                     icon={<RightOutlined />}
                     label={t('insights.view_requests')}
                     disabled={isPlaceholder || !canViewRequests}

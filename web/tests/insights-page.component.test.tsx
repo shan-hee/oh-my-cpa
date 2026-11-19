@@ -1,3 +1,4 @@
+import type React from 'react';
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { Route, Routes, useLocation } from 'react-router-dom';
@@ -10,6 +11,7 @@ import type { InsightsClientsResponse, InsightsCubeResponse, InsightsRhythmCell,
 import { RhythmGrid } from '../src/pages/insights/components/RhythmGrid';
 vi.mock('../src/pages/insights/charts/InsightsFlowChart', () => ({ default: () => null }));
 vi.mock('../src/components/dashboard/RollingNumber', () => ({
+  RollingNumberGroup: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   RollingNumber: ({ readout }: { readout?: { number: number; prefix?: string; suffix: string; format: Intl.NumberFormatOptions } }) =>
     <>{readout ? `${readout.prefix ?? ''}${new Intl.NumberFormat('en', readout.format).format(readout.number)}${readout.suffix}` : '—'}</>,
 }));
@@ -110,7 +112,7 @@ describe('insights page', () => {
     mount('/insights?group=key&metric=cache_rate');
     await waitFor(() => expect(within(tile('requests')).getByText('45')).toBeTruthy());
     expect(within(tile('requests')).getByText('125%')).toBeTruthy();
-    expect(tile('tokens').getAttribute('aria-selected')).toBe('true');
+    expect(tile('tokens').getAttribute('aria-pressed')).toBe('true');
 
     const ranking = await screen.findByTestId('insights-ranking-key');
     fireEvent.click(within(ranking).getByText('Design team'));
@@ -123,8 +125,22 @@ describe('insights page', () => {
     expect(api.requests.filter((request) => request.path === '/management/insights/cube')).toHaveLength(1);
 
     fireEvent.click(tile('latency'));
-    await waitFor(() => expect(tile('latency').getAttribute('aria-selected')).toBe('true'));
+    await waitFor(() => expect(tile('latency').getAttribute('aria-pressed')).toBe('true'));
     expect(new URLSearchParams(lastSearch).get('metric')).toBe('latency');
+
+    // The change line keeps its place when the comparison is turned off, so nothing below it moves.
+    const parts = tile('requests').children.length;
+    fireEvent.click(screen.getByTestId('insights-compare'));
+    await waitFor(() => expect(within(tile('requests')).queryByText('125%')).toBeNull());
+    expect(tile('requests').children).toHaveLength(parts);
+
+    // Narrowed to a model only one key called, every ranking stays where the reader left it.
+    const places = () => [...screen.getByTestId('insights-ranking-key').parentElement!.children].map((panel) => panel.getAttribute('data-testid'));
+    const order = ['insights-ranking-model', 'insights-ranking-client', 'insights-ranking-key', 'insights-ranking-provider', 'insights-ranking-credential'];
+    expect(places()).toEqual(order);
+    fireEvent.click(within(screen.getByTestId('insights-ranking-model')).getByText('sonnet'));
+    await waitFor(() => expect(within(screen.getByTestId('insights-ranking-key')).queryByText('sk-…bbbb')).toBeNull());
+    expect(places()).toEqual(order);
   });
 
   it('isolates a series from the legend or chart click and resets on background click', async () => {
@@ -180,6 +196,23 @@ describe('insights page', () => {
     expect(search.getAll('client_agent')).toEqual(['claude-code']);
     expect(search.get('from')).toBe('0');
     expect(search.has('ua')).toBe(false);
+  });
+
+  it('narrows the whole page to a chosen client and keeps the other clients ranked', async () => {
+    mount('/insights');
+    const clients = await screen.findByTestId('insights-ranking-client');
+    await waitFor(() => expect(within(clients).getByText('Claude Code')).toBeTruthy());
+    const row = within(within(clients).getAllByRole('listitem')[0]!).getByRole('button', { pressed: false });
+    fireEvent.click(row);
+    await waitFor(() => expect(new URLSearchParams(lastSearch).getAll('client')).toEqual(['claude-code']));
+    await waitFor(() => expect(api.requests.some((request) => request.path === '/management/insights/cube'
+      && request.query.getAll('client_agent').join() === 'claude-code')).toBe(true));
+    await waitFor(() => expect(api.requests.some((request) => request.path === '/management/insights/rhythm'
+      && request.query.getAll('client_agent').join() === 'claude-code')).toBe(true));
+    expect(api.requests.filter((request) => request.path === '/management/insights/clients')
+      .every((request) => !request.query.has('client_agent'))).toBe(true);
+    expect(within(screen.getByTestId('insights-filter-bar')).getByText('Claude Code')).toBeTruthy();
+    await waitFor(() => expect(within(within(clients).getAllByRole('listitem')[0]!).getByRole('button', { pressed: true })).toBeTruthy());
   });
 
   it('offers a retry when the client attribution fails to load', async () => {
@@ -304,6 +337,54 @@ describe('insights page', () => {
     mount();
     expect(await screen.findByText('Insights could not be loaded')).toBeTruthy();
     expect(screen.getByText(/hour buckets cover at most 14 days/)).toBeTruthy();
+  });
+
+  it('waits for the cube before fetching rhythm and clients when a provider filter is active', async () => {
+    const cube = api.hold('GET', '/management/insights/cube');
+    mount('/insights?provider=codex');
+    await cube.arrived;
+    expect(api.requests.filter((request) => request.path === '/management/insights/rhythm')).toHaveLength(0);
+    expect(api.requests.filter((request) => request.path === '/management/insights/clients')).toHaveLength(0);
+
+    cube.release(CUBE);
+    await waitFor(() => expect(api.requests.filter((request) => request.path === '/management/insights/rhythm')).toHaveLength(1));
+    await waitFor(() => expect(api.requests.filter((request) => request.path === '/management/insights/clients')).toHaveLength(1));
+    const rhythm = api.requests.find((request) => request.path === '/management/insights/rhythm');
+    const clients = api.requests.find((request) => request.path === '/management/insights/clients');
+    expect(rhythm?.query.getAll('auth_index')).toEqual(['c1']);
+    expect(clients?.query.getAll('auth_index')).toEqual(['c1']);
+  });
+
+  it('ranks clients over every credential of a connection while one client narrows the cube', async () => {
+    // The connection served by c1 and c2; the chosen client only ever used c1.
+    const c2Row = row(1, 1, 1, 4, 400);
+    c2Row[5] = 1;
+    const allClients: InsightsCubeResponse = {
+      ...CUBE,
+      dims: { ...CUBE.dims, credentials: [{ auth_index: 'c1', auth_type: 'oauth' }, { auth_index: 'c2', auth_type: 'oauth' }] },
+      rows: [...CUBE.rows, c2Row],
+    };
+    api.on('GET', '/management/insights/cube', (request) => (request.query.has('client_agent') ? CUBE : allClients));
+    mount('/insights?provider=codex&client=claude-code');
+    await waitFor(() => expect(api.requests.some((request) => request.path === '/management/insights/clients')).toBe(true));
+    const rhythm = await waitFor(() => {
+      const found = api.requests.find((request) => request.path === '/management/insights/rhythm');
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    const clients = api.requests.filter((request) => request.path === '/management/insights/clients');
+    expect(rhythm.query.getAll('auth_index')).toEqual(['c1']);
+    expect(rhythm.query.getAll('client_agent')).toEqual(['claude-code']);
+    expect(clients.map((request) => request.query.getAll('auth_index'))).toEqual([['c1', 'c2']]);
+    expect(clients[0]!.query.has('client_agent')).toBe(false);
+    // A client's request list reads like its ranking row: every credential of the connection.
+    const panel = await screen.findByTestId('insights-ranking-client');
+    await waitFor(() => expect(within(panel).getByText('Claude Code')).toBeTruthy());
+    const viewRequests = within(within(panel).getAllByRole('listitem')[1]!).getByRole('button', { name: 'View requests' });
+    await waitFor(() => expect((viewRequests as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(viewRequests);
+    await waitFor(() => expect(lastPath).toBe('/usage/events'));
+    expect(new URLSearchParams(lastSearch).getAll('auth_index')).toEqual(['c1', 'c2']);
   });
 });
 
