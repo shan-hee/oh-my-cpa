@@ -58,6 +58,7 @@ import { LoadFailure, Notice } from '../feedback';
 import { EmptyState } from '../common/EmptyState';
 import { AppDrawer } from '../common/AppDrawer';
 import { CopyButton } from '../common/CopyButton';
+import { StatusLabel } from '../common/StatusLabel';
 import './UsageEventDrawer.css';
 import './requestMarks.css';
 import { Tooltip } from '../common/Tooltip';
@@ -329,10 +330,9 @@ export const UsageEventDrawer: React.FC<UsageEventDrawerProps> = ({
                   </Tooltip>
                 )}
               </div>
-              <span className={`request-result ${event.failed ? 'is-failed' : 'is-success'}`}>
-                <i />
+              <StatusLabel tone={event.failed ? 'danger' : 'success'} className="request-result">
                 {t(event.failed ? 'events.filter_failed' : 'events.filter_success')}
-              </span>
+              </StatusLabel>
             </div>
             <div className="request-detail-id">
               <time dateTime={new Date(event.timestamp_ms).toISOString()}>

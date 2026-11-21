@@ -193,50 +193,31 @@ describe('trends page', () => {
     expect(within(within(screen.getByTestId('trends-quota-window')).getByRole('radio', { name: /5 hours/ })).getByRole('img', { name: 'Hits limit' })).toBeTruthy();
   });
 
-  it('zooms and pans the quota chart via wheel modifiers and starts each window on its whole cycle', async () => {
+  it('keeps the full cycle fixed on both trends charts without drag-brush or wheel zoom', async () => {
     mount();
-    const chart = await screen.findByTestId('trends-quota-chart', {}, { timeout: 5000 });
-    expect(screen.queryByTestId('trends-quota-lens')).toBeNull();
-    expect(screen.queryByTestId('trends-perf-window')).toBeNull();
+    const quotaChart = await screen.findByTestId('trends-quota-chart', {}, { timeout: 5000 });
+    const perfChart = await screen.findByTestId('trends-perf-chart', {}, { timeout: 5000 });
+    expect(quotaChart.querySelector('[data-testid="trends-quota-sweep"]')).toBeNull();
+    expect(quotaChart.querySelector('.omc-bucket-brush')).toBeNull();
+    expect(perfChart.querySelector('.omc-bucket-brush')).toBeNull();
+
+    // Neither plain nor modifier wheel events are intercepted to zoom or pan.
+    expect(fireEvent.wheel(quotaChart, { deltaY: 100 })).toBe(true);
+    expect(fireEvent.wheel(quotaChart, { deltaY: -460, clientX: 400, ctrlKey: true })).toBe(true);
+    expect(fireEvent.wheel(quotaChart, { deltaY: 200, shiftKey: true })).toBe(true);
+
+    // Dragging across the quota chart does not enter sweep mode or narrow the cycle bounds.
+    fireEvent.pointerDown(quotaChart, { pointerId: 1, button: 0, buttons: 1, clientX: 120, clientY: 80 });
+    fireEvent.pointerMove(quotaChart, { pointerId: 1, buttons: 1, clientX: 360, clientY: 80 });
+    expect(quotaChart.hasAttribute('data-sweeping')).toBe(false);
+    fireEvent.pointerUp(quotaChart, { pointerId: 1, button: 0, clientX: 360, clientY: 80 });
+
     const readout = screen.getByTestId('trends-quota-readout');
-
-    // A plain wheel is left to scroll the page.
-    expect(fireEvent.wheel(chart, { deltaY: 100 })).toBe(true);
-
-    // Ctrl with the wheel zooms in around the pointer: only 2h (60.0%) and the 3h milestone (100%) stay visible.
-    expect(fireEvent.wheel(chart, { deltaY: -460, clientX: 400, ctrlKey: true })).toBe(false);
-    fireEvent.keyDown(chart, { key: 'Home' });
-    expect(within(readout).getByText('60.0%')).toBeTruthy();
-    fireEvent.keyDown(chart, { key: 'End' });
-    expect(within(readout).getByText('100%')).toBeTruthy();
-    expect(within(readout).getByText(/Projected to hit the limit/)).toBeTruthy();
-    fireEvent.keyDown(chart, { key: 'Escape' });
-
-    // Shift with the wheel pans toward the end of the cycle without zooming out to 0h.
-    expect(fireEvent.wheel(chart, { deltaY: 200, shiftKey: true })).toBe(false);
-    fireEvent.keyDown(chart, { key: 'Home' });
-    expect(within(readout).getByText('100%')).toBeTruthy();
-    fireEvent.keyDown(chart, { key: 'End' });
-    expect(within(readout).getByText('140%')).toBeTruthy();
-    fireEvent.keyDown(chart, { key: 'Escape' });
-
-    // Ctrl with positive wheel delta zooms back out to the whole cycle.
-    expect(fireEvent.wheel(chart, { deltaY: 1000, clientX: 400, ctrlKey: true })).toBe(false);
-    fireEvent.keyDown(chart, { key: 'Home' });
+    fireEvent.keyDown(quotaChart, { key: 'Home' });
     expect(within(readout).getByText('0.0%')).toBeTruthy();
-    fireEvent.keyDown(chart, { key: 'Escape' });
-
-    // Another window opens on its own whole cycle even if the previous window was zoomed in.
-    expect(fireEvent.wheel(chart, { deltaY: -460, clientX: 400, ctrlKey: true })).toBe(false);
-    fireEvent.click(within(screen.getByTestId('trends-quota-window')).getByRole('radio', { name: 'Weekly' }));
-    await waitFor(() => expect(screen.getByTestId('trends-quota-used').textContent).toBe('12.0%'));
-    const weeklyChart = await screen.findByTestId('trends-quota-chart');
-    const weeklyReadout = screen.getByTestId('trends-quota-readout');
-    fireEvent.keyDown(weeklyChart, { key: 'Home' });
-    expect(within(weeklyReadout).getByText('0.0%')).toBeTruthy();
-    fireEvent.keyDown(weeklyChart, { key: 'End' });
-    expect(within(weeklyReadout).getByText('140%')).toBeTruthy();
-    fireEvent.keyDown(weeklyChart, { key: 'Escape' });
+    fireEvent.keyDown(quotaChart, { key: 'End' });
+    expect(within(readout).getByText('140%')).toBeTruthy();
+    fireEvent.keyDown(quotaChart, { key: 'Escape' });
   });
 
   it('keeps each panel mode in the URL and drills into the request list', async () => {
@@ -456,7 +437,11 @@ describe('trends page', () => {
     fireEvent.click(retryBtn);
     await waitFor(() => expect(screen.getByTestId('trends-quota-used').textContent).toBe('60.0%'));
     await waitFor(() => expect(screen.getByTestId('trends-tile-movers').textContent).toContain('4.5K'));
-    await waitFor(() => expect(screen.getByTestId('trends-tile-delivery').textContent).toContain('90.0%'));
+    await waitFor(() => {
+      const delivery = screen.getByTestId('trends-tile-delivery').textContent ?? '';
+      expect(delivery).toContain('90.0%');
+      expect(delivery).toContain('2 errors');
+    });
   });
 
   it('resets bucket=hour to auto when the active range exceeds 14 days', async () => {
@@ -552,7 +537,7 @@ describe('trends page', () => {
   it('steps stability lane buckets with arrow keys and exposes bucket time and count to assistive tech', async () => {
     mount();
     const lane = await screen.findByTestId('trends-lane-rate_limited_429', {}, { timeout: 5000 });
-    const cells = within(lane).getAllByRole('img');
+    const cells = within(lane.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
     expect(cells).toHaveLength(3);
     expect(cells[0]!.tabIndex).toBe(0);
     expect(cells[1]!.tabIndex).toBe(-1);
@@ -596,10 +581,6 @@ describe('trends page', () => {
             projectedExhaustAtMs={win.projected_exhaust_at_ms}
             projectedEndPercent={140}
             label="Quota trend"
-            viewStart={0}
-            viewEnd={5 * HOUR}
-            minSpan={HOUR}
-            onLensChange={() => undefined}
           />
         </ThemeProvider>
       );
@@ -715,7 +696,7 @@ describe('trends page', () => {
 
       mount('/trends?group=provider&provider=codex');
       const lane = await screen.findByTestId('trends-lane-rate_limited_429', {}, { timeout: 5000 });
-      const cells = within(lane).getAllByRole('img');
+      const cells = within(lane.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
       expect(cells).toHaveLength(3);
       const track = lane.querySelector('[role="group"]') as HTMLElement;
       expect(track.style.gridTemplateColumns).toBe(`${3 * HOUR}fr ${3 * HOUR}fr ${4 * HOUR}fr`);
@@ -747,5 +728,577 @@ describe('trends page', () => {
       win.__OMCPA_CONFIG__ = previousConfig;
       observeSpy.mockRestore();
     }
+  });
+
+  it('attributes failures by model/provider/credential, narrows to a clicked bucket, and inspects upstream error details in a drawer', async () => {
+    const windowFailureGroups = [
+      {
+        model: 'gpt-5',
+        provider: 'codex',
+        auth_index: 'c1',
+        total_requests: 10,
+        model_total_requests: 12,
+        provider_total_requests: 15,
+        credential_total_requests: 10,
+        failed_requests: 1,
+        rate_limited_429: 1,
+        upstream_5xx: 0,
+        stream_truncated: 0,
+        force_cooldown: 0,
+        other_failures: 0,
+        status_codes: [{ code: 429, count: 1 }],
+        last_failed_at_ms: HOUR + 120_000,
+      },
+      {
+        model: 'claude-sonnet',
+        provider: 'anthropic',
+        auth_index: 'c2',
+        total_requests: 5,
+        model_total_requests: 8,
+        provider_total_requests: 5,
+        credential_total_requests: 5,
+        failed_requests: 1,
+        rate_limited_429: 0,
+        upstream_5xx: 1,
+        stream_truncated: 0,
+        force_cooldown: 0,
+        other_failures: 0,
+        status_codes: [{ code: 503, count: 1 }],
+        last_failed_at_ms: 2 * HOUR + 60_000,
+      },
+    ];
+
+    api.on('GET', '/management/trends/telemetry', (request) => {
+      // Clicking the 01:00–02:00 cell sends a bounded slice query with top=1.
+      if (request.query.get('top') === '1' && request.query.get('from') === String(HOUR)) {
+        return {
+          ...TELEMETRY,
+          failure_groups: [windowFailureGroups[0]!],
+          substitution_pairs: [],
+        };
+      }
+      return {
+        ...TELEMETRY,
+        failure_groups: windowFailureGroups,
+      };
+    });
+    api.on('GET', '/usage/events', () => ({
+      window: { from: HOUR, to: 2 * HOUR - 1 },
+      items: [
+        {
+          id: 901,
+          event_key: 'ev-901',
+          request_id: 'req-429-01',
+          timestamp_ms: HOUR + 120_000,
+          provider: 'codex',
+          auth_index: 'c1',
+          model: 'gpt-5',
+          failed: true,
+          fail_status_code: 429,
+          generate: true,
+          latency_ms: 420,
+          tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+          has_request_log: false,
+        },
+      ],
+      has_more: false,
+      limit: 20,
+    }));
+    api.on('GET', '/usage/events/901', () => ({
+      event: {
+        id: 901,
+        event_key: 'ev-901',
+        request_id: 'req-429-01',
+        timestamp_ms: HOUR + 120_000,
+        provider: 'codex',
+        auth_index: 'c1',
+        model: 'gpt-5',
+        failed: true,
+        fail_status_code: 429,
+        fail_code: 'force_cooldown',
+        fail_body: '{"error":"quota rate limit exceeded"}',
+        generate: true,
+        latency_ms: 420,
+        tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+        has_request_log: false,
+      },
+      related_errors: [],
+      partial_errors: ['related_errors'],
+    }));
+
+    mount();
+    const attribution = await screen.findByTestId('trends-failure-attribution', {}, { timeout: 5000 });
+    expect(within(attribution).getAllByTestId('trends-failure-row')).toHaveLength(2);
+    expect(within(attribution).getByRole('columnheader', { name: 'Model' })).toBeTruthy();
+    expect(within(attribution).getByRole('columnheader', { name: 'Provider' })).toBeTruthy();
+    expect(within(attribution).getByRole('columnheader', { name: 'Causes' })).toBeTruthy();
+    expect(within(attribution).getByRole('columnheader', { name: 'Failures' })).toBeTruthy();
+    expect(within(attribution).getByRole('columnheader', { name: 'Failure rate' })).toBeTruthy();
+    // Failures and failure rate sit in separate table cells so digits align independently across rows.
+    const modelRowCells = within(within(attribution).getAllByTestId('trends-failure-row')[0]!).getAllByRole('cell');
+    expect(modelRowCells).toHaveLength(6);
+    expect(modelRowCells[3]!.textContent).toBe('1');
+    expect(modelRowCells[4]!.textContent).toBe('12.5%');
+    expect(within(attribution).getByText('gpt-5')).toBeTruthy();
+    expect(within(attribution).getByText('claude-sonnet')).toBeTruthy();
+
+    // Switch breakdown dimension to Credential without extra network calls.
+    const stability = screen.getByTestId('trends-stability');
+    fireEvent.click(within(stability).getByRole('radio', { name: 'Credential' }));
+    expect(within(attribution).getByRole('columnheader', { name: 'Credential' })).toBeTruthy();
+    expect(within(attribution).getByRole('columnheader', { name: 'Provider & model' })).toBeTruthy();
+    expect(within(attribution).getByText('c1')).toBeTruthy();
+    expect(within(attribution).getByText('c2')).toBeTruthy();
+
+    // Click the non-zero 01:00 cell in the 429 lane to focus that slice.
+    const lane429 = screen.getByTestId('trends-lane-rate_limited_429');
+    const laneCells = within(lane429.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+    fireEvent.click(laneCells[1]!);
+
+    const scopeBar = await screen.findByTestId('trends-stability-scope');
+    expect(within(scopeBar).getByText('01-01 01:00')).toBeTruthy();
+    await waitFor(() => {
+      expect(within(screen.getByTestId('trends-failure-attribution')).getAllByTestId('trends-failure-row')).toHaveLength(1);
+    });
+
+    // Open the in-place investigation drawer for the focused credential row.
+    fireEvent.click(within(screen.getByTestId('trends-failure-attribution')).getByTestId('trends-failure-inspect'));
+    const drawer = await screen.findByTestId('trends-stability-drawer');
+    const eventList = await within(drawer).findByTestId('trends-stability-event-list');
+    const usageEventsReq = api.requests.find((req) => req.path === '/usage/events');
+    expect(usageEventsReq?.query.get('result')).toBe('failed');
+    expect(usageEventsReq?.query.get('failure')).toBe('rate_limited_429');
+    expect(usageEventsReq?.query.get('auth_index')).toBe('c1');
+    expect(usageEventsReq?.query.get('from')).toBe(String(HOUR));
+    expect(usageEventsReq?.query.get('to')).toBe(String(2 * HOUR - 1));
+
+    // Expanding the failed request lazy-loads /usage/events/901 and renders the upstream error body
+    // plus a warning notice when related_errors correlation partially failed.
+    const details = eventList.querySelector('details') as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event('toggle'));
+    expect(await within(drawer).findByText('{"error":"quota rate limit exceeded"}')).toBeTruthy();
+    expect(within(drawer).getByTestId('trends-stability-related-partial')).toBeTruthy();
+
+    // Footer CTA opens Request records with the exact narrowed scope.
+    fireEvent.click(within(drawer).getByTestId('trends-stability-open-events'));
+    await waitFor(() => expect(lastPath).toBe('/usage/events'));
+    const navParams = new URLSearchParams(lastSearch);
+    expect(navParams.get('result')).toBe('failed');
+    expect(navParams.get('failure')).toBe('rate_limited_429');
+    expect(navParams.get('auth_index')).toBe('c1');
+    expect(navParams.get('from')).toBe(String(HOUR));
+    expect(navParams.get('to')).toBe(String(2 * HOUR - 1));
+  });
+
+  it('hides stale whole-window rows while a slice is pending, preserves focus across open-ended live polls, and keeps drawer scope atomic', async () => {
+    const wholeGroups = [
+      {
+        model: 'gpt-5',
+        provider: 'codex',
+        auth_index: 'c1',
+        total_requests: 10,
+        model_total_requests: 10,
+        provider_total_requests: 10,
+        credential_total_requests: 10,
+        failed_requests: 1,
+        rate_limited_429: 1,
+        upstream_5xx: 0,
+        stream_truncated: 0,
+        force_cooldown: 0,
+        other_failures: 0,
+        status_codes: [{ code: 429, count: 1 }],
+        last_failed_at_ms: HOUR + 120_000,
+      },
+      {
+        model: 'afternoon-only-model',
+        provider: 'anthropic',
+        auth_index: 'c2',
+        total_requests: 5,
+        model_total_requests: 5,
+        provider_total_requests: 5,
+        credential_total_requests: 5,
+        failed_requests: 1,
+        rate_limited_429: 1,
+        upstream_5xx: 0,
+        stream_truncated: 0,
+        force_cooldown: 0,
+        other_failures: 0,
+        status_codes: [{ code: 429, count: 1 }],
+        last_failed_at_ms: 2 * HOUR + 60_000,
+      },
+    ];
+    let pollShiftMs = 0;
+    const liveTelemetry = () => ({
+      ...TELEMETRY,
+      window: { ...WINDOW, from: WINDOW.from + pollShiftMs, to: WINDOW.to + pollShiftMs, open_end: true },
+      failure_groups: wholeGroups,
+    });
+    api.on('GET', '/management/trends/telemetry', (request) => {
+      if (request.query.get('top') === '1') {
+        return { ...liveTelemetry(), failure_groups: [wholeGroups[0]!], substitution_pairs: [] };
+      }
+      return liveTelemetry();
+    });
+    api.on('GET', '/usage/events', () => ({ window: { from: HOUR, to: 2 * HOUR - 1 }, items: [], has_more: false, limit: 20 }));
+
+    const { client } = mount();
+    const initialList = await screen.findByTestId('trends-failure-attribution', {}, { timeout: 5000 });
+    expect(within(initialList).getByText('afternoon-only-model')).toBeTruthy();
+
+    // Hold the slice telemetry response: whole-window afternoon-only-model must NOT show for the morning cell.
+    const heldSlice = api.hold('GET', '/management/trends/telemetry');
+    const lane429 = screen.getByTestId('trends-lane-rate_limited_429');
+    const cells = within(lane429.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+    fireEvent.click(cells[1]!);
+
+    await heldSlice.arrived;
+    expect(screen.getByTestId('trends-stability-slice-loading')).toBeTruthy();
+    expect(screen.queryByTestId('trends-failure-attribution')).toBeNull();
+    expect((screen.getByTestId('trends-stability-inspect-scope') as HTMLButtonElement).disabled).toBe(true);
+
+    // Release slice response: only gpt-5 renders.
+    heldSlice.release({ ...liveTelemetry(), failure_groups: [wholeGroups[0]!], substitution_pairs: [] });
+    const sliceList = await screen.findByTestId('trends-failure-attribution');
+    expect(within(sliceList).getByText('gpt-5')).toBeTruthy();
+    expect(within(sliceList).queryByText('afternoon-only-model')).toBeNull();
+
+    // Open the drawer, then trigger a live poll that advances open-ended from/to: focus persists
+    // and the drawer remains locked to the clicked cell scope without mixing whole-window groups.
+    fireEvent.click(screen.getByTestId('trends-stability-inspect-scope'));
+    const drawer = await screen.findByTestId('trends-stability-drawer');
+    expect(within(drawer).getByText('01-01 01:00')).toBeTruthy();
+
+    pollShiftMs = 60_000;
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['trends-telemetry'] });
+    });
+    await waitFor(() => expect(screen.getByTestId('trends-stability-scope')).toBeTruthy());
+    expect(within(screen.getByTestId('trends-stability-scope')).getByText('01-01 01:00')).toBeTruthy();
+    expect(within(drawer).queryByText('afternoon-only-model')).toBeNull();
+  });
+
+  it('disables Trends filter actions in demo mode, fetches all cell events for demo rates, and marks unsupported demo lanes unavailable', async () => {
+    const win = window as unknown as { __OMCPA_CONFIG__?: { demo?: boolean } };
+    const previousConfig = win.__OMCPA_CONFIG__;
+    win.__OMCPA_CONFIG__ = { ...previousConfig, demo: true };
+    try {
+      api.on('GET', '/management/trends/telemetry', () => ({
+        ...TELEMETRY,
+        summary: { ...TELEMETRY.summary, stream_truncated: 1 },
+        buckets: TELEMETRY.buckets.map((b, i) => ({
+          ...b,
+          total_requests: i === 1 ? 10 : b.total_requests,
+          stream_truncated: i === 1 ? 1 : 0,
+        })),
+        failure_groups: [
+          {
+            model: 'gpt-5',
+            provider: 'codex',
+            auth_index: 'c1',
+            total_requests: 10,
+            model_total_requests: 10,
+            provider_total_requests: 10,
+            credential_total_requests: 10,
+            failed_requests: 1,
+            rate_limited_429: 1,
+            upstream_5xx: 0,
+            stream_truncated: 1,
+            force_cooldown: 0,
+            other_failures: 0,
+            status_codes: [{ code: 429, count: 1 }],
+            last_failed_at_ms: HOUR + 120_000,
+          },
+        ],
+      }));
+      api.on('GET', '/usage/events', () => ({
+        window: { from: HOUR, to: 2 * HOUR - 1 },
+        // Partial/capped demo capture (2 items out of 10 cell requests): rate must stay omitted.
+        items: [
+          {
+            id: 101,
+            event_key: 'demo-101',
+            timestamp_ms: HOUR + 120_000,
+            provider: 'codex',
+            auth_index: 'c1',
+            model: 'gpt-5',
+            failed: true,
+            fail_status_code: 429,
+            generate: true,
+            latency_ms: 200,
+            tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+            has_request_log: false,
+          },
+          {
+            id: 102,
+            event_key: 'demo-102',
+            timestamp_ms: HOUR + 180_000,
+            provider: 'codex',
+            auth_index: 'c1',
+            model: 'gpt-5',
+            failed: false,
+            generate: true,
+            latency_ms: 200,
+            tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+            has_request_log: false,
+          },
+        ],
+        has_more: false,
+        limit: 200,
+      }));
+
+      mount();
+      const attribution = await screen.findByTestId('trends-failure-attribution', {}, { timeout: 5000 });
+      const firstRow = within(attribution).getAllByTestId('trends-failure-row')[0]!;
+      // Entity name is NOT a Trends filter button in demo mode, while Inspect & View Requests stay enabled.
+      expect(within(firstRow).queryByRole('button', { name: 'gpt-5' })).toBeNull();
+      expect((within(firstRow).getByTestId('trends-failure-inspect') as HTMLButtonElement).disabled).toBe(false);
+      const eventsBtn = within(firstRow).getByTestId('trends-failure-events') as HTMLButtonElement;
+      expect(eventsBtn.disabled).toBe(false);
+
+      // Clicking a 429 cell in demo mode reads result=all and omits failure rate because only 2 of 10 requests were captured.
+      const lane429 = screen.getByTestId('trends-lane-rate_limited_429');
+      const cells429 = within(lane429.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+      fireEvent.click(cells429[1]!);
+
+      await waitFor(() => {
+        const req = api.requests.find((r) => r.path === '/usage/events');
+        expect(req?.query.get('result')).toBe('all');
+        expect(req?.query.get('replay')).toBe('calendar');
+      });
+      const slicedTable = await screen.findByTestId('trends-failure-attribution');
+      expect(within(slicedTable).queryByRole('columnheader', { name: 'Failure rate' })).toBeNull();
+      const slicedRow = within(slicedTable).getAllByTestId('trends-failure-row')[0]!;
+      expect(within(slicedRow).getAllByRole('cell')).toHaveLength(5);
+      expect(slicedRow.textContent).not.toMatch(/%/);
+      expect(screen.getByTestId('trends-attribution-partial')).toBeTruthy();
+
+      // Clicking a model_substituted cell with partial Demo capture shows the partial-capture notice even when 0 pairs were captured.
+      const laneSub = screen.getByTestId('trends-lane-model_substituted');
+      const cellsSub = within(laneSub.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+      fireEvent.click(cellsSub[1]!);
+      expect(await screen.findByTestId('trends-substitutions-partial')).toBeTruthy();
+
+      // Clicking a stream_truncated cell in demo mode reports slice attribution unavailable instead of fabricating zeros.
+      const laneTrunc = screen.getByTestId('trends-lane-stream_truncated');
+      const cellsTrunc = within(laneTrunc.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+      fireEvent.click(cellsTrunc[1]!);
+      expect(await screen.findByText('Per-interval details for this failure type are not captured in the demo')).toBeTruthy();
+
+      // View Requests link on a drillable Demo scope navigates with replay=calendar.
+      fireEvent.click(screen.getByTestId('trends-stability-clear-focus'));
+      const freshRow = (await within(await screen.findByTestId('trends-failure-attribution')).findAllByTestId('trends-failure-row'))[0]!;
+      fireEvent.click(within(freshRow).getByTestId('trends-failure-events'));
+      await waitFor(() => expect(lastPath).toBe('/usage/events'));
+      expect(new URLSearchParams(lastSearch).get('replay')).toBe('calendar');
+    } finally {
+      win.__OMCPA_CONFIG__ = previousConfig;
+    }
+  });
+
+  it('preserves selected cell interval across track resize, bounds open-ended lane drawers, retries substitution slice errors, and labels unassigned credentials', async () => {
+    let resizeCb: ((rect: { width: number; height: number }) => void) | null = null;
+    const observeSpy = vi.spyOn(sharedResizeObserverHub, 'observe').mockImplementation((_el, callback) => {
+      resizeCb = callback;
+      callback({ width: 100, height: 20 });
+      return () => { resizeCb = null; };
+    });
+    const buckets9h = Array.from({ length: 9 }, (_, index) =>
+      telemetryBucket(index * HOUR, {
+        rate_limited_429: index === 1 ? 2 : 0,
+        model_substituted: index === 2 ? 1 : 0,
+      }),
+    );
+    const unassignedGroup = {
+      model: 'gpt-5',
+      provider: 'codex',
+      auth_index: '',
+      total_requests: 2,
+      model_total_requests: 10,
+      provider_total_requests: 10,
+      failed_requests: 2,
+      rate_limited_429: 2,
+      upstream_5xx: 0,
+      stream_truncated: 0,
+      force_cooldown: 0,
+      other_failures: 0,
+      status_codes: [{ code: 429, count: 2 }],
+      last_failed_at_ms: HOUR + 60_000,
+    };
+    let subSliceFailuresRemaining = 2;
+    api.on('GET', '/management/trends/telemetry', (request) => {
+      if (request.query.get('top') === '1' && request.query.get('from') === String(2 * HOUR)) {
+        if (subSliceFailuresRemaining > 0) {
+          subSliceFailuresRemaining -= 1;
+          throw new Error('slice boom');
+        }
+        return {
+          ...TELEMETRY,
+          window: { ...WINDOW, from: 0, to: 9 * HOUR - 1, open_end: true },
+          buckets: buckets9h,
+          failure_groups: [],
+          substitution_pairs: [{ requested_model: 'gpt-5', served_model: 'gpt-5-mini', provider: 'codex', count: 1 }],
+        };
+      }
+      return {
+        ...TELEMETRY,
+        window: { ...WINDOW, from: 0, to: 9 * HOUR - 1, open_end: true },
+        buckets: buckets9h,
+        failure_groups: [unassignedGroup],
+      };
+    });
+    api.on('GET', '/usage/events', () => ({ window: { from: 0, to: 9 * HOUR - 1 }, items: [], has_more: false, limit: 20 }));
+
+    try {
+      mount();
+      const lane429 = await screen.findByTestId('trends-lane-rate_limited_429', {}, { timeout: 5000 });
+      const cells = within(lane429.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+      expect(cells).toHaveLength(9);
+
+      // Select bucket 1 (01:00–02:00), then narrow track to force 3 regrouped cells (0, 3, 6).
+      fireEvent.click(cells[1]!);
+      await waitFor(() => expect(within(screen.getByTestId('trends-stability-scope')).getByText('01-01 01:00')).toBeTruthy());
+
+      act(() => resizeCb?.({ width: 8, height: 20 }));
+      await waitFor(() => expect(within(lane429.querySelector('[role="group"]') as HTMLElement).getAllByRole('button')).toHaveLength(3));
+      // Scope bar and drawer still retain the exact 01:00–02:00 interval instead of widening to the full window,
+      // and the scope count comes from the matching slice response once the displayed cell is regrouped.
+      expect(within(screen.getByTestId('trends-stability-scope')).getByText('01-01 01:00')).toBeTruthy();
+      expect(within(screen.getByTestId('trends-stability-scope')).getByText('1 time')).toBeTruthy();
+
+      // Switch to Credential dimension and inspect the unassigned credential: message must say unassigned, not redacted.
+      const stability = screen.getByTestId('trends-stability');
+      fireEvent.click(within(stability).getByRole('radio', { name: 'Credential' }));
+      fireEvent.click(within(await screen.findByTestId('trends-failure-attribution')).getByTestId('trends-failure-inspect'));
+      const unassignedDrawer = await screen.findByTestId('trends-stability-drawer');
+      expect(within(unassignedDrawer).getByText('Unassigned records cannot be filtered by credential')).toBeTruthy();
+      fireEvent.click(within(unassignedDrawer).getByRole('button', { name: /Close/i }));
+
+      // Open a lane drawer without a selected cell on an open-ended window: query uses closed captured `to`.
+      act(() => resizeCb?.({ width: 100, height: 20 }));
+      fireEvent.click(screen.getByTestId('trends-stability-clear-focus'));
+      fireEvent.click(screen.getByTestId('trends-lane-toggle-rate_limited_429'));
+      fireEvent.click(screen.getByTestId('trends-stability-inspect-scope'));
+      await screen.findByTestId('trends-stability-drawer');
+      await waitFor(() => {
+        const req = api.requests.find((r) => r.path === '/usage/events');
+        expect(req?.query.get('to')).toBe(String(9 * HOUR - 1));
+      });
+      fireEvent.click(within(screen.getByTestId('trends-stability-drawer')).getByRole('button', { name: /Close/i }));
+
+      // Click a substitution cell whose slice read fails once: section stays mounted with retry, and drawer omits "Last seen".
+      const laneSub = screen.getByTestId('trends-lane-model_substituted');
+      const subCells = within(laneSub.querySelector('[role="group"]') as HTMLElement).getAllByRole('button');
+      fireEvent.click(subCells[2]!);
+      const retryBtn = await within(stability).findByRole('button', { name: /Retry/i });
+      fireEvent.click(retryBtn);
+      expect(await within(stability).findByTestId('trends-substitutions')).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId('trends-stability-inspect-scope'));
+      const subDrawer = await screen.findByTestId('trends-stability-drawer');
+      expect(within(subDrawer).queryByText('Last seen')).toBeNull();
+    } finally {
+      observeSpy.mockRestore();
+    }
+  });
+
+  it('distinguishes CPA unreachability with an inline Retry action both with and without stored snapshots', async () => {
+    let phase: 'offline_empty' | 'offline_cached' | 'online' = 'offline_empty';
+    api.on('GET', '/management/trends/quota', () => {
+      if (phase === 'offline_empty') {
+        return {
+          ...QUOTA,
+          summary: { ...QUOTA.summary, active_credentials: 0, observable_windows: 0, is_membership_unknown: true },
+          items: [],
+        };
+      }
+      if (phase === 'offline_cached') {
+        return {
+          ...QUOTA,
+          summary: { ...QUOTA.summary, active_credentials: 0, is_membership_unknown: true },
+          items: [{
+            ...QUOTA.items[0]!,
+            status: 'unknown',
+            windows: [{ ...QUOTA.items[0]!.windows[0]!, status: 'normal', projected_exhaust_at_ms: undefined, projected_end_percent: undefined, burn_rate_per_hour: undefined }],
+          }],
+        };
+      }
+      return QUOTA;
+    });
+
+    mount();
+    const emptyNotice = await screen.findByTestId('trends-quota-stale-notice', {}, { timeout: 5000 });
+    expect(emptyNotice.textContent).toContain('Cannot reach CPA');
+    expect(emptyNotice.textContent).toContain('Subscription quota cannot be read');
+    expect(screen.getByTestId('trends-tile-quota').textContent).toContain('—');
+    expect(screen.queryByTestId('trends-quota-notice-refresh')).toBeNull();
+
+    phase = 'offline_cached';
+    fireEvent.click(screen.getByTestId('trends-quota-notice-retry'));
+    await waitFor(() => expect(screen.getByTestId('trends-quota-stale-notice').textContent).toContain('Showing the reading observed at'));
+    expect(screen.getByTestId('trends-tile-quota').textContent).toContain('—');
+    expect(screen.queryByTestId('trends-quota-notice-refresh')).toBeNull();
+
+    phase = 'online';
+    fireEvent.click(screen.getByTestId('trends-quota-notice-retry'));
+    await waitFor(() => expect(screen.queryByTestId('trends-quota-stale-notice')).toBeNull());
+    expect(screen.getByTestId('trends-tile-quota').textContent).toContain('1');
+  });
+
+  it('refreshes a stale quota credential directly from the notice, links management-quota cache, and reports failures', async () => {
+    const sseFrame = (event: string, data: unknown) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    let isStale = true;
+    api.on('GET', '/management/trends/quota', () => (
+      isStale
+        ? {
+            ...QUOTA,
+            items: [{
+              ...QUOTA.items[0]!,
+              status: 'stale',
+              windows: [{ ...QUOTA.items[0]!.windows[0]!, status: 'normal', projected_exhaust_at_ms: undefined, projected_end_percent: undefined, burn_rate_per_hour: undefined }],
+            }],
+          }
+        : QUOTA
+    ));
+    const heldRefresh = api.hold('POST', '/management/quota/refresh');
+
+    const { client } = mount();
+    client.setQueryData(['management-quota'], { quotas: [] });
+    const notice = await screen.findByTestId('trends-quota-stale-notice', {}, { timeout: 5000 });
+    expect(notice.textContent).not.toContain('Cannot reach CPA');
+    const refreshBtn = screen.getByTestId('trends-quota-notice-refresh');
+
+    // Rapid second click must not start a duplicate refresh while the first is in flight.
+    fireEvent.click(refreshBtn);
+    fireEvent.click(refreshBtn);
+    const refreshReq = await heldRefresh.arrived;
+    expect(refreshReq.body).toEqual({ auth_indexes: ['c1'] });
+    expect(api.writes('/management/quota/refresh')).toHaveLength(1);
+
+    // First attempt fails upstream: notice stays visible and failure reason is reported.
+    heldRefresh.release(new Response(
+      sseFrame('quota', { auth_index: 'c1', name: 'c1.json', status: 'error', error: 'HTTP 401 token expired' }) +
+      sseFrame('done', { status: 'ok', total: 1 }),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8' } },
+    ));
+    const failureReport = await screen.findByTestId('quota-operation-report', {}, { timeout: 5000 });
+    expect(failureReport.textContent).toContain('Team Codex');
+    expect(failureReport.textContent).toContain('HTTP 401 token expired');
+    expect(screen.getByTestId('trends-quota-stale-notice')).toBeTruthy();
+    expect(client.getQueryState(['management-quota'])?.isInvalidated).toBe(true);
+
+    // Second attempt succeeds: both caches invalidate and the stale notice clears.
+    client.setQueryData(['management-quota'], { quotas: [] });
+    api.on('POST', '/management/quota/refresh', () => {
+      isStale = false;
+      return new Response(
+        sseFrame('quota', { auth_index: 'c1', name: 'c1.json', status: 'healthy' }) +
+        sseFrame('done', { status: 'ok', total: 1 }),
+        { status: 200, headers: { 'Content-Type': 'text/event-stream; charset=utf-8' } },
+      );
+    });
+    fireEvent.click(screen.getByTestId('trends-quota-notice-refresh'));
+    await waitFor(() => expect(screen.queryByTestId('trends-quota-stale-notice')).toBeNull());
+    expect(client.getQueryState(['management-quota'])?.isInvalidated).toBe(true);
   });
 });

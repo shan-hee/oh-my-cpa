@@ -1,4 +1,5 @@
 import React from 'react';
+import { Button } from '@/components/ui/button';
 import { Select } from '@/components/ui/select';
 import { Segmented } from '@/components/ui/segmented';
 import { Panel } from '../../../components/common/Panel';
@@ -10,7 +11,7 @@ import { AttentionDot } from '../../../components/common/AttentionDot';
 import { ChartLinesPlaceholder } from '../../../components/common/PageLoading';
 import { LoadFailure } from '../../../components/feedback';
 import { CredentialMark } from '../../../components/LobeIcon';
-import { HistoryOutlined, LoginOutlined } from '../../../components/icons';
+import { HistoryOutlined, LoginOutlined, ReloadOutlined, SyncOutlined } from '../../../components/icons';
 import { usePluginMultiPortalKeys, usePluginOAuthLogos } from '../../../hooks/usePluginOAuthLogos';
 import { credentialBrandIdentity } from '../../../types/credentialIdentity';
 import { useT } from '../../../i18n';
@@ -18,7 +19,7 @@ import dayjs from '../../../utils/time';
 import { useTimeZone } from '../../../utils/TimeZoneProvider';
 import { useTokenDisplayStyle } from '../../../types/tokenDisplayContext';
 import { formatTokens } from '../../../types/tokenDisplay';
-import type { TrendsQuotaResponse } from '../../../types/trends';
+import type { TrendsQuotaCredential, TrendsQuotaResponse } from '../../../types/trends';
 import { LazyQuotaBurnChart as QuotaBurnChart, LazyQuotaCyclesChart as QuotaCyclesChart } from '../../../charts/lazyCharts';
 import {
   QUOTA_VIEWS,
@@ -29,16 +30,14 @@ import {
   pickQuotaWindow,
   quotaCycleBars,
   quotaDivider,
-  clampLens,
   quotaEventsHref,
-  quotaLensMinSpan,
+  quotaNoticeState,
   quotaCredentialName as credentialName,
   quotaWindowName,
   quotaWindowNames,
   quotaCredentialAttention,
   quotaWindowAttention,
   type QuotaView,
-  type TimeSpan,
 } from '../trendsLogic';
 import { Notice } from '../../../components/feedback';
 import { TrendsValue } from '../useTrendsIdentity';
@@ -49,6 +48,8 @@ export interface QuotaBurnPanelProps {
   isLoading: boolean;
   error: unknown;
   onRetry: () => void;
+  onRefreshQuota?: (credential: TrendsQuotaCredential) => void;
+  refreshingQuotaIndexes?: ReadonlySet<string>;
   credentialId?: string;
   windowId?: string;
   view: QuotaView;
@@ -64,7 +65,7 @@ export interface QuotaBurnPanelProps {
  * reads the window now - how much is used, when it resets, how fast it burns and where it lands.
  */
 export const QuotaBurnPanel: React.FC<QuotaBurnPanelProps> = ({
-  data, isLoading, error, onRetry, credentialId, windowId, view, onChange, onNavigate, nowMs, resolveNowMs,
+  data, isLoading, error, onRetry, onRefreshQuota, refreshingQuotaIndexes, credentialId, windowId, view, onChange, onNavigate, nowMs, resolveNowMs,
 }) => {
   useTimeZone();
   const t = useT();
@@ -81,17 +82,7 @@ export const QuotaBurnPanel: React.FC<QuotaBurnPanelProps> = ({
   );
   const points = React.useMemo(() => (picked ? buildQuotaBurnSeries(picked.window) : []), [picked]);
   const cycles = React.useMemo(() => (picked ? quotaCycleBars(picked.window, cycleMeasure) : []), [cycleMeasure, picked]);
-
-  // The lens belongs to one credential's window: picking another starts on its whole cycle.
   const drawingKey = picked ? `${picked.credential.auth_index}:${picked.window.window_id}` : '';
-  const [lensState, setLensState] = React.useState<{ key: string; lens: TimeSpan } | null>(null);
-  const bounds = React.useMemo<TimeSpan | null>(
-    () => (picked ? { start: picked.window.cycle_start_ms, end: picked.window.cycle_reset_ms } : null),
-    [picked],
-  );
-  const minSpan = picked ? quotaLensMinSpan(picked.window) : 0;
-  const lens = bounds && lensState?.key === drawingKey ? clampLens(lensState.lens, bounds, minSpan) : bounds;
-  const setLens = React.useCallback((next: TimeSpan) => setLensState({ key: drawingKey, lens: next }), [drawingKey]);
 
   const countdown = (ms: number) => {
     const parts = countdownParts(ms);
@@ -136,30 +127,79 @@ export const QuotaBurnPanel: React.FC<QuotaBurnPanelProps> = ({
       if (error) return <LoadFailure title={t('trends.quota.error_title')} error={error} onRetry={onRetry} />;
       return <div className="chart-placeholder" style={{ height: 300 }} aria-hidden="true"><ChartLinesPlaceholder height={300} kind="trend" /></div>;
     }
+    const isMembershipUnknown = Boolean(data.summary.is_membership_unknown);
     if (!picked) {
+      if (isMembershipUnknown) {
+        return (
+          <Notice
+            tone="warning"
+            data-testid="trends-quota-stale-notice"
+            description={t('trends.quota.cpa_unreachable_empty_notice')}
+            action={(
+              <Button
+                size="sm"
+                icon={<ReloadOutlined />}
+                loading={isLoading}
+                onClick={onRetry}
+                data-testid="trends-quota-notice-retry"
+              >
+                {t('common.retry')}
+              </Button>
+            )}
+          />
+        );
+      }
       return <EmptyState size="compact" title={t('trends.quota.empty')} description={t('trends.quota.empty_hint')} />;
     }
     const { credential, window } = picked;
     const windows = chartableWindows(credential);
     const isPhysicalUnavailable = Boolean(window.is_physical_unavailable);
     const eventsHref = isPhysicalUnavailable ? null : quotaEventsHref(credential.auth_index, window, nowMs);
-    const isStaleOrExpired = ['stale', 'error', 'unavailable', 'disabled', 'unknown'].includes(credential.status) || window.cycle_reset_ms <= nowMs;
+    const notice = quotaNoticeState(credential, window, isMembershipUnknown, nowMs);
+    const isRefreshingCredential = Boolean(refreshingQuotaIndexes?.has(credential.auth_index));
     const isExhausted = window.exhausted_at_ms !== undefined;
     // A projection past the reset is no exhaustion this cycle.
     const projectedExhaustAt = !isExhausted && window.projected_exhaust_at_ms !== undefined && window.projected_exhaust_at_ms < window.cycle_reset_ms
       ? window.projected_exhaust_at_ms
       : undefined;
     const activeWindowLabel = windowLabels.get(window.window_id) ?? quotaWindowName(window, t, windows);
+    const showCycleMeasure = view === 'cycles' && !isPhysicalUnavailable && cycles.length > 0;
     return (
-      <div className={styles['panel-body']}>
-        {isStaleOrExpired && (
+      <div className={`${styles['panel-body']} ${styles['quota-body']}`}>
+        {notice && (
           <Notice
             tone="warning"
             data-testid="trends-quota-stale-notice"
-            description={t('trends.quota.stale_notice', { at: dayjs(credential.observed_at_ms).format('MM-DD HH:mm') })}
+            description={t(
+              notice.kind === 'cpa_unreachable'
+                ? 'trends.quota.cpa_unreachable_notice'
+                : 'trends.quota.stale_notice',
+              { at: dayjs(credential.observed_at_ms).format('MM-DD HH:mm') },
+            )}
+            action={notice.kind === 'cpa_unreachable' ? (
+              <Button
+                size="sm"
+                icon={<ReloadOutlined />}
+                loading={isLoading}
+                onClick={onRetry}
+                data-testid="trends-quota-notice-retry"
+              >
+                {t('common.retry')}
+              </Button>
+            ) : notice.canRefreshQuota && onRefreshQuota ? (
+              <Button
+                size="sm"
+                icon={<SyncOutlined />}
+                loading={isRefreshingCredential}
+                onClick={() => onRefreshQuota(credential)}
+                data-testid="trends-quota-notice-refresh"
+              >
+                {t('quota.btn_refresh_quota')}
+              </Button>
+            ) : undefined}
           />
         )}
-        <div className={styles['quota-pickers']}>
+        <div className={styles['quota-toolbar']}>
           <Select
             size="small"
             className={styles['quota-credential-select']}
@@ -195,104 +235,115 @@ export const QuotaBurnPanel: React.FC<QuotaBurnPanelProps> = ({
               />
             </div>
           )}
+          <div className={styles['quota-toolbar-end']}>
+            {showCycleMeasure && (
+              <Segmented
+                size="sm"
+                className={styles['cycle-measure']}
+                value={cycleMeasure}
+                onChange={(next) => setCycleMeasure(next as 'net_tokens' | 'requests')}
+                aria-label={t('trends.quota.cycle_measure')}
+                options={[
+                  { value: 'net_tokens', label: t('trends.metric.net_tokens') },
+                  { value: 'requests', label: t('trends.metric.requests') },
+                ]}
+              />
+            )}
+            <span className={styles['quota-links']}>
+              <ToolButton
+                size="sm"
+                variant="ghost"
+                className="row-action-btn"
+                icon={<LoginOutlined />}
+                label={t('trends.quota.open_credentials')}
+                onClick={() => onNavigate('/oauth-management')}
+              />
+              <ToolButton
+                size="sm"
+                variant="ghost"
+                className="row-action-btn"
+                icon={<HistoryOutlined />}
+                label={t('trends.view_requests')}
+                disabled={!eventsHref}
+                onClick={() => {
+                  const href = isPhysicalUnavailable
+                    ? null
+                    : quotaEventsHref(credential.auth_index, window, resolveNowMs?.() ?? nowMs);
+                  if (href) onNavigate(href);
+                }}
+                data-testid="trends-quota-events"
+              />
+            </span>
+          </div>
         </div>
-        <div className={styles['quota-head']}>
-          <dl className={styles['quota-figures']}>
+        <dl className={styles['quota-figures']}>
+          <div className={styles['quota-figure']}>
+            <dt>{t('trends.quota.used')}</dt>
+            <dd
+              data-tone={window.status === 'limit_reached' ? 'danger' : window.status === 'projected_exhaust' ? 'warn' : undefined}
+              data-testid="trends-quota-used"
+              {...tipCard({
+                rows: isPhysicalUnavailable
+                  ? [{ value: t('trends.quota.physical_unavailable'), tone: 'muted' }]
+                  : [
+                      { value: t('trends.quota.current_net', { value: formatTokens(window.current_net_tokens, style) }) },
+                      { value: t('trends.quota.current_requests', { n: window.current_requests.toLocaleString('en') }) },
+                    ],
+                notes: [
+                  t('trends.quota.observed', { at: dayjs(credential.observed_at_ms).format('MM-DD HH:mm') }),
+                  ...(window.is_approximate && !isPhysicalUnavailable ? [t('trends.quota.approximate_hint')] : []),
+                ],
+              })}
+            >
+              {formatPercent(window.used_percent)}
+            </dd>
+          </div>
+          {isExhausted ? (
             <div className={styles['quota-figure']}>
-              <dt>{t('trends.quota.used')}</dt>
-              <dd
-                data-tone={window.status === 'limit_reached' ? 'danger' : window.status === 'projected_exhaust' ? 'warn' : undefined}
-                data-testid="trends-quota-used"
-                {...tipCard({
-                  rows: isPhysicalUnavailable
-                    ? [{ value: t('trends.quota.physical_unavailable'), tone: 'muted' }]
-                    : [
-                        { value: t('trends.quota.current_net', { value: formatTokens(window.current_net_tokens, style) }) },
-                        { value: t('trends.quota.current_requests', { n: window.current_requests.toLocaleString('en') }) },
-                      ],
-                  notes: [
-                    t('trends.quota.observed', { at: dayjs(credential.observed_at_ms).format('MM-DD HH:mm') }),
-                    ...(window.is_approximate && !isPhysicalUnavailable ? [t('trends.quota.approximate_hint')] : []),
-                  ],
-                })}
-              >
-                {formatPercent(window.used_percent)}
-              </dd>
+              <dt>{t('trends.quota.fact.exhausted')}</dt>
+              <dd data-tone="danger">{instant(window.exhausted_at_ms!)}</dd>
             </div>
-            {isExhausted ? (
-              <div className={styles['quota-figure']}>
-                <dt>{t('trends.quota.fact.exhausted')}</dt>
-                <dd data-tone="danger">{instant(window.exhausted_at_ms!)}</dd>
-              </div>
-            ) : projectedExhaustAt !== undefined ? (
-              <div className={styles['quota-figure']}>
-                <dt>{t('trends.quota.fact.exhaust')}</dt>
-                <dd data-tone="warn">{instant(projectedExhaustAt)}</dd>
-              </div>
-            ) : window.projected_end_percent !== undefined ? (
-              <div className={styles['quota-figure']}>
-                <dt>{t('trends.quota.fact.projected_end')}</dt>
-                <dd>{formatPercent(window.projected_end_percent)}</dd>
-              </div>
-            ) : null}
-            {window.cycle_reset_ms > nowMs && (
-              <div className={styles['quota-figure']}>
-                <dt>{t('trends.quota.fact.reset')}</dt>
-                <dd data-tip={dayjs(window.cycle_reset_ms).format('YYYY-MM-DD HH:mm')}>{countdown(window.cycle_reset_ms - nowMs)}</dd>
-              </div>
-            )}
-            {window.burn_rate_per_hour !== undefined && (
-              <div className={styles['quota-figure']}>
-                <dt>{t('trends.quota.fact.burn')}</dt>
-                <dd>{t('trends.quota.fact.burn_value', { rate: formatPercent(window.burn_rate_per_hour, 2) })}</dd>
-              </div>
-            )}
-          </dl>
-          <span className={styles['quota-links']}>
-            <ToolButton
-              size="sm"
-              variant="ghost"
-              icon={<LoginOutlined />}
-              label={t('trends.quota.open_credentials')}
-              onClick={() => onNavigate('/oauth-management')}
-            />
-            <ToolButton
-              size="sm"
-              variant="ghost"
-              icon={<HistoryOutlined />}
-              label={t('trends.view_requests')}
-              disabled={!eventsHref}
-              onClick={() => {
-                const href = isPhysicalUnavailable
-                  ? null
-                  : quotaEventsHref(credential.auth_index, window, resolveNowMs?.() ?? nowMs);
-                if (href) onNavigate(href);
-              }}
-              data-testid="trends-quota-events"
-            />
-          </span>
-        </div>
+          ) : projectedExhaustAt !== undefined ? (
+            <div className={styles['quota-figure']}>
+              <dt>{t('trends.quota.fact.exhaust')}</dt>
+              <dd data-tone="warn">{instant(projectedExhaustAt)}</dd>
+            </div>
+          ) : window.projected_end_percent !== undefined ? (
+            <div className={styles['quota-figure']}>
+              <dt>{t('trends.quota.fact.projected_end')}</dt>
+              <dd>{formatPercent(window.projected_end_percent)}</dd>
+            </div>
+          ) : null}
+          {window.cycle_reset_ms > nowMs && (
+            <div className={styles['quota-figure']}>
+              <dt>{t('trends.quota.fact.reset')}</dt>
+              <dd data-tip={dayjs(window.cycle_reset_ms).format('YYYY-MM-DD HH:mm')}>{countdown(window.cycle_reset_ms - nowMs)}</dd>
+            </div>
+          )}
+          {window.burn_rate_per_hour !== undefined && (
+            <div className={styles['quota-figure']}>
+              <dt>{t('trends.quota.fact.burn')}</dt>
+              <dd>{t('trends.quota.fact.burn_value', { rate: formatPercent(window.burn_rate_per_hour, 2) })}</dd>
+            </div>
+          )}
+        </dl>
         {view === 'burn' ? (
           points.length === 0 ? (
             <EmptyState size="compact" title={t('trends.quota.no_buckets')} />
           ) : (
             <React.Suspense fallback={<div className="chart-placeholder" style={{ height: 260 }} aria-hidden="true" />}>
               <QuotaBurnChart
-                  drawingKey={drawingKey}
-                  points={points}
-                  cycleStart={window.cycle_start_ms}
-                  cycleReset={window.cycle_reset_ms}
-                  divider={quotaDivider(window)}
-                  nowMs={nowMs}
-                  projectedExhaustAtMs={projectedExhaustAt}
-                  projectedEndPercent={window.projected_end_percent}
-                  isPhysicalUnavailable={isPhysicalUnavailable}
-                  label={t('trends.quota.chart_label', { name: credentialName(credential), window: activeWindowLabel })}
-                  viewStart={lens!.start}
-                  viewEnd={lens!.end}
-                  minSpan={minSpan}
-                  onLensChange={setLens}
-                />
+                drawingKey={drawingKey}
+                points={points}
+                cycleStart={window.cycle_start_ms}
+                cycleReset={window.cycle_reset_ms}
+                divider={quotaDivider(window)}
+                nowMs={nowMs}
+                projectedExhaustAtMs={projectedExhaustAt}
+                projectedEndPercent={window.projected_end_percent}
+                isPhysicalUnavailable={isPhysicalUnavailable}
+                label={t('trends.quota.chart_label', { name: credentialName(credential), window: activeWindowLabel })}
+              />
             </React.Suspense>
           )
         ) : isPhysicalUnavailable ? (
@@ -300,22 +351,9 @@ export const QuotaBurnPanel: React.FC<QuotaBurnPanelProps> = ({
         ) : cycles.length === 0 ? (
           <EmptyState size="compact" title={t('trends.quota.no_cycles')} />
         ) : (
-          <>
-            <Segmented
-              size="sm"
-              className={styles['cycle-measure']}
-              value={cycleMeasure}
-              onChange={(next) => setCycleMeasure(next as 'net_tokens' | 'requests')}
-              aria-label={t('trends.quota.cycle_measure')}
-              options={[
-                { value: 'net_tokens', label: t('trends.metric.net_tokens') },
-                { value: 'requests', label: t('trends.metric.requests') },
-              ]}
-            />
-            <React.Suspense fallback={<div className="chart-placeholder" style={{ height: 260 }} aria-hidden="true" />}>
-              <QuotaCyclesChart cycles={cycles} measure={cycleMeasure} label={t('trends.quota.view.cycles')} />
-            </React.Suspense>
-          </>
+          <React.Suspense fallback={<div className="chart-placeholder" style={{ height: 260 }} aria-hidden="true" />}>
+            <QuotaCyclesChart cycles={cycles} measure={cycleMeasure} label={t('trends.quota.view.cycles')} />
+          </React.Suspense>
         )}
       </div>
     );

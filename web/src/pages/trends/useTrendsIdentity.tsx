@@ -7,7 +7,74 @@ import { ClientMark } from '../../components/common/ClientMark';
 import { CodeOutlined, KeyOutlined } from '../../components/icons';
 import { clientDisplayName } from '../../types/clientAgents';
 import { createInsightsLabelResolver } from '../../hooks/useInsightsLabels';
+import type { CredentialIndex, ProviderLookupEntry } from '../../types/usageEventIdentity';
 import styles from './trends.module.css';
+
+/** Where an operator manages a live provider or credential from Trends. */
+export interface TrendsManageTarget {
+  target: 'provider' | 'oauth';
+  href: string;
+}
+
+/**
+ * Resolves a live management link for a provider or credential, returning null for archived,
+ * unassigned, redacted, or ambiguous identities so the console never draws a dead shortcut.
+ */
+export function resolveTrendsManagementTarget(
+  dimension: 'provider' | 'credential',
+  rawId: string,
+  credentials: CredentialIndex,
+  configuredProviders: readonly ProviderLookupEntry[],
+): TrendsManageTarget | null {
+  const id = rawId.trim();
+  if (!id || id.startsWith('redacted:')) return null;
+  if (dimension === 'credential') {
+    const file = credentials.get(id);
+    if (file && !file.is_archived) {
+      return { target: 'oauth', href: `/oauth-management?q=${encodeURIComponent(id)}` };
+    }
+    const claiming = configuredProviders.filter(
+      (entry) => entry.auth_index === id || entry.auth_indexes?.includes(id),
+    );
+    if (claiming.length === 1 && claiming[0]!.id) {
+      return { target: 'provider', href: `/ai-providers?provider=${encodeURIComponent(claiming[0]!.id)}` };
+    }
+    return null;
+  }
+  const norm = id.toLowerCase();
+  const byId = configuredProviders.filter((entry) => entry.id.toLowerCase() === norm);
+  if (byId.length === 1 && byId[0]!.id) {
+    return { target: 'provider', href: `/ai-providers?provider=${encodeURIComponent(byId[0]!.id)}` };
+  }
+  if (byId.length > 1) return null;
+  const byName = configuredProviders.filter((entry) => {
+    const upstream = entry.upstream_name?.trim().toLowerCase();
+    return (
+      entry.name?.trim().toLowerCase() === norm ||
+      (upstream !== undefined && (upstream === norm || `openai-compatible-${upstream}` === norm))
+    );
+  });
+  if (byName.length === 1 && byName[0]!.id) {
+    return { target: 'provider', href: `/ai-providers?provider=${encodeURIComponent(byName[0]!.id)}` };
+  }
+  if (byName.length > 1) return null;
+  const familyMatches = configuredProviders.filter((entry) => entry.family?.toLowerCase() === norm);
+  if (familyMatches.length === 1 && familyMatches[0]!.id) {
+    return { target: 'provider', href: `/ai-providers?provider=${encodeURIComponent(familyMatches[0]!.id)}` };
+  }
+  if (familyMatches.length > 1) return null;
+  const oauthNorm = norm === 'anthropic' ? 'claude' : norm;
+  for (const file of credentials.values()) {
+    if (!file || file.is_archived) continue;
+    const candidates = [file.oauth_provider, file.provider, file.type]
+      .map((value) => value?.trim().toLowerCase())
+      .filter((value): value is string => Boolean(value));
+    if (candidates.includes(norm) || candidates.includes(oauthNorm)) {
+      return { target: 'oauth', href: `/oauth-management?provider=${encodeURIComponent(oauthNorm)}` };
+    }
+  }
+  return null;
+}
 
 /**
  * Every name a trends value arrives under: the server's `group_by` (`call_point`, `credential`, …)
@@ -25,9 +92,11 @@ export type TrendsNamed = string | { id: string; label?: string; alias?: string;
 
 export interface TrendsIdentity {
   /** The value's mark: a model's maker, a provider's or credential's brand, a client's logo, the key glyph. */
-  mark: (dimension: string, id: string) => React.ReactNode;
+  mark: (dimension: string, id: string, size?: number) => React.ReactNode;
   /** The name a reader knows the value by, the same one the request list and Insights print. */
   label: (dimension: string, value: TrendsNamed) => string;
+  /** Live management shortcut for a provider or credential, when the target is currently configured. */
+  manage: (dimension: 'provider' | 'credential', id: string) => TrendsManageTarget | null;
 }
 
 function shortIndexTag(id: string): string {
@@ -76,18 +145,18 @@ export function useTrendsIdentity(): TrendsIdentity {
 
   return React.useMemo<TrendsIdentity>(() => {
     return {
-      mark: (dimension, id) => {
+      mark: (dimension, id, size) => {
         if (!id) return null;
         switch (dimension) {
           case 'model':
           case 'call_point':
           case 'model_alias':
-            return renderMark('model', id);
+            return renderMark('model', id, size);
           case 'provider':
-            return renderMark('provider', id);
+            return renderMark('provider', id, size);
           case 'credential':
           case 'auth_index':
-            return renderMark('auth_index', id);
+            return renderMark('auth_index', id, size);
           case 'key':
           case 'api_key':
             return <KeyOutlined aria-hidden="true" />;
@@ -120,8 +189,9 @@ export function useTrendsIdentity(): TrendsIdentity {
             return item.alias?.trim() || given || item.id;
         }
       },
+      manage: (dimension, id) => resolveTrendsManagementTarget(dimension, id, credentials, configuredProviders ?? []),
     };
-  }, [names, renderMark, t]);
+  }, [configuredProviders, credentials, names, renderMark, t]);
 }
 
 /** One value as the page prints it: its mark in a fixed box, then its name, truncated alone. */

@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -181,6 +182,17 @@ func TestTrendsTelemetryModesClassificationsAndRetention(t *testing.T) {
 	}
 	if len(result.SubstitutionPairs) != 1 || result.SubstitutionPairs[0] != (TrendsSubstitutionPairDTO{RequestedModel: "gpt-main", ServedModel: "gpt-served", Provider: "codex", Count: 1}) {
 		t.Fatalf("substitutions=%+v", result.SubstitutionPairs)
+	}
+	if len(result.FailureGroups) != 1 {
+		t.Fatalf("expected 1 failure group, got %+v", result.FailureGroups)
+	}
+	fg := result.FailureGroups[0]
+	if fg.Model != "gpt-error" || fg.Provider != "codex" || fg.FailedRequests != 5 || fg.TotalRequests != 5 || fg.ModelTotalRequests != 5 || fg.ProviderTotalRequests != 13 || fg.RateLimited429 != 2 || fg.Upstream5xx != 2 || fg.StreamTruncated != 1 || fg.ForceCooldown != 1 || fg.OtherFailures != 1 || fg.LastFailedAtMS != at.UnixMilli() {
+		t.Fatalf("unexpected failure group=%+v", fg)
+	}
+	wantCodes := []TrendsStatusCountDTO{{Code: 429, Count: 2}, {Code: 400, Count: 1}, {Code: 502, Count: 1}, {Code: 503, Count: 1}}
+	if !slices.Equal(fg.StatusCodes, wantCodes) {
+		t.Fatalf("failure status codes=%+v want %+v", fg.StatusCodes, wantCodes)
 	}
 	if err := repo.PutPreference(ctx, repository.PreferenceTpsCalculationMode, `"exclude_ttft"`); err != nil {
 		t.Fatal(err)
@@ -510,6 +522,64 @@ func TestTrendsRedactedGroupIDsRoundTripAndConsistentWindowBoundaries(t *testing
 	}
 	if len(telemetryResp.SubstitutionPairs) != 1 || strings.Contains(telemetryResp.SubstitutionPairs[0].ServedModel, "bob@example.com") {
 		t.Fatalf("substitution pair leaked email: %+v", telemetryResp.SubstitutionPairs)
+	}
+	// Verify failure attribution also redacts sensitive model/credential strings without losing opaque filter IDs.
+	failEvent := eventFor("redacted-fail-1", now.Add(-20*time.Second), usage.TokenStats{}, true)
+	failEvent.Model = "claude-alice@example.com-sk-ant-api03-secret"
+	failEvent.Provider = "anthropic"
+	failEvent.AuthIndex = "cred-carol@example.com"
+	failEvent.FailStatusCode = 429
+	if _, err := repo.InsertUsageEvents(ctx, []usage.Event{failEvent}); err != nil {
+		t.Fatal(err)
+	}
+	redactedFailResp := trendsTestRead[TrendsTelemetryResponseDTO](t, client, telemetryURL)
+	if len(redactedFailResp.FailureGroups) != 1 {
+		t.Fatalf("expected 1 redacted failure group, got %+v", redactedFailResp.FailureGroups)
+	}
+	rfg := redactedFailResp.FailureGroups[0]
+	if strings.Contains(rfg.Model, "alice@example.com") || strings.Contains(rfg.Model, "sk-ant-api03") || strings.Contains(rfg.AuthIndex, "carol@example.com") {
+		t.Fatalf("failure group leaked sensitive data: %+v", rfg)
+	}
+	if !strings.HasPrefix(rfg.ModelID, repository.TrendsRedactedPrefix) || !strings.HasPrefix(rfg.AuthIndexID, repository.TrendsRedactedPrefix) || rfg.DrillDisabled {
+		t.Fatalf("expected opaque redacted drill IDs on failure group, got %+v", rfg)
+	}
+	if rfg.CredentialTotalRequests != 1 || rfg.RateLimited429 != 1 {
+		t.Fatalf("unexpected redacted failure group counts: %+v", rfg)
+	}
+}
+
+func TestBoundFailureGroupsPreservesActiveLanesAndFlagsTruncation(t *testing.T) {
+	groups := make([]TrendsFailureGroupDTO, 0, maxTelemetryFailureGroups+2)
+	for i := range maxTelemetryFailureGroups + 1 {
+		groups = append(groups, TrendsFailureGroupDTO{
+			Model:          "gpt-5",
+			Provider:       "codex",
+			AuthIndex:      fmt.Sprintf("cred-%03d", i),
+			FailedRequests: 2,
+			Upstream5xx:    2,
+		})
+	}
+	// The lowest-total tuple is the sole 429 culprit; bounding must keep it and mark truncated.
+	groups = append(groups, TrendsFailureGroupDTO{
+		Model:          "gpt-5",
+		Provider:       "codex",
+		AuthIndex:      "sole-429",
+		FailedRequests: 1,
+		RateLimited429: 1,
+	})
+	bounded, truncated := boundFailureGroups(groups, maxTelemetryFailureGroups)
+	if !truncated || len(bounded) != maxTelemetryFailureGroups {
+		t.Fatalf("boundFailureGroups = (%d, %v), want (%d, true)", len(bounded), truncated, maxTelemetryFailureGroups)
+	}
+	foundSole429 := false
+	for _, g := range bounded {
+		if g.AuthIndex == "sole-429" {
+			foundSole429 = true
+			break
+		}
+	}
+	if !foundSole429 {
+		t.Fatalf("sole 429 culprit dropped by failure-group cap")
 	}
 }
 
@@ -1268,5 +1338,240 @@ func TestTrendsCodeRabbitRegressionInvariants(t *testing.T) {
 	afterReqs, afterToks := sumPhysical()
 	if afterReqs != 2 || afterToks != 15 {
 		t.Fatalf("after retention: got (%d reqs, %d tokens), want (2, 15)", afterReqs, afterToks)
+	}
+}
+
+func TestTrendsQuotaBatchLateReconcileLegacyAndCanonicalCapacity(t *testing.T) {
+	start := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	obs := start.Add(2 * time.Hour)
+	now := start.Add(3 * time.Hour)
+	reset := start.Add(5 * time.Hour)
+	const (
+		authCanon  = "quota-batch-canon"
+		authLegacy = "quota-batch-legacy"
+	)
+
+	client, baseURL, repo := startDashboardTestServer(t, trendsAuthFilesHandler([]map[string]any{
+		{"auth_index": authCanon, "name": "canon.json", "type": "claude", "provider": "claude", "account_type": "oauth"},
+		{"auth_index": authLegacy, "name": "legacy.json", "type": "codex", "provider": "codex", "account_type": "oauth"},
+	}, nil), func(handler *Handler) { handler.nowFn = func() time.Time { return now } })
+	ctx := context.Background()
+
+	// 1. Canonical v2 independent-cache row before observation (1000 raw input + 200 cache read = 1200 prompt, 16.7% cache rate),
+	// plus an unmatched alias row on the same credential to verify scoped UnmatchedRequests handling.
+	canonicalJSON := `{"version":2,"status":"complete","raw_tokens":{"input_tokens":1000,"output_tokens":300,"cache_read_tokens":200,"total_tokens":1500},"token_breakdown":{"schema_version":2,"quality":"complete","total_tokens":1500,"input":{"total_tokens":1200,"uncached_tokens":1000,"cache_read_tokens":200,"cache_write_tokens":0},"output":{"total_tokens":300,"non_reasoning_tokens":300,"reasoning_tokens":0},"unclassified_tokens":0}}`
+	if _, err := repo.SQL().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			instance_id, event_key, api_group_key, provider, model, response_model,
+			auth_index, auth_type, timestamp_ms, created_at_ms, latency_ms,
+			input_tokens, output_tokens, cache_read_tokens, total_tokens,
+			cost_nanos, pricing_status, token_accounting
+		) VALUES
+			('default', 'canon-sonnet', 'group', 'claude', 'fast-alias', 'claude-sonnet-4-6', ?, 'oauth', ?, ?, 0, 1000, 300, 200, 1500, 5000, 'priced', ?),
+			('default', 'canon-unknown', 'group', 'claude', 'mystery-alias', '', ?, 'oauth', ?, ?, 0, 100, 50, 0, 150, 1000, 'priced', NULL)`,
+		authCanon, start.Add(30*time.Minute).UnixMilli(), start.Add(30*time.Minute).UnixMilli(), canonicalJSON,
+		authCanon, start.Add(45*time.Minute).UnixMilli(), start.Add(45*time.Minute).UnixMilli(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	period, resetMS, used := 5.0, reset.UnixMilli(), 25.0
+	canonRaw, _ := json.Marshal([]quota.QuotaWindow{
+		{ID: "five_hour", Scope: "standard", Kind: "five_hour", PeriodHours: &period, UsedPercent: &used, ResetAtMS: &resetMS, ResetAccuracy: "exact"},
+		{ID: "seven_day_sonnet", Scope: "model", Model: "claude-sonnet-4-6", Kind: "weekly", PeriodHours: &period, UsedPercent: &used, ResetAtMS: &resetMS, ResetAccuracy: "exact"},
+		{ID: "code_review", Scope: "code_review", PeriodHours: &period, UsedPercent: &used, ResetAtMS: &resetMS, ResetAccuracy: "exact"},
+	})
+	if err := repo.SaveQuotaSnapshot(ctx, repository.QuotaSnapshotRecord{
+		ID: "batch-canon-snap", AuthIndex: authCanon, Provider: "claude", Status: "healthy",
+		ObservedAtMS: obs.UnixMilli(), CreatedAtMS: obs.UnixMilli(), WindowsJSON: string(canonRaw),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fold and prune canon-sonnet so live usage_events no longer carries it;
+	// the response must combine the stored calibration checkpoint with canon-late
+	// via watermark reconciliation rather than reading both from live usage_events.
+	if _, err := repo.AggregateUsageFacts(ctx, 100); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := repo.RunLifecycle(ctx, map[string]int64{repository.LifecycleUsageDetail: start.Add(time.Hour).UnixMilli()}, 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var remainingCanon int
+	if err := repo.SQL().QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events WHERE auth_index = ?`, authCanon).Scan(&remainingCanon); err != nil {
+		t.Fatal(err)
+	}
+	if remainingCanon != 0 {
+		t.Fatalf("expected canon pre-snapshot rows to be pruned, found %d", remainingCanon)
+	}
+
+	// Late-arriving row inserted AFTER the snapshot (id > UsageWatermarkID) that completed before obs.
+	if _, err := repo.SQL().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			instance_id, event_key, api_group_key, provider, model, response_model,
+			auth_index, auth_type, timestamp_ms, created_at_ms, latency_ms,
+			input_tokens, output_tokens, cache_read_tokens, total_tokens, cost_nanos, pricing_status
+		) VALUES ('default', 'canon-late', 'group', 'claude', 'claude-sonnet-4-6', '', ?, 'oauth', ?, ?, 0, 400, 100, 0, 500, 2000, 'priced')`,
+		authCanon, start.Add(90*time.Minute).UnixMilli(), now.UnixMilli(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Legacy unwatermarked calibration row (UsageWatermarkID == 0, HasUsageGap == true)
+	// with a mid-cycle reset (40% -> 10% -> 30%). The stored reset baseline is stale
+	// (0 reqs / 0 tokens), while retained usage has 1 req (100 tokens) before the reset
+	// and 2 reqs (200 tokens) after it. Repairing the legacy reset baseline yields
+	// dUsed = 20%, dTokens = 200 -> 1000 capacity (versus 300/20% = 1500 unrepaired).
+	legacyUsed := 30.0
+	legacyRaw, _ := json.Marshal([]quota.QuotaWindow{
+		{ID: "five_hour", Scope: "standard", Kind: "five_hour", PeriodHours: &period, UsedPercent: &legacyUsed, ResetAtMS: &resetMS, ResetAccuracy: "exact"},
+	})
+	if err := repo.SaveQuotaSnapshot(ctx, repository.QuotaSnapshotRecord{
+		ID: "batch-legacy-snap", AuthIndex: authLegacy, Provider: "codex", Status: "healthy",
+		ObservedAtMS: obs.UnixMilli(), CreatedAtMS: obs.UnixMilli(), WindowsJSON: string(legacyRaw),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacyPoints, _ := json.Marshal([]quota.CalibrationPoint{
+		{ObservedAtMS: start.Add(40 * time.Minute).UnixMilli(), UsedPercent: 40, Requests: 1, Tokens: 100, HasUsageGap: true},
+		{ObservedAtMS: start.Add(60 * time.Minute).UnixMilli(), UsedPercent: 10, Requests: 0, Tokens: 0, HasUsageGap: true},
+		{ObservedAtMS: obs.UnixMilli(), UsedPercent: 30, Requests: 1, Tokens: 100, HasUsageGap: true},
+	})
+	if _, err := repo.SQL().ExecContext(ctx, `
+		UPDATE quota_capacity_cycles SET points_json = ? WHERE auth_index = ?`,
+		string(legacyPoints), authLegacy,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.SQL().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			instance_id, event_key, api_group_key, provider, model, auth_index, auth_type,
+			timestamp_ms, created_at_ms, input_tokens, output_tokens, total_tokens, cost_nanos, pricing_status
+		) VALUES
+			('default', 'legacy-pre-reset', 'group', 'codex', 'gpt-5', ?, 'oauth', ?, ?, 80, 20, 100, 500, 'priced'),
+			('default', 'legacy-post-reset-1', 'group', 'codex', 'gpt-5', ?, 'oauth', ?, ?, 80, 20, 100, 500, 'priced'),
+			('default', 'legacy-post-reset-2', 'group', 'codex', 'gpt-5', ?, 'oauth', ?, ?, 80, 20, 100, 500, 'priced')`,
+		authLegacy, start.Add(30*time.Minute).UnixMilli(), start.Add(30*time.Minute).UnixMilli(),
+		authLegacy, start.Add(75*time.Minute).UnixMilli(), start.Add(75*time.Minute).UnixMilli(),
+		authLegacy, start.Add(90*time.Minute).UnixMilli(), start.Add(90*time.Minute).UnixMilli(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := trendsTestRead[TrendsQuotaResponseDTO](t, client, baseURL+"/omc/api/v1/management/trends/quota")
+	if len(resp.Items) != 2 {
+		t.Fatalf("expected 2 credentials, got %d", len(resp.Items))
+	}
+	byAuth := map[string]TrendsQuotaCredentialDTO{}
+	for _, item := range resp.Items {
+		byAuth[item.AuthIndex] = item
+	}
+
+	canonItem := byAuth[authCanon]
+	if len(canonItem.Windows) != 3 {
+		t.Fatalf("canon windows=%+v", canonItem.Windows)
+	}
+	sonnetWin := canonItem.Windows[1]
+	// Pruned canon-sonnet checkpoint (1200 prompt, 200 cache, 1500 total) + reconciled canon-late (400 prompt, 0 cache, 500 total)
+	// = 2 reqs, 2000 tokens, 1600 prompt, 200 cache -> 12.5% cache rate.
+	if sonnetWin.CurrentUsage == nil || sonnetWin.CurrentUsage.Requests != 2 || sonnetWin.CurrentUsage.Tokens != 2000 ||
+		sonnetWin.CurrentUsage.PromptTokens != 1600 || sonnetWin.CurrentUsage.CachedTokens != 200 ||
+		sonnetWin.CurrentUsage.CacheRate == nil || *sonnetWin.CurrentUsage.CacheRate != 12.5 {
+		t.Fatalf("canonical + late scoped usage mismatch: %+v", sonnetWin.CurrentUsage)
+	}
+	if sonnetWin.Capacity == nil || sonnetWin.Capacity.Requests != 8 || sonnetWin.Capacity.Tokens != 8000 {
+		t.Fatalf("canonical + late scoped capacity mismatch: %+v", sonnetWin.Capacity)
+	}
+	if !canonItem.Windows[2].IsPhysicalUnavailable || canonItem.Windows[2].CurrentRequests != 0 {
+		t.Fatalf("feature window should keep zero physical usage: %+v", canonItem.Windows[2])
+	}
+
+	legacyItem := byAuth[authLegacy]
+	if len(legacyItem.Windows) != 1 {
+		t.Fatalf("legacy windows=%+v", legacyItem.Windows)
+	}
+	legacyWin := legacyItem.Windows[0]
+	if legacyWin.CurrentUsage == nil || legacyWin.CurrentUsage.Requests != 3 || legacyWin.CurrentUsage.Tokens != 300 {
+		t.Fatalf("legacy reconciled usage mismatch: %+v", legacyWin.CurrentUsage)
+	}
+	// Post-reset delta: (3 - 1) reqs = 2 reqs, (300 - 100) tokens = 200 tokens over (30 - 10)% = 20% -> 10 reqs / 1000 tokens capacity.
+	if legacyWin.Capacity == nil || legacyWin.Capacity.Requests != 10 || legacyWin.Capacity.Tokens != 1000 {
+		t.Fatalf("legacy mid-cycle reset repaired capacity mismatch: %+v", legacyWin.Capacity)
+	}
+}
+
+func TestTrendsQuotaTieBreakOrderAndCaseInsensitiveEndpointPartition(t *testing.T) {
+	start := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	obs := start.Add(2 * time.Hour)
+	now := start.Add(3 * time.Hour)
+	reset := start.Add(5 * time.Hour)
+	const authID = "quota-tie-ep"
+
+	client, baseURL, repo := startDashboardTestServer(t, trendsAuthFilesHandler([]map[string]any{
+		{"auth_index": authID, "name": "tie.json", "type": "codex", "provider": "codex", "account_type": "oauth"},
+	}, nil), func(handler *Handler) { handler.nowFn = func() time.Time { return now } })
+	ctx := context.Background()
+
+	// Legacy row with empty provider/executor and uppercase /v1/MESSAGES endpoint:
+	// SQL LIKE '%/v1/messages%' treats it as independent Anthropic semantics (2),
+	// so prompt = 100 + 40 = 140, completion = 20 -> effectiveTotal = 160, net = 160 - 40 = 120.
+	if _, err := repo.SQL().ExecContext(ctx, `
+		INSERT INTO usage_events (
+			instance_id, event_key, api_group_key, provider, executor_type, endpoint, model,
+			auth_index, auth_type, timestamp_ms, created_at_ms, latency_ms,
+			input_tokens, output_tokens, cache_read_tokens, total_tokens, pricing_status
+		) VALUES ('default', 'upper-ep', 'group', '', '', '/v1/MESSAGES', 'claude-sonnet-4-6', ?, 'oauth', ?, ?, 0, 100, 20, 40, 120, 'priced')`,
+		authID, start.Add(30*time.Minute).UnixMilli(), start.Add(30*time.Minute).UnixMilli(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pin both ObservedAtMS and CreatedAtMS across two snapshots (20% then 90%)
+	// at a historical timestamp, followed by a newer snapshot at a distinct timestamp.
+	// GetQuotaSnapshotHistoryBatch must preserve rowid DESC tie-breaking so the
+	// historical burn bucket at the tied timestamp reflects 90% rather than 20%.
+	tiedObs := start.Add(time.Hour)
+	period, resetMS := 5.0, reset.UnixMilli()
+	saveSnap := func(id string, at time.Time, used float64) {
+		raw, _ := json.Marshal([]quota.QuotaWindow{
+			{ID: "five_hour", Scope: "standard", Kind: "five_hour", PeriodHours: &period, UsedPercent: &used, ResetAtMS: &resetMS, ResetAccuracy: "exact"},
+		})
+		if err := repo.SaveQuotaSnapshot(ctx, repository.QuotaSnapshotRecord{
+			ID: id, AuthIndex: authID, Provider: "codex", Status: "healthy",
+			ObservedAtMS: at.UnixMilli(), CreatedAtMS: at.UnixMilli(), WindowsJSON: string(raw),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	saveSnap("snap-tie-1", tiedObs, 20)
+	saveSnap("snap-tie-2", tiedObs, 90)
+	saveSnap("snap-latest", obs, 95)
+
+	resp := trendsTestRead[TrendsQuotaResponseDTO](t, client, baseURL+"/omc/api/v1/management/trends/quota")
+	if len(resp.Items) != 1 || len(resp.Items[0].Windows) != 1 {
+		t.Fatalf("unexpected items: %+v", resp.Items)
+	}
+	win := resp.Items[0].Windows[0]
+	if win.UsedPercent != 95 {
+		t.Fatalf("expected latest snapshot used_percent=95, got %v", win.UsedPercent)
+	}
+	// Find the burn bucket ending at tiedObs (whose cumulative UsedPercent is
+	// evaluated at EndMS == tiedObs) and verify it recorded 90% (not 20%).
+	var tiedBucket *TrendsQuotaBucketDTO
+	for i := range win.Buckets {
+		b := &win.Buckets[i]
+		if b.EndMS == tiedObs.UnixMilli() {
+			tiedBucket = b
+			break
+		}
+	}
+	if tiedBucket == nil || tiedBucket.UsedPercent != 90 {
+		t.Fatalf("expected historical tied bucket ending at tiedObs used_percent=90 via rowid DESC tie-break, got %+v", tiedBucket)
+	}
+	if win.CurrentNetTokens != 120 || win.CurrentTotalTokens != 160 {
+		t.Fatalf("case-insensitive /v1/MESSAGES partition mismatch: net=%d total=%d, want net=120 total=160",
+			win.CurrentNetTokens, win.CurrentTotalTokens)
 	}
 }

@@ -5,19 +5,16 @@ import {
   HOUR_LIMIT_MS,
   availablePerfGroups,
   buildQuotaBurnSeries,
-  clampLens,
   countdownParts,
-  deliveryFailureCauses,
   filterGroupByForKey,
   filterKeyForGroupBy,
   formatPercent,
   hasStabilityActivity,
   isRangeWithinHourLimit,
   latencySeriesRows,
-  lensFromSweep,
   nearestPointIndex,
   omitTrendsFilter,
-  panLens,
+  percentReadout,
   percentileRows,
   perfBucketsHaveSamples,
   perfModeHasSamples,
@@ -31,12 +28,20 @@ import {
   quotaCycleBars,
   quotaDivider,
   quotaEventsHref,
-  quotaLensMinSpan,
+  quotaNoticeState,
   quotaWindowName,
   readTrendsView,
   resolvePerfBuckets,
+  aggregateStabilityFailures,
+  deriveFailureGroupsFromEvents,
+  deriveSubstitutionPairsFromEvents,
+  stabilityDemoSliceEventsQueryString,
   stabilityDisplayBuckets,
+  stabilityEventsHref,
+  stabilityCellWeight,
   stabilityLanes,
+  stabilitySliceTelemetryParams,
+  stabilityWindowForCell,
   stepPointIndex,
   substitutionEventsHref,
   successRate,
@@ -49,12 +54,12 @@ import {
   trendsWindowParams,
   usageGroupBy,
   writeTrendsView,
-  zoomLens,
   GLOBAL_SERIES_ID,
 } from '../../src/pages/trends/trendsLogic.ts';
+import { resolveTrendsManagementTarget } from '../../src/pages/trends/useTrendsIdentity.tsx';
 import { readEventQuery } from '../../src/types/usageEventQuery.ts';
 import { MAX_USAGE_EVENT_FILTER_VALUES } from '../../src/types/usageEvents.ts';
-import type { TrendsQuotaCredential, TrendsQuotaWindow, TrendsTelemetryBucket } from '../../src/types/trends.ts';
+import type { TrendsFailureGroup, TrendsQuotaCredential, TrendsQuotaWindow, TrendsTelemetryBucket } from '../../src/types/trends.ts';
 import type { TFunc } from '../../src/i18n/index.tsx';
 import { CATALOGS } from '../../src/i18n/resources.ts';
 import { formatMessage } from '../../src/i18n/format.ts';
@@ -250,6 +255,13 @@ test('telemetry gaps stay gaps and stability lanes count each failure kind', () 
   assert.equal(formatPercent(0.9 * 100), '90.0%');
   assert.equal(successRate({ total_requests: 0, success_requests: 0 }), null);
 
+  // A cell's tint follows the share of its requests the lane caught, so a stray failure stays faint.
+  assert.equal(stabilityCellWeight(0, 100), 0);
+  assert.ok(stabilityCellWeight(1, 1000) < 30);
+  assert.ok(stabilityCellWeight(1, 1000) < stabilityCellWeight(10, 1000));
+  assert.equal(stabilityCellWeight(20, 100), stabilityCellWeight(100, 100));
+  assert.equal(stabilityCellWeight(3, 0), stabilityCellWeight(100, 100));
+
   // Performance latency filtering resolves in-memory top series or an on-demand item read.
   const modelBucket = telemetryBucket(0, { ttft_p50_ms: 250, ttft_p95_ms: 400, ttft_samples: 2 });
   const tailBucket = telemetryBucket(0, { latency_p50_ms: 1800, latency_p95_ms: 2900, latency_samples: 4 });
@@ -347,29 +359,6 @@ test('trends drill links open the request list on the records the page counted',
   assert.equal(finished.get('to'), String(5 * HOUR));
 });
 
-test('the quota lens zooms, pans and sweeps inside its cycle', () => {
-  const bounds = { start: 0, end: 10 * HOUR };
-  const min = quotaLensMinSpan(quotaWindow());
-  // One bucket of the cycle, never under a quarter hour.
-  assert.equal(min, HOUR);
-  assert.equal(quotaLensMinSpan({ ...quotaWindow(), buckets: [{ ...quotaWindow().buckets[0]!, end_ms: 60_000 }] }), 15 * 60_000);
-
-  // Zooming about an instant keeps that instant where it was on screen.
-  const zoomed = zoomLens(bounds, bounds, 0.5, min, 2 * HOUR);
-  assert.deepEqual(zoomed, { start: HOUR, end: 6 * HOUR });
-  assert.deepEqual(zoomLens(zoomed, bounds, 0.01, min), { start: 3 * HOUR, end: 4 * HOUR });
-  assert.deepEqual(zoomLens(zoomed, bounds, 4, min), bounds);
-
-  // A pan past an edge slides back to it without narrowing.
-  assert.deepEqual(panLens(zoomed, bounds, -3 * HOUR, min), { start: 0, end: 5 * HOUR });
-  assert.deepEqual(panLens(zoomed, bounds, 9 * HOUR, min), { start: 5 * HOUR, end: 10 * HOUR });
-
-  // A sweep reads either way, and one narrower than the minimum widens about its middle.
-  assert.deepEqual(lensFromSweep(4 * HOUR, 2 * HOUR, bounds, min), { start: 2 * HOUR, end: 4 * HOUR });
-  assert.deepEqual(lensFromSweep(HOUR, 1.2 * HOUR, bounds, min), { start: 0.6 * HOUR, end: 1.6 * HOUR });
-  assert.deepEqual(clampLens({ start: -HOUR, end: 20 * HOUR }, bounds, min), bounds);
-});
-
 test('the analytical hour bucket limit holds for ranges up to 14 days', () => {
   assert.equal(isRangeWithinHourLimit({ preset: '7d' }), true);
   assert.equal(isRangeWithinHourLimit({ preset: '30d' }), false);
@@ -426,7 +415,7 @@ test('trends quota window names follow OAuth management localization across all 
   );
 });
 
-test('quota tile targeting, delivery causes, performance mode samples, and stability aggregation stay consistent', () => {
+test('quota tile targeting, percentage readouts, performance mode samples, and stability aggregation stay consistent', () => {
   // Stale/expired/unknown credentials are excluded from forecastable risk and tile target selection
   // while historical readings remain openable via pickQuotaWindow.
   const staleLimit = credential('stale-1', [quotaWindow({ window_id: '5h', status: 'limit_reached', used_percent: 100 })]);
@@ -440,22 +429,18 @@ test('quota tile targeting, delivery causes, performance mode samples, and stabi
   assert.equal(pickForecastableQuotaWindow([unknownCred], 2 * HOUR), null);
   assert.equal(pickQuotaWindow([unknownCred], undefined, undefined)?.credential.auth_index, 'unknown-1');
 
-  // Delivery failure causes include forced cooldowns, rank failures before substitutions, and cap at 2.
-  const baseSummary = telemetryBucket(0, { total_requests: 10, success_requests: 8, failed_requests: 2 });
-  assert.deepEqual(
-    deliveryFailureCauses({ ...baseSummary, force_cooldown: 2, model_substituted: 5 }),
-    [
-      { key: 'force_cooldown', count: 2, tone: 'tone-danger' },
-      { key: 'substituted', count: 5, tone: 'tone-warn' },
-    ],
-  );
-  assert.deepEqual(
-    deliveryFailureCauses({ ...baseSummary, rate_limited_429: 1, upstream_5xx: 1, model_substituted: 3 }),
-    [
-      { key: 'rate_limited', count: 1, tone: 'tone-danger' },
-      { key: 'upstream_5xx', count: 1, tone: 'tone-danger' },
-    ],
-  );
+  // Percentage readouts mirror formatPercent rounding so the delivery tile rolls and aligns beside sibling tiles.
+  assert.equal(percentReadout(null), undefined);
+  assert.deepEqual(percentReadout(95.8), {
+    number: 95.8,
+    suffix: '%',
+    format: { minimumFractionDigits: 1, maximumFractionDigits: 1 },
+  });
+  assert.deepEqual(percentReadout(99.96), {
+    number: 100,
+    suffix: '%',
+    format: { minimumFractionDigits: 0, maximumFractionDigits: 0 },
+  });
 
   // Performance mode sample detection checks mode-specific drawability and excludes filter_disabled groups.
   const latencyOnlyBucket = telemetryBucket(0, { latency_samples: 4, latency_p50_ms: 900, latency_p95_ms: 1400 });
@@ -500,4 +485,275 @@ test('quota tile targeting, delivery causes, performance mode samples, and stabi
   const lanes = stabilityLanes(aggregated);
   assert.equal(lanes.find((l) => l.lane === 'rate_limited_429')?.total, 13);
   assert.equal(lanes.find((l) => l.lane === 'force_cooldown')?.total, 2);
+});
+
+test('stability failure attribution rolls up model, provider, credential and lane scopes with exact totals and ops links', () => {
+  const groups: TrendsFailureGroup[] = [
+    {
+      model: 'gpt-5',
+      provider: 'codex',
+      auth_index: 'cred-1',
+      total_requests: 20,
+      model_total_requests: 120,
+      provider_total_requests: 100,
+      credential_total_requests: 40,
+      failed_requests: 10,
+      rate_limited_429: 8,
+      upstream_5xx: 2,
+      stream_truncated: 0,
+      force_cooldown: 1,
+      other_failures: 0,
+      status_codes: [{ code: 429, count: 8 }, { code: 503, count: 2 }],
+      last_failed_at_ms: 2 * HOUR,
+    },
+    {
+      model: 'gpt-5',
+      provider: 'relay-a',
+      auth_index: '',
+      total_requests: 10,
+      model_total_requests: 120,
+      provider_total_requests: 50,
+      failed_requests: 4,
+      rate_limited_429: 0,
+      upstream_5xx: 0,
+      stream_truncated: 0,
+      force_cooldown: 0,
+      other_failures: 4,
+      status_codes: [{ code: 401, count: 4 }],
+      last_failed_at_ms: 3 * HOUR,
+    },
+  ];
+
+  // Model rollup uses the exact window-wide denominator (120), not only failing channels (30).
+  const byModel = aggregateStabilityFailures(groups, 'model', null);
+  assert.equal(byModel.length, 1);
+  assert.equal(byModel[0]!.failures, 14);
+  assert.equal(byModel[0]!.totalRequests, 120);
+  assert.equal(byModel[0]!.failureRate, 14 / 120);
+  assert.deepEqual(byModel[0]!.peers.map((p) => [p.id, p.count]), [['codex', 10], ['relay-a', 4]]);
+  assert.equal(byModel[0]!.credentialCount, 1);
+
+  // Lane narrowing filters both failure counts and HTTP status codes cleanly.
+  const only429 = aggregateStabilityFailures(groups, 'provider', 'rate_limited_429');
+  assert.deepEqual(only429.map((r) => [r.id, r.failures, r.statusCodes]), [['codex', 8, [{ code: 429, count: 8 }]]]);
+
+  const onlyOther = aggregateStabilityFailures(groups, 'credential', 'other_failures');
+  assert.equal(onlyOther.length, 1);
+  assert.equal(onlyOther[0]!.id, '');
+  assert.equal(onlyOther[0]!.drillDisabled, true);
+  assert.equal(onlyOther[0]!.totalRequests, 0);
+  assert.equal(onlyOther[0]!.failureRate, null);
+  assert.deepEqual(onlyOther[0]!.statusCodes, [{ code: 401, count: 4 }]);
+
+  // Selected-lane aggregation isolates lane counts (never leaking tuple-wide sibling lanes)
+  // and omits lastFailedAtMs when the tuple also contains sibling failure types.
+  assert.equal(only429[0]!.lanes.force_cooldown, 0);
+  assert.equal(only429[0]!.lastFailedAtMs, 0);
+  const exclusive429 = aggregateStabilityFailures([{
+    ...groups[0]!,
+    failed_requests: 8,
+    upstream_5xx: 0,
+    force_cooldown: 0,
+    status_codes: [{ code: 429, count: 8 }],
+  }], 'provider', 'rate_limited_429');
+  assert.equal(exclusive429[0]!.lastFailedAtMs, 2 * HOUR);
+
+  // Shared tuple status histograms are omitted for protocol-level truncation/cooldown lanes
+  // so co-occurring HTTP status codes (e.g. 502/503 from sibling failures) are never misattributed.
+  const overlappingGroup: TrendsFailureGroup = {
+    model: 'claude-sonnet',
+    provider: 'anthropic',
+    auth_index: 'cred-2',
+    total_requests: 10,
+    model_total_requests: 10,
+    provider_total_requests: 10,
+    credential_total_requests: 10,
+    failed_requests: 3,
+    rate_limited_429: 0,
+    upstream_5xx: 2,
+    stream_truncated: 1,
+    force_cooldown: 1,
+    other_failures: 1,
+    status_codes: [{ code: 502, count: 1 }, { code: 503, count: 1 }, { code: 400, count: 1 }],
+    last_failed_at_ms: 4 * HOUR,
+  };
+  const truncatedRows = aggregateStabilityFailures([overlappingGroup], 'model', 'stream_truncated');
+  assert.equal(truncatedRows[0]!.failures, 1);
+  assert.deepEqual(truncatedRows[0]!.statusCodes, []);
+  const cooldownRows = aggregateStabilityFailures([overlappingGroup], 'model', 'force_cooldown');
+  assert.equal(cooldownRows[0]!.failures, 1);
+  assert.deepEqual(cooldownRows[0]!.statusCodes, []);
+  const ambiguousOtherRows = aggregateStabilityFailures([overlappingGroup], 'model', 'other_failures');
+  assert.equal(ambiguousOtherRows[0]!.failures, 1);
+  assert.deepEqual(ambiguousOtherRows[0]!.statusCodes, []);
+  const upstreamRows = aggregateStabilityFailures([overlappingGroup], 'model', 'upstream_5xx');
+  assert.deepEqual(upstreamRows[0]!.statusCodes, [{ code: 502, count: 1 }, { code: 503, count: 1 }]);
+
+  // Cell clamping guarantees to > from, returns null for single-millisecond intersections rather
+  // than spilling into the next bucket, and builds exact slice/events URLs.
+  const win = { from: 0, to: 10 * HOUR - 1, open_end: false as const };
+  const cell = { start_ms: HOUR, end_ms: 2 * HOUR };
+  assert.deepEqual(stabilityWindowForCell(win, cell), { from: HOUR, to: 2 * HOUR - 1, open_end: false });
+  assert.equal(stabilityWindowForCell({ from: 999, to: 10_000 }, { start_ms: 0, end_ms: 1000 }), null);
+  assert.equal(stabilitySliceTelemetryParams({ from: 999, to: 10_000 }, { start_ms: 0, end_ms: 1000 }, {}), null);
+  assert.equal(stabilityDemoSliceEventsQueryString({ from: 999, to: 10_000 }, {}, { start_ms: 0, end_ms: 1000 }), null);
+  assert.equal(stabilityEventsHref({ from: 999, to: 10_000, open_end: false }, {}, { lane: 'rate_limited_429', cell: { start_ms: 0, end_ms: 1000 } }), null);
+  assert.equal(stabilitySliceTelemetryParams(win, cell, { provider: ['codex'] }), `from=${HOUR}&to=${2 * HOUR - 1}&top=1&provider=codex`);
+
+  const href = stabilityEventsHref(win, { api_key: ['hmac:k1'] }, {
+    lane: 'rate_limited_429',
+    cell,
+    entity: { dimension: 'credential', id: 'cred-1' },
+  });
+  assert.ok(href);
+  const parsed = readEventQuery(new URL(href, 'http://localhost').searchParams);
+  assert.equal(parsed.from, HOUR);
+  assert.equal(parsed.to, 2 * HOUR - 1);
+  assert.equal(parsed.result, 'failed');
+  assert.equal(parsed.failure, 'rate_limited_429');
+  assert.deepEqual(parsed.filters?.auth_index, ['cred-1']);
+  assert.deepEqual(parsed.filters?.api_key, ['hmac:k1']);
+
+  const truncatedHref = stabilityEventsHref(win, {}, { lane: 'stream_truncated', cell });
+  assert.ok(truncatedHref);
+  const parsedTruncated = readEventQuery(new URL(truncatedHref, 'http://localhost').searchParams);
+  assert.equal(parsedTruncated.result, 'all');
+  assert.equal(parsedTruncated.failure, 'stream_truncated');
+
+  const demoSliceQuery = stabilityDemoSliceEventsQueryString(win, {}, cell);
+  assert.ok(demoSliceQuery);
+  const demoParams = new URLSearchParams(demoSliceQuery);
+  assert.equal(demoParams.get('result'), 'all');
+  assert.equal(demoParams.get('replay'), 'calendar');
+  assert.equal(demoParams.get('from'), String(HOUR));
+  assert.equal(demoParams.get('to'), String(2 * HOUR - 1));
+
+  // Demo fallback derives failure groups (preserving truncation/cooldown overlap and capping rates)
+  // and substitution pairs from raw usage events.
+  const sampleEvents = [
+    {
+      id: 1, event_key: 'e1', timestamp_ms: HOUR, provider: 'codex', auth_index: 'cred-1',
+      model: 'gpt-5', failed: true, fail_status_code: 502, fail_code: 'stream_truncated', generate: true, latency_ms: 100,
+      tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+      has_request_log: false,
+    },
+    {
+      id: 2, event_key: 'e2', timestamp_ms: HOUR + 1000, provider: 'codex', auth_index: 'cred-1',
+      model: 'gpt-5', response_model: 'gpt-5-mini', model_substituted: true, failed: false, generate: true, latency_ms: 100,
+      tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+      has_request_log: false,
+    },
+  ];
+  const derived = deriveFailureGroupsFromEvents(sampleEvents);
+  assert.equal(derived.length, 1);
+  assert.equal(derived[0]!.failed_requests, 1);
+  assert.equal(derived[0]!.total_requests, 2);
+  assert.equal(derived[0]!.upstream_5xx, 1);
+  assert.equal(derived[0]!.stream_truncated, 1);
+  assert.equal(derived[0]!.other_failures, 0);
+
+  const capped = deriveFailureGroupsFromEvents(sampleEvents, { isCapped: true });
+  const cappedRows = aggregateStabilityFailures(capped, 'model', null);
+  assert.equal(cappedRows[0]!.failures, 1);
+  assert.equal(cappedRows[0]!.totalRequests, 0);
+  assert.equal(cappedRows[0]!.failureRate, null);
+
+  // Truncated live failure groups suppress potentially understated rates via isPartial.
+  const partialLiveRows = aggregateStabilityFailures(groups, 'model', null, { isPartial: true });
+  assert.equal(partialLiveRows[0]!.failures, 14);
+  assert.equal(partialLiveRows[0]!.totalRequests, 0);
+  assert.equal(partialLiveRows[0]!.failureRate, null);
+
+  // When Demo list payloads omit fail_code, omitUncategorizedOther avoids misclassifying
+  // uncoded failures (such as a status-less stream truncation) as other_failures.
+  const uncodedDemo = deriveFailureGroupsFromEvents([
+    {
+      id: 3, event_key: 'e3', timestamp_ms: HOUR, provider: 'codex', auth_index: 'cred-1',
+      model: 'gpt-5', failed: true, generate: true, latency_ms: 100,
+      tokens: { input: 0, output: 0, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 0 },
+      has_request_log: false,
+    },
+  ], { omitUncategorizedOther: true });
+  assert.equal(uncodedDemo[0]!.failed_requests, 1);
+  assert.equal(uncodedDemo[0]!.other_failures, 0);
+
+  assert.deepEqual(deriveSubstitutionPairsFromEvents(sampleEvents), [
+    { requested_model: 'gpt-5', served_model: 'gpt-5-mini', provider: 'codex', count: 1 },
+  ]);
+
+  // Live management target resolution avoids dead shortcuts for archived or redacted entities.
+  const credentials = new Map([
+    ['oauth-live', { name: 'team.json', provider: 'codex', auth_index: 'oauth-live' }],
+    ['oauth-archived', { name: 'old.json', provider: 'codex', auth_index: 'oauth-archived', is_archived: true }],
+  ]);
+  const providers = [
+    { id: 'prov-relay', family: 'openai-compatibility', name: 'Relay A', upstream_name: 'relay-a', auth_indexes: ['key-idx-1', 'shared-idx'] },
+    { id: 'prov-alias', family: 'openai-compatibility', name: 'team-west', upstream_name: 'dup-upstream', auth_indexes: ['shared-idx'] },
+    { id: 'team-west', family: 'openai-compatibility', name: 'West Exact', upstream_name: 'dup-upstream', auth_indexes: [] },
+  ];
+  assert.deepEqual(resolveTrendsManagementTarget('credential', 'oauth-live', credentials, providers), {
+    target: 'oauth',
+    href: '/oauth-management?q=oauth-live',
+  });
+  assert.deepEqual(resolveTrendsManagementTarget('credential', 'key-idx-1', credentials, providers), {
+    target: 'provider',
+    href: '/ai-providers?provider=prov-relay',
+  });
+  // Ambiguous credential index claimed by multiple configured providers must hide the shortcut.
+  assert.equal(resolveTrendsManagementTarget('credential', 'shared-idx', credentials, providers), null);
+  assert.equal(resolveTrendsManagementTarget('credential', 'oauth-archived', credentials, providers), null);
+  assert.equal(resolveTrendsManagementTarget('credential', 'redacted:abc', credentials, providers), null);
+  assert.deepEqual(resolveTrendsManagementTarget('provider', 'openai-compatible-relay-a', credentials, providers), {
+    target: 'provider',
+    href: '/ai-providers?provider=prov-relay',
+  });
+  // Exact provider ID match takes precedence over an earlier provider with that display name.
+  assert.deepEqual(resolveTrendsManagementTarget('provider', 'team-west', credentials, providers), {
+    target: 'provider',
+    href: '/ai-providers?provider=team-west',
+  });
+  // Ambiguous upstream name shared by two providers hides the shortcut.
+  assert.equal(resolveTrendsManagementTarget('provider', 'dup-upstream', credentials, providers), null);
+  assert.deepEqual(resolveTrendsManagementTarget('provider', 'codex', credentials, providers), {
+    target: 'oauth',
+    href: '/oauth-management?provider=codex',
+  });
+  // Multiple configured providers sharing a family must return null rather than falling through to OAuth.
+  const multiFamilyProviders = [
+    ...providers,
+    { id: 'codex-a', family: 'codex', name: 'Codex A', auth_indexes: [] },
+    { id: 'codex-b', family: 'codex', name: 'Codex B', auth_indexes: [] },
+  ];
+  assert.equal(resolveTrendsManagementTarget('provider', 'codex', credentials, multiFamilyProviders), null);
+});
+
+test('quotaNoticeState distinguishes CPA unreachability from stale or expired observations', () => {
+  const activeWin = quotaWindow({ cycle_start_ms: 0, cycle_reset_ms: 5 * HOUR });
+  const activeCred = credential('cred-1', [activeWin]);
+
+  assert.equal(quotaNoticeState(activeCred, activeWin, false, 2 * HOUR), null);
+  assert.deepEqual(
+    quotaNoticeState({ ...activeCred, status: 'stale' }, activeWin, true, 2 * HOUR),
+    { kind: 'cpa_unreachable', canRefreshQuota: false },
+  );
+  assert.deepEqual(
+    quotaNoticeState({ ...activeCred, status: 'stale' }, activeWin, false, 2 * HOUR),
+    { kind: 'stale', canRefreshQuota: true },
+  );
+  assert.deepEqual(
+    quotaNoticeState({ ...activeCred, status: 'error' }, activeWin, false, 2 * HOUR),
+    { kind: 'stale', canRefreshQuota: true },
+  );
+  assert.deepEqual(
+    quotaNoticeState(activeCred, activeWin, false, 5 * HOUR),
+    { kind: 'stale', canRefreshQuota: true },
+  );
+  assert.deepEqual(
+    quotaNoticeState({ ...activeCred, status: 'disabled' }, activeWin, false, 2 * HOUR),
+    { kind: 'stale', canRefreshQuota: false },
+  );
+  assert.deepEqual(
+    quotaNoticeState({ ...activeCred, auth_index: '  ', status: 'stale' }, activeWin, false, 2 * HOUR),
+    { kind: 'stale', canRefreshQuota: false },
+  );
 });

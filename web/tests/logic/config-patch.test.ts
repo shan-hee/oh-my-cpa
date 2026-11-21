@@ -24,7 +24,7 @@ import { ALL_CONFIG_FIELDS, CONFIG_GROUPS, type ConfigFieldDefinition } from '..
 // an unknown section or a legacy field, so an editor field placed there could
 // never be saved.
 const V8_SECTIONS = new Set([
-  'server', 'management', 'access', 'credentials', 'routing', 'requests', 'oauth',
+  'models', 'server', 'management', 'access', 'credentials', 'routing', 'requests', 'oauth',
   'multimedia', 'observability', 'plugins', 'quota-exceeded', 'api-keys', 'client', 'upstream',
 ]);
 
@@ -1507,3 +1507,177 @@ test('payloadReplaceRules schema registration, searchability, patch emission, an
   ]);
 });
 
+test('Claude OAuth create_api_key scope switch stays omitted at default and persists explicit false', () => {
+  const scopeField = field('claudeOAuthIncludeCreateAPIKey');
+  assert.equal(scopeField.sectionId, 'providers');
+  assert.equal(scopeField.type, 'switch');
+  assert.equal(scopeField.defaultValue, true);
+  assert.deepEqual(scopeField.yamlPath, ['oauth', 'providers', 'claude', 'oauth-include-create-api-key']);
+  assert.equal(scopeField.legacyYamlPath, undefined);
+  for (const keyword of ['claude', 'oauth', 'scope', 'create_api_key']) {
+    assert.ok(scopeField.keywords?.includes(keyword), `expected keyword ${keyword}`);
+  }
+  const claudeGroup = CONFIG_GROUPS.find((group) => group.id === 'grp_claude_behavior');
+  assert.ok(claudeGroup?.fieldIds.includes('claudeOAuthIncludeCreateAPIKey'));
+
+  // Default install: omitted key reads as true and never writes a redundant line.
+  const defaultServer = parseDocument(SERVER_YAML);
+  const defaultDraft = defaultServer.clone();
+  assert.equal(getFieldSemanticValue(defaultServer, scopeField), true);
+  updateFieldWithBaseline(defaultDraft, defaultServer, scopeField, true);
+  assert.deepEqual(computeConfigChanges(defaultServer, defaultDraft), []);
+  assert.equal(defaultDraft.toString(), defaultServer.toString());
+
+  // Toggling OFF writes explicit false; toggling back ON before save prunes empty ancestors.
+  updateFieldWithBaseline(defaultDraft, defaultServer, scopeField, false);
+  assert.deepEqual(computeConfigChanges(defaultServer, defaultDraft), [
+    { path: ['oauth'], value: { providers: { claude: { 'oauth-include-create-api-key': false } } } },
+  ]);
+  updateFieldWithBaseline(defaultDraft, defaultServer, scopeField, true);
+  assert.equal(defaultDraft.has('oauth'), false);
+  assert.deepEqual(computeConfigChanges(defaultServer, defaultDraft), []);
+  assert.equal(defaultDraft.toString(), defaultServer.toString());
+
+  // Explicit false survives subsequent unrelated edits and reads back as false.
+  const optedOutYaml = `${SERVER_YAML}oauth:
+    providers:
+        claude:
+            oauth-include-create-api-key: false # org policy
+        antigravity:
+            tos-pause-window: 10m
+`;
+  const optedOutServer = parseDocument(optedOutYaml);
+  const optedOutDraft = optedOutServer.clone();
+  assert.equal(getFieldSemanticValue(optedOutServer, scopeField), false);
+  updateFieldWithBaseline(optedOutDraft, optedOutServer, field('debug'), true);
+  assert.deepEqual(computeConfigChanges(optedOutServer, optedOutDraft), [
+    { path: ['observability', 'logs', 'debug'], value: true },
+  ]);
+  assert.equal(optedOutDraft.getIn(['oauth', 'providers', 'claude', 'oauth-include-create-api-key']), false);
+
+  // Toggling explicit false back to true updates only the leaf key and reverting restores comments.
+  const reenableDraft = optedOutServer.clone();
+  updateFieldWithBaseline(reenableDraft, optedOutServer, scopeField, true);
+  assert.deepEqual(computeConfigChanges(optedOutServer, reenableDraft), [
+    { path: ['oauth', 'providers', 'claude', 'oauth-include-create-api-key'], value: true },
+  ]);
+  assert.equal(reenableDraft.getIn(['oauth', 'providers', 'antigravity', 'tos-pause-window']), '10m');
+  updateFieldWithBaseline(reenableDraft, optedOutServer, scopeField, false);
+  assert.equal(reenableDraft.toString(), optedOutServer.toString());
+
+  // Explicit null in YAML matches Go *bool nil semantics (defaults to true).
+  const nullServer = parseDocument('oauth:\n    providers:\n        claude:\n            oauth-include-create-api-key: null\n');
+  assert.equal(getFieldSemanticValue(nullServer, scopeField), true);
+
+  // Rebasing an opt-out onto a newer server baseline preserves sibling OAuth provider settings.
+  const rebaseBase = parseDocument(SERVER_YAML);
+  const rebaseEdit = rebaseBase.clone();
+  updateFieldWithBaseline(rebaseEdit, rebaseBase, scopeField, false);
+  const newerWithSibling = `${SERVER_YAML}oauth:
+    providers:
+        antigravity:
+            tos-pause-window: 15m
+`;
+  const rebased = parseDocument(rebaseDraft(rebaseBase, rebaseEdit, newerWithSibling) ?? '');
+  assert.equal(rebased.getIn(['oauth', 'providers', 'antigravity', 'tos-pause-window']), '15m');
+  assert.equal(rebased.getIn(['oauth', 'providers', 'claude', 'oauth-include-create-api-key']), false);
+  assert.deepEqual(computeConfigChanges(parseDocument(newerWithSibling), rebased), [
+    { path: ['oauth', 'providers', 'claude'], value: { 'oauth-include-create-api-key': false } },
+  ]);
+});
+
+test('model catalog source fields preserve absent default, emit canonical patches, clear cleanly, and rebase', () => {
+  const catalogGroup = CONFIG_GROUPS.find((group) => group.id === 'grp_model_catalogs');
+  assert.ok(catalogGroup);
+  assert.equal(catalogGroup.sectionId, 'providers');
+  assert.equal(catalogGroup.variant, 'form-grid');
+  assert.deepEqual(catalogGroup.fieldIds, ['modelsCatalog', 'modelsCodexCatalog', 'modelsDevinCatalog']);
+
+  const specs = [
+    {
+      id: 'modelsCatalog',
+      key: 'catalog',
+      values: ['https://mirror.example.test/models.json', '/etc/cpa/models.json'],
+    },
+    {
+      id: 'modelsCodexCatalog',
+      key: 'codex-catalog',
+      values: ['https://mirror.example.test/codex_client_models.json', '/etc/cpa/codex.json'],
+    },
+    {
+      id: 'modelsDevinCatalog',
+      key: 'devin-catalog',
+      values: ['https://mirror.example.test/devin_models.json', 'C:\\cpa\\devin_models.json'],
+    },
+  ] as const;
+
+  const bareServer = parseDocument(SERVER_YAML);
+  for (const spec of specs) {
+    const catalogField = field(spec.id);
+    assert.equal(catalogField.sectionId, 'providers');
+    assert.equal(catalogField.type, 'string');
+    assert.deepEqual(catalogField.yamlPath, ['models', spec.key]);
+    assert.equal(catalogField.legacyYamlPath, undefined);
+
+    // Unconfigured models stays absent so older CPA gateways remain untouched.
+    const untouched = bareServer.clone();
+    assert.equal(getFieldSemanticValue(bareServer, catalogField), undefined);
+    updateFieldWithBaseline(untouched, bareServer, catalogField, '');
+    assert.equal(untouched.hasIn(['models']), false);
+    assert.equal(untouched.toString(), bareServer.toString());
+
+    for (const value of spec.values) {
+      const edited = bareServer.clone();
+      updateFieldWithBaseline(edited, bareServer, catalogField, value);
+      assert.deepEqual(computeConfigChanges(bareServer, edited), [
+        { path: ['models'], value: { [spec.key]: value } },
+      ]);
+      assert.equal(getFieldSemanticValue(parseDocument(edited.toString()), catalogField), value);
+
+      updateFieldWithBaseline(edited, bareServer, catalogField, '');
+      assert.deepEqual(computeConfigChanges(bareServer, edited), []);
+      assert.equal(edited.toString(), bareServer.toString());
+    }
+  }
+
+  // Existing models section updates only the edited key, preserves sibling keys and comments,
+  // and emits DELETE when a configured source is cleared.
+  const configuredYaml = `${SERVER_YAML}models:
+    catalog: https://custom.example.test/models.json # custom general catalog
+    codex-catalog: /etc/cpa/codex_client_models.json
+    devin-catalog: ""
+`;
+  const configured = parseDocument(configuredYaml);
+  const generalField = field('modelsCatalog');
+  const codexField = field('modelsCodexCatalog');
+  const devinField = field('modelsDevinCatalog');
+  assert.equal(getFieldSemanticValue(configured, generalField), 'https://custom.example.test/models.json');
+  assert.equal(getFieldSemanticValue(configured, codexField), '/etc/cpa/codex_client_models.json');
+  assert.equal(getFieldSemanticValue(configured, devinField), '');
+
+  const updatedDraft = configured.clone();
+  updateFieldWithBaseline(updatedDraft, configured, generalField, '/etc/cpa/custom-models.json');
+  assert.deepEqual(computeConfigChanges(configured, updatedDraft), [
+    { path: ['models', 'catalog'], value: '/etc/cpa/custom-models.json' },
+  ]);
+  updateFieldWithBaseline(updatedDraft, configured, generalField, 'https://custom.example.test/models.json');
+  assert.equal(updatedDraft.toString(), configured.toString());
+
+  const clearedDraft = configured.clone();
+  updateFieldWithBaseline(clearedDraft, configured, codexField, '');
+  assert.deepEqual(computeConfigChanges(configured, clearedDraft), [
+    { path: ['models', 'codex-catalog'], remove: true },
+  ]);
+  assert.equal(clearedDraft.getIn(['models', 'catalog']), 'https://custom.example.test/models.json');
+
+  // Rebase carries a models.devin-catalog edit onto a newer baseline with concurrent sibling changes.
+  const rebaseDraftDoc = configured.clone();
+  updateFieldWithBaseline(rebaseDraftDoc, configured, devinField, 'https://custom.example.test/devin.json');
+  const newerYaml = configuredYaml.replace('/etc/cpa/codex_client_models.json', 'https://custom.example.test/codex.json');
+  const rebased = parseDocument(rebaseDraft(configured, rebaseDraftDoc, newerYaml) ?? '');
+  assert.equal(rebased.getIn(['models', 'codex-catalog']), 'https://custom.example.test/codex.json');
+  assert.equal(getFieldSemanticValue(rebased, devinField), 'https://custom.example.test/devin.json');
+  assert.deepEqual(computeConfigChanges(parseDocument(newerYaml), rebased), [
+    { path: ['models', 'devin-catalog'], value: 'https://custom.example.test/devin.json' },
+  ]);
+});

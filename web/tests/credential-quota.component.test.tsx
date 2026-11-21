@@ -692,7 +692,7 @@ describe('dashboard model panels and heatmap alignment states', () => {
         requests: number;
         priced_requests: number;
         cost_usd: number | null;
-        buckets: number[];
+        series: Array<{ t: number; tokens: number }>;
       }>,
     };
     api.on('GET', '/management/dashboard/models', () => modelsPayload);
@@ -728,7 +728,10 @@ describe('dashboard model panels and heatmap alignment states', () => {
             requests: 4,
             priced_requests: 4,
             cost_usd: 0.12,
-            buckets: [400, 800],
+            series: [
+              { t: NOW_MS - 120_000, tokens: 400 },
+              { t: NOW_MS - 60_000, tokens: 800 },
+            ],
           },
         ],
       };
@@ -798,6 +801,7 @@ describe('dashboard model panels and heatmap alignment states', () => {
       const legend = await screen.findByTestId('model-trend-legend');
       fireEvent.click(within(legend).getByRole('button', { name: /gpt-5/ }));
       expect(screen.getByRole('radiogroup', { name: t('dash.models.view_toggle_label') })).toBeTruthy();
+      expect(view.container.querySelector('.model-usage-card [data-slot="panel-head-extra"]')).toBeNull();
 
       fireEvent.click(screen.getByRole('tab', { name: t('dash.models.lens_clients') }));
       // The model ranking stays on screen, and clickable, until the client one lands. A choice made

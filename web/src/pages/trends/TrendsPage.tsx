@@ -1,8 +1,10 @@
 import React from 'react';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { Select } from '@/components/ui/select';
 import { api, apiErrorCode } from '../../api/client';
+import { QUERY_KEYS } from '../../api/queryKeys';
+import { retryTrendsQuery } from '../../routePreload';
 import { useT } from '../../i18n';
 import { usePreference } from '../../hooks/usePreference';
 import { useIsPhoneViewport } from '../../hooks/useIsPhoneViewport';
@@ -24,7 +26,7 @@ import {
   type InsightsBucketChoice,
   type InsightsRange,
 } from '../../types/insights';
-import type { TrendsSubstitutionPair, TrendsUsageGroupOption } from '../../types/trends';
+import type { TrendsQuotaCredential, TrendsSubstitutionPair, TrendsUsageGroupOption } from '../../types/trends';
 import { PageHeader } from '../../components/common/PageHeader';
 import { ToolButton } from '../../components/common/ToolButton';
 import { StatTiles } from '../../components/common/StatTiles';
@@ -33,7 +35,9 @@ import { DeferredPanel } from '../../components/common/DeferredPanel';
 import { Panel } from '../../components/common/Panel';
 import { TrendsSkeleton } from '../../components/common/PageLoading';
 import { HistoryOutlined } from '../../components/icons';
-import { LoadFailure, Notice } from '../../components/feedback';
+import { LoadFailure, Notice, useToast } from '../../components/feedback';
+import { quotaRefreshFailureReason, refreshCredentialQuotas } from '../../utils/quotaRefresh';
+import { QUOTA_REFRESH_TOAST_KEY, quotaRefreshOutcomeKind } from '../../utils/quotaRefreshOutcome';
 import { RollingNumber, RollingNumberGroup } from '../../components/dashboard/RollingNumber';
 import { useIsRouteActive, useIsRoutePollingActive } from '../../performance/routeContract';
 import { isDemoMode } from '../../types/demoMode';
@@ -47,15 +51,16 @@ import {
   HOUR_LIMIT_MS,
   TRENDS_USAGE_GROUPS,
   availablePerfGroups,
-  deliveryFailureCauses,
   filterKeyForGroupBy,
-  formatPercent,
   hasTrendsFilters,
   isRangeWithinHourLimit,
+  percentReadout,
   pickForecastableQuotaWindow,
+  quotaCredentialName,
   quotaRisk,
   readTrendsView,
   relativeChange,
+  stabilityFilterKeyForDim,
   substitutionEventsHref,
   successRate,
   toggleTrendsFilter,
@@ -82,10 +87,6 @@ const TILE_SECTIONS: Record<TileKey, string> = {
   delivery: 'trends-stability',
 };
 
-function retryUnlessUncaptured(count: number, error: unknown): boolean {
-  return apiErrorCode(error) !== 'demo_uncaptured' && count < 2;
-}
-
 /** A group's name as the page prints it: a key's alias over its mask, the remainder as one word. */
 function groupName(item: { id: string; label: string; alias?: string; mask?: string; folded?: boolean }, folded: string): string {
   if (item.folded) return folded;
@@ -103,12 +104,62 @@ function groupName(item: { id: string; label: string; alias?: string; mask?: str
 export const TrendsPage: React.FC = () => {
   useTimeZone();
   const t = useT();
+  const toast = useToast();
+  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const isPhone = useIsPhoneViewport();
   const isRouteActive = useIsRouteActive();
   const isPollingActive = useIsRoutePollingActive();
   const isDemo = isDemoMode();
   const { modelView, style } = useTokenDisplayStyle();
+  const [refreshingQuotaIndexes, setRefreshingQuotaIndexes] = React.useState<ReadonlySet<string>>(() => new Set());
+  const refreshingQuotaRef = React.useRef(new Set<string>());
+
+  const refreshQuotaCredential = React.useCallback(async (credential: TrendsQuotaCredential) => {
+    const authIndex = credential.auth_index.trim();
+    if (!authIndex || refreshingQuotaRef.current.has(authIndex)) return;
+    refreshingQuotaRef.current.add(authIndex);
+    setRefreshingQuotaIndexes(new Set(refreshingQuotaRef.current));
+    const displayName = quotaCredentialName(credential);
+    try {
+      const outcome = await refreshCredentialQuotas([authIndex]);
+      const failed = outcome.failures.length;
+      const unknown = outcome.unknownIndexes.length;
+      if (quotaRefreshOutcomeKind({ failed, unknown }) === 'report') {
+        toast.warning(
+          t('omc.quota_refresh_report', { succeeded: outcome.succeeded, failed: failed + unknown, skipped: 0 }),
+          {
+            key: QUOTA_REFRESH_TOAST_KEY,
+            testId: 'quota-operation-report',
+            items: [
+              ...outcome.failures.map((failure) => ({
+                name: displayName,
+                reason: quotaRefreshFailureReason(failure, t),
+                group: t('toast.group_failed'),
+              })),
+              ...outcome.unknownIndexes.map(() => ({
+                name: displayName,
+                reason: t('omc.quota_refresh_unknown'),
+                group: t('toast.group_unknown'),
+              })),
+            ],
+          },
+        );
+      } else {
+        toast.success(
+          t('omc.quota_refresh_report_clean', { succeeded: outcome.succeeded, skipped: 0 }),
+          { key: QUOTA_REFRESH_TOAST_KEY },
+        );
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: QUERY_KEYS.trendsQuota }),
+        queryClient.invalidateQueries({ queryKey: QUERY_KEYS.quota }),
+      ]);
+    } finally {
+      refreshingQuotaRef.current.delete(authIndex);
+      setRefreshingQuotaIndexes(new Set(refreshingQuotaRef.current));
+    }
+  }, [queryClient, t, toast]);
 
   const visibleNow = useVisibleNow();
   const [search, setSearch] = useViewSearchParams();
@@ -138,7 +189,7 @@ export const TrendsPage: React.FC = () => {
     staleTime: 15_000,
     refetchOnWindowFocus: isPollingActive,
     refetchInterval: (query) => (isPollingActive ? insightsPollInterval(query.state.data?.window) : false),
-    retry: retryUnlessUncaptured,
+    retry: retryTrendsQuery,
     // The page states a failure in place, and an uncaptured demonstration window as a notice.
     meta: { silent: true },
   });
@@ -150,17 +201,17 @@ export const TrendsPage: React.FC = () => {
     staleTime: 15_000,
     refetchOnWindowFocus: isPollingActive,
     refetchInterval: (query) => (isPollingActive ? insightsPollInterval(query.state.data?.window) : false),
-    retry: retryUnlessUncaptured,
+    retry: retryTrendsQuery,
     meta: { silent: true },
   });
   const quotaQuery = useQuery({
-    queryKey: ['trends-quota', quotaQueryString],
+    queryKey: [...QUERY_KEYS.trendsQuota, quotaQueryString],
     queryFn: ({ signal }) => api.getTrendsQuota(quotaQueryString, signal),
     placeholderData: keepPreviousData,
     staleTime: 30_000,
     refetchOnWindowFocus: isPollingActive,
     refetchInterval: isPollingActive ? QUOTA_POLL_MS : false,
-    retry: retryUnlessUncaptured,
+    retry: retryTrendsQuery,
     meta: { silent: true },
   });
 
@@ -190,7 +241,7 @@ export const TrendsPage: React.FC = () => {
     staleTime: 15_000,
     refetchOnWindowFocus: isPollingActive,
     refetchInterval: (query) => (isPollingActive ? insightsPollInterval(query.state.data?.window) : false),
-    retry: retryUnlessUncaptured,
+    retry: retryTrendsQuery,
     meta: { silent: true },
   });
 
@@ -288,10 +339,6 @@ export const TrendsPage: React.FC = () => {
     }
     void setRange(next);
   }, [setRange, setView, view.bucket, visibleNow]);
-
-  const brush = React.useCallback((next: { from: number; to: number | null }) => {
-    changeRange(next);
-  }, [changeRange]);
 
   const eventsHref = shownWindow ? trendsEventsHref(shownWindow, view.filters, {}, { isDemo }) : null;
   const moverFilterKey = usage ? filterKeyForGroupBy(usage.group_by) : null;
@@ -401,14 +448,12 @@ export const TrendsPage: React.FC = () => {
   const rate = summary ? successRate(summary) : null;
   const ttftP95 = summary?.ttft_p95_ms ?? null;
 
-  // Each tile answers one question a reader brings to the page, with its figure and at most two
-  // quiet facts that say why: whether any subscription runs out, how fast answers stream, how the
-  // token volume compares, and what the failures are.
+  // Each tile answers one question a reader brings to the page, with its figure and a concise
+  // supporting fact: whether any subscription runs out, how fast answers stream, how the token
+  // volume compares, and how many requests failed.
   const isQuotaMembershipUnknown = Boolean(quota?.summary.is_membership_unknown);
   const risk = quota ? quotaRisk(quota.items, quotaNowMs) : null;
   const rateTone = rate === null ? 'neutral' : successRateTone(rate * 100);
-  // The two largest causes, failures first; a substitution is served traffic, so it trails them.
-  const failureCauses = deliveryFailureCauses(summary);
 
   const tiles = [
     {
@@ -461,13 +506,16 @@ export const TrendsPage: React.FC = () => {
     {
       key: 'delivery' as const,
       label: t('trends.tile.delivery'),
-      value: summary ? (rate === null ? '—' : (
-        <span className={rateTone === 'warn' || rateTone === 'danger' ? styles[`tone-${rateTone}`] : undefined}>{formatPercent(rate * 100)}</span>
-      )) : undefined,
+      value: summary ? (
+        <span className={rateTone === 'warn' || rateTone === 'danger' ? styles[`tone-${rateTone}`] : undefined}>
+          <RollingNumber readout={percentReadout(rate === null ? null : rate * 100)} />
+        </span>
+      ) : undefined,
       foot: summary ? (
         <MetaLine className={styles['tile-foot']}>
-          {failureCauses.length > 0
-            ? failureCauses.map((cause) => <span key={cause.key} className={styles[cause.tone]}>{t(`trends.tile.${cause.key}`, { n: cause.count })}</span>)
+          {summary.failed_requests > 0
+            // The count takes the rate's verdict: a handful of errors behind a healthy rate is context.
+            ? <span className={rateTone === 'warn' || rateTone === 'danger' ? styles[`tone-${rateTone}`] : undefined}>{t('trends.tile.errors', { n: summary.failed_requests })}</span>
             : <span>{t('trends.tile.requests', { n: summary.total_requests })}</span>}
         </MetaLine>
       ) : null,
@@ -533,6 +581,8 @@ export const TrendsPage: React.FC = () => {
         isLoading={quotaQuery.isFetching}
         error={isQuotaUncaptured ? null : quotaQuery.error}
         onRetry={() => void quotaQuery.refetch()}
+        onRefreshQuota={(credential) => void refreshQuotaCredential(credential)}
+        refreshingQuotaIndexes={refreshingQuotaIndexes}
         credentialId={view.quotaCredential}
         windowId={view.quotaWindow}
         view={view.quotaView}
@@ -566,7 +616,6 @@ export const TrendsPage: React.FC = () => {
           onItemChange={(perfItem) => setView({ perfItem })}
           isUnavailable={isTelemetryUncaptured}
           bucketControl={bucketControl}
-          onBrush={isPhone ? undefined : brush}
         />
       </DeferredPanel>
       <DeferredPanel priority="p2" fallback={<><Panel /><Panel /></>}>
@@ -584,7 +633,16 @@ export const TrendsPage: React.FC = () => {
           <StabilityPanel
             identity={identity}
             data={telemetry}
+            filters={view.filters}
+            isDemo={isDemo}
+            canFilterTrends={!isDemo}
+            isPollingActive={isPollingActive}
+            isStale={telemetry !== undefined && !currentTelemetry}
             pairHref={(pair: TrendsSubstitutionPair) => (currentTelemetry?.window ? substitutionEventsHref(currentTelemetry.window, view.filters, pair, { isDemo }) : null)}
+            isEntityFiltered={(dimension, id) => Boolean(view.filters[stabilityFilterKeyForDim(dimension)]?.includes(id))}
+            onToggleFilter={(dimension, id) => {
+              if (!isDemo) toggleFilter(stabilityFilterKeyForDim(dimension), id);
+            }}
             onNavigate={navigate}
             isUnavailable={isTelemetryUncaptured}
           />

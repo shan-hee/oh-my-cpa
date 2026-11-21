@@ -4,6 +4,7 @@ import { MutationObserver, QueryClient, QueryObserver } from '@tanstack/react-qu
 import { test } from 'vitest';
 import { lineSlotChildren } from '../../src/components/ui/line-slot.tsx';
 
+import { ApiError } from '../../src/api/client.ts';
 import { MUTATION_KEYS, QUERY_KEYS } from '../../src/api/queryKeys.ts';
 import {
   createStateLiveChannel,
@@ -42,7 +43,14 @@ import { isDiscreteWheel, keyScrollFor, pageDistance, type WheelSample } from '.
 import { isSameDrawing } from '../../src/charts/useChartMorph.ts';
 import { isSameReadout } from '../../src/components/dashboard/RollingNumber.tsx';
 import { PAGE_SKELETON_REGISTRY } from '../../src/components/common/PageLoading.tsx';
-import { ROUTE_DESCRIPTORS, consoleRouteRegistry } from '../../src/routePreload.ts';
+import {
+  ROUTE_DESCRIPTORS,
+  consoleRouteRegistry,
+  prefetchLandingRouteData,
+  retryTrendsQuery,
+  trendsQuotaParamsFromSearch,
+} from '../../src/routePreload.ts';
+import { readTrendsView, trendsQuotaParams } from '../../src/pages/trends/trendsLogic.ts';
 import { buildNavGroupSpecs } from '../../src/types/sidebarNav.ts';
 
 test('frame scheduler separates priority tiers across slices, caps per-slice jobs, and yields across frames', () => {
@@ -474,6 +482,34 @@ test('route registry resolves exact and prefix routes, respects intent cooldown,
   while (idleCallbacks.length > 0) idleCallbacks.shift()!();
   assert.deepEqual(loaded, ['/insights'], 'idle prewarm skips active route and normal-priority plugin routes');
   cancelIdle();
+
+  // Mobile/constrained devices skip speculative idle prewarming completely.
+  loaded.length = 0;
+  const mobileRegistry = createRouteRegistry(
+    [
+      {
+        path: '/dashboard',
+        priority: 'critical',
+        preloadChunk: async () => { loaded.push('/dashboard'); },
+      },
+      {
+        path: '/insights',
+        priority: 'high',
+        preloadChunk: async () => { loaded.push('/insights'); },
+      },
+    ],
+    {
+      canIdlePrewarm: () => false,
+      scheduleIdle: (cb) => {
+        idleCallbacks.push(cb);
+        return () => undefined;
+      },
+    },
+  );
+  const cancelMobileIdle = mobileRegistry.scheduleIdlePrewarm('/dashboard');
+  while (idleCallbacks.length > 0) idleCallbacks.shift()!();
+  assert.deepEqual(loaded, [], 'constrained/mobile devices skip background idle prewarm');
+  cancelMobileIdle();
   queryClient.clear();
 });
 
@@ -781,6 +817,17 @@ test('state SSE channel suspends when hidden and reconcileStateSyncEvent applies
   assert.equal(tracker.lastVersion, 2);
   assert.equal(queryClient.getQueryState(QUERY_KEYS.providers(false))?.isInvalidated, true);
 
+  // Quota state_sync must invalidate both management-quota and trends-quota caches together.
+  queryClient.setQueryData(QUERY_KEYS.quota, { quotas: [] });
+  queryClient.setQueryData([...QUERY_KEYS.trendsQuota, ''], { items: [] });
+  await reconcileStateSyncEvent(
+    queryClient,
+    { type: 'state_sync', version: 3, scopes: ['management-quota'] },
+    tracker,
+  );
+  assert.equal(queryClient.getQueryState(QUERY_KEYS.quota)?.isInvalidated, true);
+  assert.equal(queryClient.getQueryState([...QUERY_KEYS.trendsQuota, ''])?.isInvalidated, true);
+
   // Verify resolveStateEventsURL honors root and custom OMCPA_BASE_PATH via window.__OMCPA_CONFIG__.
   const g = globalThis as { window?: { __OMCPA_CONFIG__?: { basePath?: string; apiBaseUrl?: string } } };
   const prevWindow = g.window;
@@ -967,6 +1014,33 @@ test('reconcileHotRouteSlots preserves slot order, keeps outlet identity on warm
   const trendsLoc = { locationContext: { location: { pathname: '/trends', search: '', hash: '', state: null } } };
   const allHot = reconcileHotRouteSlots(slotsInsightsNewest, { key: '/trends', outlet: { id: 'trends-1' }, locationContext: trendsLoc }, { maxSlots: HOT_ACTIVITY_ROUTES.size });
   assert.deepEqual(allHot.map((s) => s.key), ['/dashboard', '/insights', '/trends']);
+
+  // Shrinking when all remaining non-active slots are pinned evicts the least-recently-used slot, not index 0.
+  const allPinnedShrunk = reconcileHotRouteSlots(
+    [
+      { key: '/dashboard', outlet: dashOutlet1, locationContext: dashLoc1, lastActiveStep: 4 },
+      { key: '/insights', outlet: insightsOutlet, locationContext: insightsLoc, lastActiveStep: 2 },
+      { key: '/trends', outlet: { id: 'trends-1' }, locationContext: trendsLoc, lastActiveStep: 3 },
+    ],
+    { key: '/trends', outlet: { id: 'trends-2' }, locationContext: trendsLoc },
+    { maxSlots: 2, pinnedKeys: new Set(['/dashboard', '/insights', '/trends']) },
+  );
+  assert.deepEqual(allPinnedShrunk.map((s) => s.key), ['/dashboard', '/trends'], 'evicts oldest pinned /insights rather than newer /dashboard');
+
+  // Mobile mode caps to 1 active hot slot (releasing hidden chart trees) and drops slots on non-hot routes.
+  const mobileSingle = reconcileHotRouteSlots(
+    allHot,
+    { key: '/insights', outlet: { id: 'insights-2' }, locationContext: insightsLoc },
+    { maxSlots: 1, pinnedKeys: new Set(), dropWhenInactive: true },
+  );
+  assert.deepEqual(mobileSingle.map((s) => s.key), ['/insights']);
+  assert.equal(mobileSingle[0]?.outlet, insightsOutlet, 'preserves outlet identity when shrinking pool to active route');
+  const mobileCleared = reconcileHotRouteSlots(
+    mobileSingle,
+    null,
+    { maxSlots: 1, pinnedKeys: new Set(), dropWhenInactive: true },
+  );
+  assert.deepEqual(mobileCleared, [], 'mobile releases off-screen hot route when navigating to a non-hot route');
 });
 
 test('buildMonotoneSparkline produces overshoot-free monotone paths and maps pointer x to nearest bucket', () => {
@@ -1152,4 +1226,41 @@ test('lineSlotChildren recursively wraps fragment text children in spans while p
   assert.equal(inner[0]?.props.children, 'a-long-credential-name');
   assert.equal(inner[1]?.type, 'span');
   assert.equal(inner[1]?.props.children, 42);
+});
+
+test('trendsQuotaParamsFromSearch matches readTrendsView + trendsQuotaParams and landing prefetch targets /trends only', async () => {
+  const cases = [
+    '',
+    '?provider=codex&model=gpt-5',
+    '?auth_index=cred-2&provider=claude&provider=codex&provider=claude&auth_index=%20cred-2%20&auth_index=%20%20',
+    '?bucket=hour&group=provider&quota_view=cycles',
+  ];
+  for (const search of cases) {
+    const expected = trendsQuotaParams(readTrendsView(new URLSearchParams(search)).filters);
+    assert.equal(trendsQuotaParamsFromSearch(search), expected, `mismatch for search=${search}`);
+  }
+
+  const trendsDescriptor = consoleRouteRegistry.resolve('/trends');
+  assert.equal(trendsDescriptor?.prefetchData, undefined, 'hover intent on /trends must not invoke upstream CPA quota reads');
+
+  const queryClient = new QueryClient();
+  const seen: Array<{ queryKey: readonly unknown[]; retry: unknown }> = [];
+  const originalPrefetch = queryClient.prefetchQuery.bind(queryClient);
+  queryClient.prefetchQuery = (async (options: Parameters<typeof originalPrefetch>[0]) => {
+    seen.push({ queryKey: options.queryKey, retry: options.retry });
+  }) as typeof queryClient.prefetchQuery;
+
+  prefetchLandingRouteData(queryClient, '/dashboard', '?provider=codex');
+  prefetchLandingRouteData(queryClient, '/insights', '?provider=codex');
+  assert.deepEqual(seen, [], 'non-trends landing routes must not prefetch trends-quota');
+
+  prefetchLandingRouteData(queryClient, '/trends', '?model=gpt-5&provider=codex&auth_index=c1');
+  prefetchLandingRouteData(queryClient, '/trends/', '?provider=codex');
+  assert.deepEqual(seen, [
+    { queryKey: ['trends-quota', 'provider=codex&auth_index=c1'], retry: retryTrendsQuery },
+    { queryKey: ['trends-quota', 'provider=codex'], retry: retryTrendsQuery },
+  ]);
+  assert.equal(retryTrendsQuery(0, new Error('transient 500')), true);
+  assert.equal(retryTrendsQuery(2, new Error('transient 500')), false);
+  assert.equal(retryTrendsQuery(0, new ApiError(404, 'uncaptured', { code: 'demo_uncaptured' })), false);
 });

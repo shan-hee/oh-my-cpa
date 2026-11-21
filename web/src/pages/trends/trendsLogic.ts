@@ -8,13 +8,16 @@ import { INSIGHTS_BUCKETS, insightsRangeParams, type InsightsBucketChoice, type 
 import type { TFunc } from '../../i18n';
 import dayjs from '../../utils/time';
 import type { QuotaWindow } from '../../types/quota';
-import { MAX_USAGE_EVENT_FILTER_VALUES } from '../../types/usageEvents';
+import type { RollingReadout } from '../../types/rollingNumber';
+import { MAX_USAGE_EVENT_FILTER_VALUES, type UsageEvent, type UsageFailureCategory } from '../../types/usageEvents';
 import { quotaReadingLabels, roundQuotaPeriodHours } from '../quota/quotaWindowNaming';
 import type {
+  TrendsFailureGroup,
   TrendsGroupName,
   TrendsQuotaCredential,
   TrendsQuotaWindow,
   TrendsScatterPoint,
+  TrendsStatusCount,
   TrendsSubstitutionPair,
   TrendsTelemetryBucket,
   TrendsTelemetryResponse,
@@ -345,6 +348,36 @@ export function quotaCredentialAttention(credential: TrendsQuotaCredential): 'wa
  */
 const STALE_CREDENTIAL_STATUSES = new Set(['stale', 'error', 'unavailable', 'disabled', 'unknown']);
 
+export type TrendsQuotaNoticeKind = 'cpa_unreachable' | 'stale';
+
+export interface TrendsQuotaNoticeState {
+  kind: TrendsQuotaNoticeKind;
+  canRefreshQuota: boolean;
+}
+
+/**
+ * Classifies why the selected quota cycle cannot project forward: CPA itself could not be
+ * reached to verify live credentials (retry the read) or the observation is stale, failed, or
+ * past its reset (trigger a live upstream quota refresh).
+ */
+export function quotaNoticeState(
+  credential: TrendsQuotaCredential,
+  window: TrendsQuotaWindow,
+  isMembershipUnknown: boolean,
+  nowMs: number,
+): TrendsQuotaNoticeState | null {
+  if (isMembershipUnknown) {
+    return { kind: 'cpa_unreachable', canRefreshQuota: false };
+  }
+  if (STALE_CREDENTIAL_STATUSES.has(credential.status) || window.cycle_reset_ms <= nowMs) {
+    return {
+      kind: 'stale',
+      canRefreshQuota: credential.status !== 'disabled' && credential.auth_index.trim() !== '',
+    };
+  }
+  return null;
+}
+
 export function quotaRisk(items: readonly TrendsQuotaCredential[], nowMs?: number): { forecastable: number; limited: number; projected: number } {
   let forecastable = 0;
   let limited = 0;
@@ -501,6 +534,18 @@ export function formatPercent(value: number | null | undefined, digits = 1): str
   if (value === null || value === undefined || !Number.isFinite(value)) return '—';
   const rounded = Number(value.toFixed(digits));
   return `${rounded.toFixed(Math.abs(rounded) >= 100 ? 0 : digits)}%`;
+}
+
+/** `formatPercent` as an animated readout so percentage tiles align and roll beside sibling figures. */
+export function percentReadout(value: number | null | undefined, digits = 1): RollingReadout | undefined {
+  if (value === null || value === undefined || !Number.isFinite(value)) return undefined;
+  const rounded = Number(value.toFixed(digits));
+  const fractionDigits = Math.abs(rounded) >= 100 ? 0 : digits;
+  return {
+    number: rounded,
+    suffix: '%',
+    format: { minimumFractionDigits: fractionDigits, maximumFractionDigits: fractionDigits },
+  };
 }
 
 export interface QuotaCycleBar {
@@ -662,29 +707,16 @@ export function perfModeHasSamples(
   return data.scatter.some((point) => point.ttft_ms !== null && point.latency_ms !== null);
 }
 
-export interface DeliveryCause {
-  key: 'rate_limited' | 'truncated' | 'force_cooldown' | 'upstream_5xx' | 'other_failures' | 'substituted';
-  count: number;
-  tone: 'tone-danger' | 'tone-warn';
-}
-
-/** Top two causes for the delivery tile, prioritizing failures before served model substitutions. */
-export function deliveryFailureCauses(summary: TrendsTelemetrySummary | undefined): DeliveryCause[] {
-  if (!summary) return [];
-  return [
-    ...([
-      { key: 'rate_limited', count: summary.rate_limited_429, tone: 'tone-danger' },
-      { key: 'truncated', count: summary.stream_truncated, tone: 'tone-danger' },
-      { key: 'force_cooldown', count: summary.force_cooldown, tone: 'tone-danger' },
-      { key: 'upstream_5xx', count: summary.upstream_5xx, tone: 'tone-danger' },
-      { key: 'other_failures', count: summary.other_failures, tone: 'tone-danger' },
-    ] as const).filter((cause) => cause.count > 0).sort((left, right) => right.count - left.count),
-    ...(summary.model_substituted > 0 ? [{ key: 'substituted', count: summary.model_substituted, tone: 'tone-warn' } as const] : []),
-  ].slice(0, 2);
-}
-
 export const STABILITY_LANES = ['rate_limited_429', 'stream_truncated', 'force_cooldown', 'upstream_5xx', 'other_failures', 'model_substituted'] as const;
 export type StabilityLane = (typeof STABILITY_LANES)[number];
+export const STABILITY_FAILURE_LANES = ['rate_limited_429', 'stream_truncated', 'force_cooldown', 'upstream_5xx', 'other_failures'] as const;
+export type StabilityFailureLane = (typeof STABILITY_FAILURE_LANES)[number];
+export const STABILITY_ATTRIBUTION_DIMS = ['model', 'provider', 'credential'] as const;
+export type StabilityAttributionDim = (typeof STABILITY_ATTRIBUTION_DIMS)[number];
+
+export function isStabilityFailureLane(lane: StabilityLane | null | undefined): lane is StabilityFailureLane {
+  return lane !== null && lane !== undefined && lane !== 'model_substituted';
+}
 
 export interface StabilityLaneRow {
   lane: StabilityLane;
@@ -698,6 +730,9 @@ export interface StabilityDisplayBucket {
   last_start_ms: number;
   end_ms: number;
   span_count: number;
+  total_requests: number;
+  success_requests: number;
+  failed_requests: number;
   rate_limited_429: number;
   stream_truncated: number;
   force_cooldown: number;
@@ -726,6 +761,9 @@ export function stabilityDisplayBuckets(
     const last = slice[slice.length - 1]!;
     const next = buckets[index + groupSize];
     const endMs = next ? next.start_ms : Math.max(last.start_ms, windowEndMs);
+    let total_requests = 0;
+    let success_requests = 0;
+    let failed_requests = 0;
     let rate_limited_429 = 0;
     let stream_truncated = 0;
     let force_cooldown = 0;
@@ -733,6 +771,9 @@ export function stabilityDisplayBuckets(
     let other_failures = 0;
     let model_substituted = 0;
     for (const item of slice) {
+      total_requests += item.total_requests;
+      success_requests += item.success_requests;
+      failed_requests += item.failed_requests;
       rate_limited_429 += item.rate_limited_429;
       stream_truncated += item.stream_truncated;
       force_cooldown += item.force_cooldown;
@@ -745,6 +786,9 @@ export function stabilityDisplayBuckets(
       last_start_ms: last.start_ms,
       end_ms: endMs,
       span_count: slice.length,
+      total_requests,
+      success_requests,
+      failed_requests,
       rate_limited_429,
       stream_truncated,
       force_cooldown,
@@ -762,6 +806,9 @@ export function stabilityDisplayBuckets(
         last_start_ms: tail.last_start_ms,
         end_ms: tail.end_ms,
         span_count: prev.span_count + tail.span_count,
+        total_requests: prev.total_requests + tail.total_requests,
+        success_requests: prev.success_requests + tail.success_requests,
+        failed_requests: prev.failed_requests + tail.failed_requests,
         rate_limited_429: prev.rate_limited_429 + tail.rate_limited_429,
         stream_truncated: prev.stream_truncated + tail.stream_truncated,
         force_cooldown: prev.force_cooldown + tail.force_cooldown,
@@ -775,11 +822,507 @@ export function stabilityDisplayBuckets(
   return cells;
 }
 
+export interface StabilityAttributionPeer {
+  id: string;
+  label: string;
+  count: number;
+}
+
+export interface StabilityAttributionRow {
+  dimension: StabilityAttributionDim;
+  /** Filterable id (`model`, `provider`, or `auth_index`); empty when unassigned. */
+  id: string;
+  /** Projected display label from the server. */
+  label: string;
+  /** Primary provider for credential rows, so credential failures show their provider context. */
+  providerId?: string;
+  providerLabel?: string;
+  /** Complementary failing entities (providers for model rows; models for provider/credential rows). */
+  peers: StabilityAttributionPeer[];
+  /** Distinct non-empty credentials affected (for model/provider rows). */
+  credentialCount: number;
+  /** Failure count in the active scope (overall failures or selected lane). */
+  failures: number;
+  /** Total requests for this entity in the active scope (denominator for failure rate). */
+  totalRequests: number;
+  /** Share of failures (`failures / totalRequests`), or null when denominator is unknown/zero. */
+  failureRate: number | null;
+  lanes: Record<UsageFailureCategory, number>;
+  statusCodes: TrendsStatusCount[];
+  lastFailedAtMs: number;
+  drillDisabled: boolean;
+}
+
+function statusMatchesLane(code: number, lane: UsageFailureCategory | null | undefined): boolean {
+  if (!lane) return true;
+  // Shared tuple status histograms cannot separate status codes belonging to protocol-level
+  // stream_truncated or force_cooldown failures from co-occurring failures in the same tuple,
+  // so omit shared status distributions when focused on those lanes.
+  if (lane === 'stream_truncated' || lane === 'force_cooldown') return false;
+  if (lane === 'rate_limited_429') return code === 429;
+  if (lane === 'upstream_5xx') return code >= 500 && code < 600;
+  return code !== 429 && !(code >= 500 && code < 600);
+}
+
+const STABILITY_FAILURE_LANES_LIST: readonly UsageFailureCategory[] = [
+  'rate_limited_429',
+  'upstream_5xx',
+  'stream_truncated',
+  'force_cooldown',
+  'other_failures',
+];
+
+/**
+ * True when every failure event recorded in `group` belongs exclusively to `lane`,
+ * so tuple-level `last_failed_at_ms` is guaranteed to describe that lane alone.
+ */
+export function isFailureGroupExclusiveToLane(
+  group: TrendsFailureGroup,
+  lane: UsageFailureCategory,
+): boolean {
+  const laneCount = group[lane];
+  if (laneCount <= 0) return false;
+  if (group.failed_requests > laneCount) return false;
+  return STABILITY_FAILURE_LANES_LIST.every((other) => other === lane || group[other] === 0);
+}
+
+/**
+ * Rolls failure attribution tuples (`model × provider × credential`) up into a ranked list for one
+ * dimension, optionally narrowed to a single failure lane. Entity denominators come from the
+ * server's exact window totals rather than summing only failing channels.
+ */
+export function aggregateStabilityFailures(
+  groups: readonly TrendsFailureGroup[] | undefined,
+  dimension: StabilityAttributionDim,
+  activeLane?: UsageFailureCategory | null,
+  options?: { isPartial?: boolean },
+): StabilityAttributionRow[] {
+  if (!groups || groups.length === 0) return [];
+  const isPartial = Boolean(options?.isPartial);
+  type Acc = {
+    id: string;
+    label: string;
+    providerCounts: Map<string, { id: string; label: string; count: number }>;
+    peers: Map<string, StabilityAttributionPeer>;
+    credentials: Set<string>;
+    failures: number;
+    totalRequests: number;
+    lanes: Record<UsageFailureCategory, number>;
+    statusCodes: Map<number, number>;
+    lastFailedAtMs: number;
+    isLastSeenExact: boolean;
+    hasDrillableGroup: boolean;
+  };
+  const map = new Map<string, Acc>();
+
+  for (const group of groups) {
+    const count = activeLane
+      ? group[activeLane]
+      : Math.max(
+          group.failed_requests,
+          group.rate_limited_429,
+          group.upstream_5xx,
+          group.stream_truncated,
+          group.force_cooldown,
+          group.other_failures,
+        );
+    if (count <= 0) continue;
+
+    let id: string;
+    let label: string;
+    let entityTotal: number;
+    if (dimension === 'model') {
+      id = group.model_id ?? group.model;
+      label = group.model;
+      entityTotal = id ? group.model_total_requests : 0;
+    } else if (dimension === 'provider') {
+      id = group.provider_id ?? group.provider;
+      label = group.provider;
+      entityTotal = id ? group.provider_total_requests : 0;
+    } else {
+      id = group.auth_index_id ?? group.auth_index ?? '';
+      label = group.auth_index ?? '';
+      // Unassigned credentials lack an all-requests denominator across non-failing tuples, so omit
+      // the rate rather than computing it from failing tuples alone.
+      entityTotal = id ? (group.credential_total_requests ?? 0) : 0;
+    }
+
+    const key = `${id}\u0000${label}`;
+    let acc = map.get(key);
+    if (!acc) {
+      acc = {
+        id,
+        label,
+        providerCounts: new Map(),
+        peers: new Map(),
+        credentials: new Set(),
+        failures: 0,
+        totalRequests: 0,
+        lanes: {
+          rate_limited_429: 0,
+          upstream_5xx: 0,
+          stream_truncated: 0,
+          force_cooldown: 0,
+          other_failures: 0,
+        },
+        statusCodes: new Map(),
+        lastFailedAtMs: 0,
+        isLastSeenExact: true,
+        hasDrillableGroup: false,
+      };
+      map.set(key, acc);
+    }
+
+    acc.failures += count;
+    if (entityTotal > acc.totalRequests) {
+      acc.totalRequests = entityTotal;
+    }
+    if (activeLane) {
+      // Only record the selected lane's count; tuple-wide sibling lane counts do not prove
+      // per-request intersection.
+      acc.lanes[activeLane] += count;
+      if (!isFailureGroupExclusiveToLane(group, activeLane)) {
+        acc.isLastSeenExact = false;
+      } else if ((group.last_failed_at_ms ?? 0) > acc.lastFailedAtMs) {
+        acc.lastFailedAtMs = group.last_failed_at_ms ?? 0;
+      }
+    } else {
+      acc.lanes.rate_limited_429 += group.rate_limited_429;
+      acc.lanes.upstream_5xx += group.upstream_5xx;
+      acc.lanes.stream_truncated += group.stream_truncated;
+      acc.lanes.force_cooldown += group.force_cooldown;
+      acc.lanes.other_failures += group.other_failures;
+      if ((group.last_failed_at_ms ?? 0) > acc.lastFailedAtMs) {
+        acc.lastFailedAtMs = group.last_failed_at_ms ?? 0;
+      }
+    }
+    if (!group.drill_disabled && id !== '') {
+      acc.hasDrillableGroup = true;
+    }
+    const credKey = group.auth_index_id ?? group.auth_index ?? '';
+    if (credKey) acc.credentials.add(credKey);
+
+    const provId = group.provider_id ?? group.provider;
+    if (provId || group.provider) {
+      const prev = acc.providerCounts.get(provId) ?? { id: provId, label: group.provider, count: 0 };
+      prev.count += count;
+      acc.providerCounts.set(provId, prev);
+    }
+
+    const peerId = dimension === 'model' ? provId : (group.model_id ?? group.model);
+    const peerLabel = dimension === 'model' ? group.provider : group.model;
+    if (peerId || peerLabel) {
+      const peerKey = `${peerId}\u0000${peerLabel}`;
+      const prevPeer = acc.peers.get(peerKey) ?? { id: peerId, label: peerLabel, count: 0 };
+      prevPeer.count += count;
+      acc.peers.set(peerKey, prevPeer);
+    }
+
+    const skipAmbiguousOtherStatuses =
+      activeLane === 'other_failures' && (group.stream_truncated > 0 || group.force_cooldown > 0);
+    if (!skipAmbiguousOtherStatuses) {
+      for (const entry of group.status_codes ?? []) {
+        if (entry.code <= 0 || entry.count <= 0) continue;
+        if (!statusMatchesLane(entry.code, activeLane)) continue;
+        acc.statusCodes.set(entry.code, (acc.statusCodes.get(entry.code) ?? 0) + entry.count);
+      }
+    }
+  }
+
+  return [...map.values()]
+    .map<StabilityAttributionRow>((acc) => {
+      const peers = [...acc.peers.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+      const topProvider = [...acc.providerCounts.values()].sort((a, b) => b.count - a.count || a.label.localeCompare(b.label))[0];
+      const statusCodes = [...acc.statusCodes.entries()]
+        .map(([code, count]) => ({ code, count }))
+        .sort((a, b) => b.count - a.count || a.code - b.code);
+      const denominator = !isPartial && acc.totalRequests > 0 ? Math.max(acc.totalRequests, acc.failures) : 0;
+      return {
+        dimension,
+        id: acc.id,
+        label: acc.label,
+        providerId: dimension === 'credential' ? topProvider?.id : undefined,
+        providerLabel: dimension === 'credential' ? topProvider?.label : undefined,
+        peers,
+        credentialCount: acc.credentials.size,
+        failures: acc.failures,
+        totalRequests: denominator,
+        failureRate: denominator > 0 ? acc.failures / denominator : null,
+        lanes: acc.lanes,
+        statusCodes,
+        lastFailedAtMs: acc.isLastSeenExact ? acc.lastFailedAtMs : 0,
+        drillDisabled: !acc.hasDrillableGroup,
+      };
+    })
+    .sort((left, right) => {
+      if (left.failures !== right.failures) return right.failures - left.failures;
+      const lr = left.failureRate ?? -1;
+      const rr = right.failureRate ?? -1;
+      if (lr !== rr) return rr - lr;
+      if (left.lastFailedAtMs !== right.lastFailedAtMs) return right.lastFailedAtMs - left.lastFailedAtMs;
+      return left.label.localeCompare(right.label);
+    });
+}
+
+/**
+ * Derives failure attribution tuples from raw usage events (used as a clean fallback in Demo mode
+ * when slicing a custom time cell whose telemetry snapshot was not pre-exported).
+ *
+ * `isCapped` marks a truncated sample (`has_more === true` or failure-only reads): when set,
+ * entity totals are left as 0 so callers display exact sample counts without a misleading rate.
+ */
+export function deriveFailureGroupsFromEvents(
+  events: readonly (UsageEvent & { fail_code?: string })[],
+  options?: { isCapped?: boolean; omitUncategorizedOther?: boolean },
+): TrendsFailureGroup[] {
+  if (events.length === 0) return [];
+  const isCapped = Boolean(options?.isCapped);
+  const omitUncategorizedOther = Boolean(options?.omitUncategorizedOther);
+  const modelTotals = new Map<string, number>();
+  const providerTotals = new Map<string, number>();
+  const credTotals = new Map<string, number>();
+  const comboTotals = new Map<string, number>();
+  type Acc = {
+    model: string;
+    provider: string;
+    authIndex: string;
+    failed: number;
+    rl429: number;
+    up5xx: number;
+    truncated: number;
+    cooldown: number;
+    other: number;
+    codes: Map<number, number>;
+    lastMs: number;
+  };
+  const failed = new Map<string, Acc>();
+  for (const event of events) {
+    const model = event.model || '';
+    const provider = event.provider || 'unknown';
+    const authIndex = event.auth_index?.trim() || '';
+    const key = `${model}\u0000${provider}\u0000${authIndex}`;
+    modelTotals.set(model, (modelTotals.get(model) ?? 0) + 1);
+    providerTotals.set(provider, (providerTotals.get(provider) ?? 0) + 1);
+    if (authIndex) credTotals.set(authIndex, (credTotals.get(authIndex) ?? 0) + 1);
+    comboTotals.set(key, (comboTotals.get(key) ?? 0) + 1);
+    const failCode = event.fail_code ?? '';
+    const isTruncated = failCode === 'stream_truncated';
+    const isCooldown = failCode === 'force_cooldown';
+    if (!event.failed && !isTruncated && !isCooldown) continue;
+    let acc = failed.get(key);
+    if (!acc) {
+      acc = {
+        model,
+        provider,
+        authIndex,
+        failed: 0,
+        rl429: 0,
+        up5xx: 0,
+        truncated: 0,
+        cooldown: 0,
+        other: 0,
+        codes: new Map(),
+        lastMs: 0,
+      };
+      failed.set(key, acc);
+    }
+    if (event.failed) acc.failed += 1;
+    const code = event.fail_status_code ?? 0;
+    const is429 = event.failed && code === 429;
+    const is5xx = event.failed && code >= 500 && code < 600;
+    if (is429) acc.rl429 += 1;
+    if (is5xx) acc.up5xx += 1;
+    if (isTruncated) acc.truncated += 1;
+    if (isCooldown) acc.cooldown += 1;
+    if (
+      event.failed &&
+      !is429 &&
+      !is5xx &&
+      !isTruncated &&
+      !isCooldown &&
+      (!omitUncategorizedOther || event.fail_code !== undefined)
+    ) {
+      acc.other += 1;
+    }
+    if (code > 0) acc.codes.set(code, (acc.codes.get(code) ?? 0) + 1);
+    if (event.timestamp_ms > acc.lastMs) acc.lastMs = event.timestamp_ms;
+  }
+  return [...failed.entries()].map(([key, acc]) => ({
+    model: acc.model,
+    provider: acc.provider,
+    auth_index: acc.authIndex || undefined,
+    total_requests: isCapped ? 0 : (comboTotals.get(key) ?? acc.failed),
+    model_total_requests: isCapped ? 0 : (modelTotals.get(acc.model) ?? acc.failed),
+    provider_total_requests: isCapped ? 0 : (providerTotals.get(acc.provider) ?? acc.failed),
+    credential_total_requests: !isCapped && acc.authIndex ? credTotals.get(acc.authIndex) : undefined,
+    failed_requests: acc.failed,
+    rate_limited_429: acc.rl429,
+    upstream_5xx: acc.up5xx,
+    stream_truncated: acc.truncated,
+    force_cooldown: acc.cooldown,
+    other_failures: acc.other,
+    status_codes: [...acc.codes.entries()]
+      .map(([code, count]) => ({ code, count }))
+      .sort((a, b) => b.count - a.count || a.code - b.code),
+    last_failed_at_ms: acc.lastMs,
+  }));
+}
+
+/** Derives substitution pairs from raw usage events for Demo mode cell slices. */
+export function deriveSubstitutionPairsFromEvents(events: readonly UsageEvent[]): TrendsSubstitutionPair[] {
+  const counts = new Map<string, TrendsSubstitutionPair>();
+  for (const event of events) {
+    if (!event.model_substituted || !event.response_model) continue;
+    const requested = event.model || '';
+    const served = event.response_model;
+    const provider = event.provider || 'unknown';
+    const key = `${requested}\u0000${served}\u0000${provider}`;
+    const existing = counts.get(key);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      counts.set(key, { requested_model: requested, served_model: served, provider, count: 1 });
+    }
+  }
+  return [...counts.values()].sort(
+    (a, b) =>
+      b.count - a.count ||
+      a.requested_model.localeCompare(b.requested_model) ||
+      a.served_model.localeCompare(b.served_model) ||
+      a.provider.localeCompare(b.provider),
+  );
+}
+
+/** Query string for Demo mode cell attribution: reads all requests (successes + failures) so denominators stay honest. */
+export function stabilityDemoSliceEventsQueryString(
+  window: Pick<InsightsWindow, 'from' | 'to'>,
+  filters: TrendsFilters,
+  cell: Pick<StabilityDisplayBucket, 'start_ms' | 'end_ms'>,
+  limit = 200,
+): string | null {
+  const span = stabilityWindowForCell(window, cell);
+  if (!span) return null;
+  const href = trendsEventsHref(span, filters, { result: 'all', limit: String(limit) }, { isDemo: true });
+  if (!href) return null;
+  const queryStart = href.indexOf('?');
+  return queryStart >= 0 ? href.slice(queryStart + 1) : '';
+}
+
+export function stabilityFilterKeyForDim(dimension: StabilityAttributionDim): TrendsFilterKey {
+  switch (dimension) {
+    case 'model': return 'model';
+    case 'provider': return 'provider';
+    case 'credential': return 'auth_index';
+  }
+}
+
+/**
+ * Clamps a stability display cell's span inside the resolved window. Returns `null` when the
+ * intersection is a single instant (`to <= from`), because both `/trends/telemetry` and
+ * `/usage/events` reject `from >= to` and widening `to` would spill into the next bucket.
+ */
+export function stabilityWindowForCell(
+  window: Pick<InsightsWindow, 'from' | 'to'>,
+  cell: Pick<StabilityDisplayBucket, 'start_ms' | 'end_ms'>,
+): { from: number; to: number; open_end: false } | null {
+  const from = Math.max(window.from, cell.start_ms);
+  const rawEnd = cell.end_ms > cell.start_ms ? cell.end_ms - 1 : cell.end_ms;
+  const clampedEnd = Math.min(window.to, rawEnd);
+  if (clampedEnd <= from) return null;
+  return { from, to: clampedEnd, open_end: false };
+}
+
+/** Query string for fetching exact failure attribution & substitutions inside one clicked stability cell. */
+export function stabilitySliceTelemetryParams(
+  window: Pick<InsightsWindow, 'from' | 'to'>,
+  cell: Pick<StabilityDisplayBucket, 'start_ms' | 'end_ms'>,
+  filters: TrendsFilters,
+): string | null {
+  const span = stabilityWindowForCell(window, cell);
+  if (!span) return null;
+  const params = new URLSearchParams();
+  params.set('from', String(span.from));
+  params.set('to', String(span.to));
+  params.set('top', '1');
+  appendFilters(params, filters);
+  return params.toString();
+}
+
+export interface StabilityDrillScope {
+  lane?: StabilityLane | null;
+  cell?: Pick<StabilityDisplayBucket, 'start_ms' | 'end_ms'> | null;
+  entity?: { dimension: StabilityAttributionDim; id: string } | null;
+  limit?: number;
+}
+
+/** Query string (without leading `?`) for fetching or opening request records matching a stability focus. */
+export function stabilityEventsQueryString(
+  window: Pick<InsightsWindow, 'from' | 'to' | 'open_end'>,
+  filters: TrendsFilters,
+  scope: StabilityDrillScope,
+  options?: { isDemo?: boolean },
+): string | null {
+  const targetWindow = scope.cell ? stabilityWindowForCell(window, scope.cell) : window;
+  if (!targetWindow) return null;
+  const narrowed: TrendsFilters = { ...filters };
+  if (scope.entity) {
+    if (!scope.entity.id) return null;
+    const key = stabilityFilterKeyForDim(scope.entity.dimension);
+    narrowed[key] = [scope.entity.id];
+  }
+  const extra: Record<string, string> = {};
+  if (scope.lane === 'model_substituted') {
+    extra.served = 'substituted';
+  } else if (isStabilityFailureLane(scope.lane)) {
+    if (scope.lane !== 'stream_truncated' && scope.lane !== 'force_cooldown') {
+      extra.result = 'failed';
+    }
+    extra.failure = scope.lane;
+  } else {
+    extra.result = 'failed';
+  }
+  if (scope.limit !== undefined) extra.limit = String(scope.limit);
+  const href = trendsEventsHref(targetWindow, narrowed, extra, { isDemo: options?.isDemo });
+  if (!href) return null;
+  const queryStart = href.indexOf('?');
+  return queryStart >= 0 ? href.slice(queryStart + 1) : '';
+}
+
+/** Full `/usage/events?...` link for a stability lane, cell, or failing entity. */
+export function stabilityEventsHref(
+  window: Pick<InsightsWindow, 'from' | 'to' | 'open_end'>,
+  filters: TrendsFilters,
+  scope: StabilityDrillScope,
+  options?: { isDemo?: boolean },
+): string | null {
+  const query = stabilityEventsQueryString(window, filters, scope, options);
+  return query === null ? null : `/usage/events?${query}`;
+}
+
 export function stabilityLanes(buckets: readonly Pick<TrendsTelemetryBucket, StabilityLane>[]): StabilityLaneRow[] {
   return STABILITY_LANES.map((lane) => {
     const counts = buckets.map((bucket) => bucket[lane]);
     return { lane, counts, total: counts.reduce((sum, count) => sum + count, 0), max: Math.max(0, ...counts) };
   });
+}
+
+/** The failure share at which a stability cell reaches full strength: the attribution table's danger band. */
+export const STABILITY_SATURATION_RATE = 0.2;
+/** The faintest a cell with any event is drawn, so a single failure stays visible on the track. */
+const STABILITY_MIN_WEIGHT = 24;
+/** The strongest a cell is drawn; even an outage stops short of the raw state hue. */
+const STABILITY_MAX_WEIGHT = 88;
+
+/**
+ * How strongly a stability cell is tinted, in percent of its lane hue. Strength follows the share of
+ * the cell's requests the lane caught, not the count against the lane's own peak: one failure among
+ * thousands of answers stays a faint mark instead of a full red block. The square root keeps small
+ * shares distinguishable from each other.
+ */
+export function stabilityCellWeight(count: number, totalRequests: number): number {
+  if (count <= 0) return 0;
+  const share = totalRequests > 0 ? Math.min(1, count / totalRequests / STABILITY_SATURATION_RATE) : 1;
+  return Math.round(STABILITY_MIN_WEIGHT + (STABILITY_MAX_WEIGHT - STABILITY_MIN_WEIGHT) * Math.sqrt(share));
 }
 
 export function hasStabilityActivity(data: Pick<TrendsTelemetryResponse, 'buckets' | 'substitution_pairs'>): boolean {
@@ -789,55 +1332,6 @@ export function hasStabilityActivity(data: Pick<TrendsTelemetryResponse, 'bucket
 /** The share of requests that succeeded, or null without any. */
 export function successRate(summary: Pick<TrendsTelemetrySummary, 'total_requests' | 'success_requests'>): number | null {
   return summary.total_requests > 0 ? summary.success_requests / summary.total_requests : null;
-}
-
-// ── Lenses ─────────────────────────────────────────────────────────────────
-
-/** A span of time a chart is looking at, inclusive of both ends. */
-export interface TimeSpan {
-  start: number;
-  end: number;
-}
-
-/** The closest a quota lens zooms: one bucket of the cycle, and never under a quarter hour. */
-export function quotaLensMinSpan(window: TrendsQuotaWindow): number {
-  const bucketSpans = window.buckets.map((bucket) => bucket.end_ms - bucket.start_ms).filter((span) => span > 0);
-  const bucket = bucketSpans.length > 0 ? Math.min(...bucketSpans) : 0;
-  return Math.min(window.cycle_reset_ms - window.cycle_start_ms, Math.max(15 * 60_000, bucket));
-}
-
-/**
- * Holds a lens inside its bounds without changing its width where it can: a lens pushed past an
- * edge slides back rather than shrinking, and one narrower than the minimum widens about its centre.
- */
-export function clampLens(lens: TimeSpan, bounds: TimeSpan, minSpan: number): TimeSpan {
-  const total = bounds.end - bounds.start;
-  let span = Math.min(total, Math.max(minSpan, lens.end - lens.start));
-  if (!Number.isFinite(span) || span <= 0) span = total;
-  const centre = (lens.start + lens.end) / 2;
-  let start = centre - span / 2;
-  if (lens.end - lens.start >= minSpan) start = lens.start;
-  start = Math.min(Math.max(start, bounds.start), bounds.end - span);
-  return { start, end: start + span };
-}
-
-/** Zooms a lens by `factor` (under 1 closes in) about an instant, which keeps its place on screen. */
-export function zoomLens(lens: TimeSpan, bounds: TimeSpan, factor: number, minSpan: number, anchor = (lens.start + lens.end) / 2): TimeSpan {
-  const span = lens.end - lens.start;
-  const next = Math.min(bounds.end - bounds.start, Math.max(minSpan, span * factor));
-  const share = span > 0 ? (anchor - lens.start) / span : 0.5;
-  const start = anchor - next * share;
-  return clampLens({ start, end: start + next }, bounds, minSpan);
-}
-
-/** Slides a lens by a stretch of time, stopping at the bounds. */
-export function panLens(lens: TimeSpan, bounds: TimeSpan, deltaMs: number, minSpan: number): TimeSpan {
-  return clampLens({ start: lens.start + deltaMs, end: lens.end + deltaMs }, bounds, minSpan);
-}
-
-/** The lens a sweep between two instants selects, in either direction. */
-export function lensFromSweep(a: number, b: number, bounds: TimeSpan, minSpan: number): TimeSpan {
-  return clampLens({ start: Math.min(a, b), end: Math.max(a, b) }, bounds, minSpan);
 }
 
 export const HOUR_LIMIT_MS = 14 * 24 * 60 * 60 * 1000;

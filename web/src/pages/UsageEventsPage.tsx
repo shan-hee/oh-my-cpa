@@ -3,7 +3,7 @@ import { useTimeZone } from '../utils/TimeZoneProvider';
 import React from 'react';
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from '@/components/ui/popover';
 import { Button } from '@/components/ui/button';
-import { StatusDot } from '@/components/ui/badge';
+import { StatusLabel, type StatusTone } from '../components/common/StatusLabel';
 import clsx from 'clsx';
 import { TablePlaceholder } from '../components/common/ContentPlaceholder';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
@@ -421,6 +421,7 @@ export const UsageEventsPage: React.FC = () => {
     cost: 'events.filter_chip_cost_state',
     served: 'events.filter_chip_served_model',
     transport: 'events.filter_chip_transport',
+    failure: 'events.filter_chip_failure',
     client_agent: 'events.filter_chip_client_agent',
   };
 
@@ -462,6 +463,13 @@ export const UsageEventsPage: React.FC = () => {
           websocket: t('events.transport_websocket'),
           sse: t('events.transport_sse'),
           http: t('events.transport_http'),
+        },
+        failureLabels: {
+          rate_limited_429: t('events.failure_rate_limited_429'),
+          upstream_5xx: t('events.failure_upstream_5xx'),
+          stream_truncated: t('events.failure_stream_truncated'),
+          force_cooldown: t('events.failure_force_cooldown'),
+          other_failures: t('events.failure_other_failures'),
         },
       });
       return { label: t(chipLabels[key], { val: shown }) };
@@ -587,14 +595,14 @@ export const UsageEventsPage: React.FC = () => {
       selection,
     ],
   );
-  const ingestTone =
+  const ingestTone: StatusTone =
     !status || ingest.isError
-      ? 'default'
+      ? 'neutral'
       : status.enabled === false
-        ? 'default'
+        ? 'neutral'
         : status.healthy === true && !status.collector?.coverage_gaps
           ? 'success'
-          : 'warning';
+          : 'warn';
   const ingestLabel =
     !status || ingest.isError
       ? 'events.ingest_unknown'
@@ -620,8 +628,8 @@ export const UsageEventsPage: React.FC = () => {
               <Popover>
                 <PopoverTrigger
                   render={
-                    <Button variant="ghost">
-                      <StatusDot status={ingestTone} text={t(ingestLabel)} />
+                    <Button variant="ghost" className="request-ingest-trigger">
+                      <StatusLabel tone={ingestTone}>{t(ingestLabel)}</StatusLabel>
                     </Button>
                   }
                 />
