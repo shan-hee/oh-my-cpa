@@ -125,6 +125,7 @@ func demoExportCases() []demoExportCase {
 		{Name: "system-maintenance", Path: "/api/v1/management/system/maintenance"},
 		{Name: "system-data-retention", Path: "/api/v1/management/system/data-retention"},
 		{Name: "outbound-proxy", Path: "/api/v1/management/outbound-proxy"},
+		{Name: "github-token", Path: "/api/v1/management/github-token"},
 		{Name: "config", Path: "/api/v1/management/config"},
 		{Name: "config-source", Path: "/api/v1/management/config/source"},
 		{Name: "config-backups", Path: "/api/v1/management/config/backups"},
@@ -143,6 +144,7 @@ func demoExportCases() []demoExportCase {
 		{Name: "client-key-aliases", Path: "/api/v1/management/client-key-aliases"},
 		{Name: "model-square", Path: "/api/v1/management/model-square"},
 		{Name: "pricing", Path: "/api/v1/pricing"},
+		{Name: "pricing-sync-schedule", Path: "/api/v1/pricing/sync-schedule"},
 		{Name: "pricing-attention", Path: "/api/v1/pricing/attention"},
 		{Name: "pricing-catalog", Path: "/api/v1/pricing/catalog"},
 		{Name: "plugins", Path: "/api/v1/management/plugins"},
@@ -162,6 +164,7 @@ func demoExportCases() []demoExportCase {
 		// without a name is what the console's own model picker sends.
 		{Name: "auth-files-model-aliases", Path: "/api/v1/management/auth-files/model-aliases"},
 		{Name: "auth-files-excluded-models", Path: "/api/v1/management/auth-files/excluded-models"},
+		{Name: "auth-files-request-scoped-errors", Path: "/api/v1/management/auth-files/request-scoped-errors"},
 		// The rule editors read one catalog per provider; these are the fixture's
 		// providers that carry rules, which are the ones the drawer opens on.
 		{Name: "auth-files-provider-models-claude", Path: "/api/v1/management/auth-files/provider-models?provider=claude"},

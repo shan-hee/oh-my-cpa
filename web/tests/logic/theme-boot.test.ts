@@ -582,6 +582,18 @@ test('foldable panels, Collapse variants, and payload builder do not clip edge s
   assert.match(payloadBranch, /className="payload-builder-group"/);
   assert.equal(/settings-group(?!-head)/.test(payloadBranch), false);
   assert.equal(/settings-group-body/.test(payloadBranch), false);
+
+  // Toast item lists sit inside the toast's scrollable body on an elevated surface, so they use an
+  // inset well on a recessed surface fill rather than an outset edge shadow that scroll clipping cuts off.
+  const toastReportRule = indexCss.match(/\.omc-toast-report\s*\{([^}]*)\}/)?.[1] ?? '';
+  assert.ok(toastReportRule.length > 0);
+  assert.doesNotMatch(toastReportRule, /\boverflow(?:-y)?:\s*(?:auto|scroll|hidden)\b/);
+
+  const toastItemsRule = indexCss.match(/\.omc-toast-items\s*\{([^}]*)\}/)?.[1] ?? '';
+  assert.ok(toastItemsRule.length > 0);
+  assert.match(toastItemsRule, /\bbackground:\s*var\(--surface\)\s*;/);
+  assert.match(toastItemsRule, /\bbox-shadow:\s*var\(--shadow-well\)\s*;/);
+  assert.doesNotMatch(toastItemsRule, /\b--shadow-edge\b/);
 });
 
 test('no retired input-wrapper slot selectors remain and alignment invariants hold', () => {
@@ -624,12 +636,13 @@ test('chip primitives keep unified breathing room, centered icons, and unclipped
 
   // Small chips share a 20px box with 7px inline padding so 12px UI/CJK text and icons have room.
   assert.match(indexCss, /\.tag\.is-small\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
-  assert.match(indexCss, /\.status-label\.is-small\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
+  assert.match(indexCss, /\.status-label\.is-small\s*\{[^}]*height:\s*20px;/);
+  assert.match(indexCss, /\.status-label\.is-chip\.is-small\s*\{[^}]*padding-inline:\s*7px;/);
   assert.match(indexCss, /\.omc-notice-label\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
   assert.match(indexCss, /\.demo-chip\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
   assert.match(glyphCss, /\.badge\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
   assert.match(prefixCss, /\.prefix-chip\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*height:\s*20px;/);
-  assert.match(requestListCss, /\.req-result-pill\s*\{[^}]*height:\s*20px;[^}]*padding:\s*0 7px;/);
+  assert.match(requestListCss, /\.req-result-pill\s*\{[^}]*height:\s*20px;[^}]*padding:\s*calc\(\(20px - 1\.25em\) \/ 2\) 7px;/);
 
   // Chip icons center inside the flex container and stay capped inside the chip's inner height.
   assert.match(indexCss, /\.tag-icon\s*\{[^}]*align-items:\s*center;[^}]*justify-content:\s*center;/);
@@ -640,5 +653,39 @@ test('chip primitives keep unified breathing room, centered icons, and unclipped
   assert.match(indexCss, /\.status-label-text\s*\{[^}]*overflow:\s*hidden;[^}]*line-height:\s*1\.25;/);
   const comboboxTsx = stripCodeComments(readFileSync(path.join(sourceRoot, 'components/ui/combobox.tsx'), 'utf8'));
   assert.equal((comboboxTsx.match(/<LineSlot className="leading-\[1\.25\]">\{renderChipLabel\(val\)\}<\/LineSlot>/g) ?? []).length, 2);
+
+  // Secondary destructive buttons share the calm `--shadow-control` secondary material at rest and
+  // reveal the WCAG-AA danger wash/ink when approached or open, never a bespoke red outline ring.
+  const buttonTsx = stripCodeComments(readFileSync(path.join(sourceRoot, 'components/ui/button.tsx'), 'utf8'));
+  const destructiveSecondary = buttonTsx.match(/'destructive-secondary':\s*\n?\s*'([^']+)'/)?.[1] ?? '';
+  assert.ok(destructiveSecondary.length > 0);
+  assert.match(destructiveSecondary, /\bbg-secondary\b/);
+  assert.match(destructiveSecondary, /\bshadow-control\b/);
+  assert.match(destructiveSecondary, /\bhover:enabled:bg-danger-wash\b/);
+  assert.match(destructiveSecondary, /\bhover:enabled:text-danger-ink\b/);
+  assert.match(destructiveSecondary, /\bdata-\[popup-open\]:bg-danger-wash\b/);
+  assert.doesNotMatch(destructiveSecondary, /shadow-\[/);
+
+  // `--color-danger-ink` over `--color-danger-wash` and `--color-danger-wash-active` clears WCAG AA
+  // (>= 4.5:1) on bg, surface, and elevated grounds across every built-in palette.
+  const dangerInkShare = Number(/--color-danger-ink:\s*color-mix\(in srgb,\s*var\(--danger\)\s*(\d+)%,\s*var\(--fg\)\);/.exec(indexCss)?.[1]);
+  const dangerWashPct = Number(/--color-danger-wash:\s*color-mix\(in srgb,\s*var\(--danger\)\s*(\d+)%,\s*transparent\);/.exec(indexCss)?.[1]);
+  const dangerActivePct = Number(/--color-danger-wash-active:\s*color-mix\(in srgb,\s*var\(--danger\)\s*(\d+)%,\s*transparent\);/.exec(indexCss)?.[1]);
+  assert.ok(dangerInkShare > 0 && dangerWashPct > 0 && dangerActivePct > 0);
+  const contrastFloor = CONTRAST_FLOORS.text ?? 4.5;
+  for (const definition of BUILT_IN_PALETTES) {
+    const { palette } = resolvedBuiltInPalette(definition.id);
+    const ink = mixSrgb(palette.danger, palette.fg, (100 - dangerInkShare) / 100);
+    for (const [groundName, ground] of [['bg', palette.bg], ['surface', palette.surface], ['elevated', palette.elevated]] as const) {
+      for (const pct of [dangerWashPct, dangerActivePct]) {
+        const wash = mixSrgb(ground, palette.danger, pct / 100);
+        const ratio = contrastRatio(ink, wash);
+        assert.ok(ratio >= contrastFloor, `${definition.id} danger button on ${groundName} @${pct}% (${ratio.toFixed(2)}) < ${contrastFloor}`);
+      }
+    }
+  }
+
+  // Code elements follow the operator-configured `--font-mono` role rather than the browser UA fallback.
+  assert.match(indexCss, /code,\s*kbd,\s*samp,\s*pre\s*\{\s*font-family:\s*var\(--font-mono\);\s*\}/);
 });
 

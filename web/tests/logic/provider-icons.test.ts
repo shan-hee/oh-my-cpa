@@ -16,6 +16,7 @@ import {
   pluginOAuthProviderIds,
   pluginOAuthProviderKeys,
   pluginOAuthProviderLogos,
+  pluginOAuthProviderTitles,
   pluginMultiPortalKeys,
 } from '../../src/types/pluginOAuthProviders.ts';
 import { resolveProviderMark, resolveProviderPickerIcon, resolveCredentialMark, resolveMarkArtworks } from '../../src/types/brandMark';
@@ -60,6 +61,7 @@ test('every built-in OAuth provider reaches a brand mark that ships in the bundl
 test('the named credential rows carry the mark of the provider they name', () => {
   assert.deepEqual(getCredentialProviderMetadata('devin'), { id: 'devin', label: 'Devin', iconId: 'Devin' });
   assert.deepEqual(getCredentialProviderMetadata('meta'), { id: 'meta', label: 'Meta', iconId: 'Meta' });
+  assert.deepEqual(getCredentialProviderMetadata('copilot'), { id: 'copilot', label: 'GitHub Copilot', iconId: 'GithubCopilot' });
   // The CodeBuddy plugin declares `codebuddy` as its provider key; a build that
   // keeps the plugin's own id has to reach the same row.
   assert.equal(getCredentialProviderMetadata('codebuddy').iconId, 'CodeBuddy');
@@ -68,7 +70,30 @@ test('the named credential rows carry the mark of the provider they name', () =>
   // Case and padding are not part of the key.
   assert.equal(getCredentialProviderMetadata('DEViN').iconId, 'Devin');
   assert.equal(getCredentialProviderMetadata('  meta ').iconId, 'Meta');
+  assert.equal(getCredentialProviderMetadata(' COPILOT ').iconId, 'GithubCopilot');
   assert.equal(getCredentialProviderMetadata('not-a-brand').iconId, '');
+});
+
+test('GitHub Copilot resolves strictly to GithubCopilot rather than Microsoft Copilot and stays reserved for plugins', () => {
+  assert.equal(providerIconId('copilot'), 'GithubCopilot');
+  assert.equal(providerIconId('github-copilot'), 'GithubCopilot');
+  assert.equal(resolveProviderIcon('copilot'), 'GithubCopilot');
+  assert.equal(credentialProviderIconId('copilot'), 'GithubCopilot');
+  assert.equal(iconIdIsRenderable('GithubCopilot'), true);
+  assert.deepEqual(
+    resolveMarkArtworks({ iconId: 'GithubCopilot' }, { baseURL: '/omc/', customIconURL: () => '', customIcons: [] }),
+    [{ url: '/omc/lobe-icons/githubcopilot.svg', isMono: true }],
+  );
+  // A community plugin declaring a Copilot portal cannot rename the built-in GitHub Copilot brand,
+  // and Copilot itself is registered as a built-in device sign-in flow.
+  const customPlugin: PluginItem = { id: 'custom-copilot', name: 'Custom', enabled: true, supports_oauth: true, oauth_provider: 'copilot' };
+  assert.deepEqual(pluginOAuthProviderIds(customPlugin), ['copilot']);
+  assert.equal(pluginOAuthProviderTitles([customPlugin]).has('copilot'), false);
+  const copilotBuiltin = BUILTIN_OAUTH_PROVIDERS.find((provider) => provider.id === 'copilot');
+  assert.deepEqual(
+    copilotBuiltin ? { id: copilotBuiltin.id, iconId: copilotBuiltin.iconId, flow: copilotBuiltin.flow } : undefined,
+    { id: 'copilot', iconId: 'GithubCopilot', flow: 'device' },
+  );
 });
 
 test('a provider the table has not named still resolves through the icon catalog', () => {
