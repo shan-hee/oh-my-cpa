@@ -8025,7 +8025,7 @@
             "CookieAuth": []
           }
         ],
-        "description": "Redeem a Codex quota reset credit, clear gateway cooldown, and refresh the credential quota reading.",
+        "description": "Redeem a specific or earliest-expiring Codex quota reset credit, clear gateway cooldown, and refresh the credential quota reading.",
         "consumes": [
           "application/json"
         ],
@@ -8038,12 +8038,12 @@
         "summary": "Redeem Codex rate-limit reset credit",
         "parameters": [
           {
-            "description": "Codex credential auth_index",
+            "description": "Codex credential auth_index and optional credit_id",
             "name": "body",
             "in": "body",
             "required": true,
             "schema": {
-              "$ref": "#/definitions/api.quotaActionRequest"
+              "$ref": "#/definitions/api.quotaRedeemCreditRequest"
             }
           }
         ],
@@ -8068,6 +8068,12 @@
           },
           "404": {
             "description": "Not Found",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "409": {
+            "description": "Conflict",
             "schema": {
               "$ref": "#/definitions/api.ErrorResponseDTO"
             }
@@ -8701,6 +8707,70 @@
             "description": "OK",
             "schema": {
               "$ref": "#/definitions/api.QuotaCapacityHistoryResponseDTO"
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "500": {
+            "description": "Internal Server Error",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "schema": {
+              "$ref": "#/definitions/api.ErrorResponseDTO"
+            }
+          }
+        }
+      }
+    },
+    "/v1/management/quota/{authIndex}/subscription-cycle": {
+      "get": {
+        "security": [
+          {
+            "CookieAuth": []
+          }
+        ],
+        "description": "Return recorded usage across the current and previous subscription billing periods plus a pace-based full-cycle projection.",
+        "produces": [
+          "application/json"
+        ],
+        "tags": [
+          "Quota"
+        ],
+        "summary": "Get credential subscription-cycle usage",
+        "parameters": [
+          {
+            "type": "string",
+            "description": "Credential runtime auth_index",
+            "name": "authIndex",
+            "in": "path",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "schema": {
+              "$ref": "#/definitions/api.QuotaSubscriptionCycleResponseDTO"
             }
           },
           "400": {
@@ -17178,6 +17248,9 @@
         "cooldown_error": {
           "type": "string"
         },
+        "credit_id": {
+          "type": "string"
+        },
         "quota": {
           "$ref": "#/definitions/quota.NormalizedQuota"
         },
@@ -17260,6 +17333,29 @@
           "type": "string"
         },
         "windows_json": {
+          "type": "string"
+        }
+      }
+    },
+    "api.QuotaSubscriptionCycleResponseDTO": {
+      "type": "object",
+      "properties": {
+        "current": {
+          "$ref": "#/definitions/api.subscriptionCyclePeriodDTO"
+        },
+        "plan_label": {
+          "type": "string"
+        },
+        "previous": {
+          "$ref": "#/definitions/api.subscriptionCyclePeriodDTO"
+        },
+        "projection": {
+          "$ref": "#/definitions/quota.WindowCapacity"
+        },
+        "projection_unavailable": {
+          "type": "string"
+        },
+        "source": {
           "type": "string"
         }
       }
@@ -22557,6 +22653,17 @@
         }
       }
     },
+    "api.quotaRedeemCreditRequest": {
+      "type": "object",
+      "properties": {
+        "auth_index": {
+          "type": "string"
+        },
+        "credit_id": {
+          "type": "string"
+        }
+      }
+    },
     "api.refreshQuotaRequest": {
       "type": "object",
       "properties": {
@@ -22993,6 +23100,30 @@
         },
         "web_search_requests": {
           "type": "integer"
+        }
+      }
+    },
+    "api.subscriptionCyclePeriodDTO": {
+      "type": "object",
+      "properties": {
+        "elapsed_percent": {
+          "type": "number"
+        },
+        "from_ms": {
+          "type": "integer"
+        },
+        "measured_at_ms": {
+          "type": "integer"
+        },
+        "to_ms": {
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/definitions/quota.WindowUsage"
+        },
+        "widened": {
+          "description": "Widened reports that request records behind the retention horizon could not\nsplit an edge bucket, so usage was read across whole 15-minute fact buckets\nnamed by usage.from_ms and usage.to_ms.",
+          "type": "boolean"
         }
       }
     },
@@ -24169,6 +24300,10 @@
             "$ref": "#/definitions/quota.QuotaBalance"
           }
         },
+        "billing_period": {
+          "description": "\"weekly\", \"monthly\", \"quarterly\", \"yearly\"",
+          "type": "string"
+        },
         "credits": {
           "description": "Credits is the account's prepaid credit standing. Nil when the provider\nreports none.",
           "allOf": [
@@ -24205,6 +24340,10 @@
         "plan_type": {
           "description": "e.g. \"pro\", \"plus\", \"ultra\", \"team\", \"free\"",
           "type": "string"
+        },
+        "starts_at_ms": {
+          "description": "epoch ms",
+          "type": "integer"
         },
         "subscription_active": {
           "type": "boolean"

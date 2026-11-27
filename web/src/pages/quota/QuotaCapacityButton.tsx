@@ -15,12 +15,19 @@ export function QuotaCapacityScope({ isBlocked, children }: { isBlocked: boolean
   return <QuotaCapacityScopeContext.Provider value={value}>{children}</QuotaCapacityScopeContext.Provider>;
 }
 
+/** Reports whether an ancestor page overlay currently suppresses capacity dialogs. */
+export function useQuotaCapacityBlocked(): boolean {
+  return Boolean(React.useContext(QuotaCapacityScopeContext)?.isBlocked);
+}
+
 /** The credential a window belongs to, as the details name it. */
 export interface QuotaCapacityOwner {
   authIndex: string;
   credentialName: string;
   /** The credential's brand mark, drawn beside the details' title. */
   mark?: React.ReactNode;
+  /** Verified active subscription billing-period identity covering now; absent when unavailable. */
+  subscriptionPeriodKey?: string | null;
 }
 
 export interface QuotaCapacityButtonProps {
@@ -37,8 +44,7 @@ export interface QuotaCapacityButtonProps {
 
 /** Opens recorded consumption and model-conditioned forecast details. */
 export function QuotaCapacityButton({ owner, window, windows, className, hasTrigger = true, children }: QuotaCapacityButtonProps) {
-  const scope = React.useContext(QuotaCapacityScopeContext);
-  const isBlocked = Boolean(scope?.isBlocked);
+  const isBlocked = useQuotaCapacityBlocked();
   const [isOpen, setIsOpen] = React.useState(false);
   const [hasOpened, setHasOpened] = React.useState(false);
 

@@ -16,6 +16,7 @@ import { setReducedMotionPreference } from '../src/utils/motionPreference';
 import usageEventMessages from '../src/i18n/locales/en/usageEvents';
 import { StructuredUsageView } from '../src/components/usage/StructuredUsageView';
 import { UsageEventDrawer } from '../src/components/usage/UsageEventDrawer';
+import * as downloadUtils from '../src/utils/download';
 import { CostBreakdownView } from '../src/components/pricing/CostBreakdownView';
 import type { RequestCostBreakdown } from '../src/types/pricing';
 import { RequestRow } from '../src/components/usage/RequestRow';
@@ -144,6 +145,94 @@ it('propagates replay=calendar to usage-event detail reads with a separate query
     { client },
   );
   await waitFor(() => expect(api.requests.some((r) => r.path === '/usage/events/274' && r.query.get('replay') === 'calendar')).toBe(true));
+});
+
+it('downloads OMC record logs (.log and .json) for any event and previews CPA raw logs with switch guidance', async () => {
+  const saveSpy = vi.spyOn(downloadUtils, 'saveBlob').mockImplementation(() => undefined);
+  try {
+    const api = installOmcApi({
+      preferences: { omc_models_view: 'model', omc_request_model_icons: false },
+      logsStatus: { logging_to_file: true, request_log: false },
+    });
+    const client = createTestQueryClient();
+    client.setDefaultOptions({ queries: { retry: false, gcTime: Infinity, staleTime: Infinity } });
+    const eventWithoutRaw: UsageEvent = {
+      id: 301, event_key: 'evt-301', timestamp_ms: 1_800_000_000_000,
+      provider: 'codex', model: 'fixture-model', failed: false, generate: true,
+      latency_ms: 900, has_request_log: false,
+      tokens: { input: 80, output: 20, reasoning: 0, cached: 0, cache_read: 0, cache_creation: 0, total: 100 },
+    };
+    client.setQueryData(['usage-event', 301], { event: eventWithoutRaw, related_errors: [] });
+    client.setQueryData(['preferences'], { omc_models_view: 'model', omc_request_model_icons: false });
+
+    const first = renderWithOmc(
+      <TokenDisplayProvider>
+        <UsageEventDrawer eventId={301} credentials={new Map()} onClose={() => undefined} />
+      </TokenDisplayProvider>,
+      { client },
+    );
+
+    // Every record gets OMC record log download (.log and .json) at the bottom of the scrollable drawer body.
+    expect(screen.queryByTestId('drawer-view-raw-log')).toBeNull();
+    const recordDownloadBtn = await screen.findByTestId('drawer-download-record-log');
+    expect(document.querySelector('.request-detail [data-slot="sheet-footer"]')).toBeNull();
+    expect(recordDownloadBtn.closest('[data-slot="sheet-body"]')).not.toBeNull();
+    fireEvent.click(recordDownloadBtn);
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy.mock.calls[0][1]).toBe('record-event-301.log');
+    expect(await saveSpy.mock.calls[0][0].text()).toMatch(/=== (?:Request details|请求详情) ===/);
+
+    fireEvent.click(screen.getByTestId('drawer-record-log-menu'));
+    fireEvent.click(await screen.findByRole('menuitem', { name: /JSON \(\.json\)/ }));
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+    expect(saveSpy.mock.calls[1][1]).toBe('record-event-301.json');
+    expect(JSON.parse(await saveSpy.mock.calls[1][0].text()).schema).toBe('omc.request.log.v1');
+
+    fireEvent.click(await screen.findByRole('tab', { name: /^(?:Diagnostics|诊断)$/ }));
+    expect(await screen.findByTestId('enable-cpa-request-log')).toBeTruthy();
+    first.unmount();
+
+    // The raw-log shortcut selects the tab and reads the CPA file through the event route.
+    const eventWithRaw: UsageEvent = { ...eventWithoutRaw, id: 302, event_key: 'evt-302', request_id: 'req-302', has_request_log: true };
+    client.setQueryData(['usage-event', 302], { event: eventWithRaw, related_errors: [] });
+    api.on('GET', '/usage/events/302/request-log', () => new Response('=== CPA RAW TRACE ===\nPOST /v1/responses\n', { status: 200 }));
+
+    const second = renderWithOmc(
+      <TokenDisplayProvider>
+        <UsageEventDrawer eventId={302} credentials={new Map()} onClose={() => undefined} />
+      </TokenDisplayProvider>,
+      { client },
+    );
+
+    fireEvent.click(await screen.findByTestId('drawer-view-raw-log'));
+    await screen.findByRole('heading', { name: 'CPA RAW TRACE' });
+    expect(screen.getByRole('tab', { name: /^(?:Raw log|原始日志)$/ }).getAttribute('aria-selected')).toBe('true');
+    expect(api.requests.filter((r) => r.path === '/usage/events/302/request-log')).toHaveLength(1);
+    second.unmount();
+
+    // A missing CPA file offers the same enable action within the raw-log tab.
+    const eventWithMissingRaw: UsageEvent = { ...eventWithRaw, id: 303, event_key: 'evt-303', request_id: 'req-303' };
+    client.setQueryData(['usage-event', 303], { event: eventWithMissingRaw, related_errors: [] });
+    api.on('GET', '/usage/events/303/request-log', () => new Response(
+      JSON.stringify({ error: 'CPA holds no log file for this request', code: 'request_log_not_found' }),
+      { status: 404, headers: { 'Content-Type': 'application/json' } },
+    ));
+    renderWithOmc(
+      <TokenDisplayProvider>
+        <UsageEventDrawer eventId={303} credentials={new Map()} onClose={() => undefined} />
+      </TokenDisplayProvider>,
+      { client },
+    );
+
+    fireEvent.click(await screen.findByTestId('drawer-view-raw-log'));
+    const enableBtn = await screen.findByTestId('enable-cpa-request-log');
+    fireEvent.click(enableBtn);
+    await waitFor(() => expect(api.writes('/management/config/request_log')).toHaveLength(1));
+    expect(api.writes('/management/config/request_log')[0].body).toEqual({ value: true });
+    await waitFor(() => expect(screen.queryByTestId('enable-cpa-request-log')).toBeNull());
+  } finally {
+    saveSpy.mockRestore();
+  }
 });
 
 describe('request stream virtualization and desktop/mobile header fold', () => {

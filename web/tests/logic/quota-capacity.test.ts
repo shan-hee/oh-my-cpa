@@ -2,8 +2,24 @@ import assert from 'node:assert/strict';
 import { test } from 'vitest';
 import type { TFunc } from '../../src/i18n/index.tsx';
 import type { QuotaWindowCapacity } from '../../src/types/quota.ts';
-import { compactQuotaCapacity, describeCapacityCard, formatCycleCardFigures, quotaCapacityNote } from '../../src/pages/quota/quotaCapacity.ts';
-import { formatQuotaMetric, orderCodexResetCredits, quotaPayloadSummary } from '../../src/pages/quota/quotaFormat.ts';
+import {
+  activeSubscriptionPeriodKey,
+  compactQuotaCapacity,
+  describeCapacityCard,
+  formatCycleCardFigures,
+  hasActiveSubscriptionPeriod,
+  quotaCapacityNote,
+  quotaSubscriptionPeriodKey,
+  subscriptionProjectionNote,
+  supportsSubscriptionCycleTab,
+} from '../../src/pages/quota/quotaCapacity.ts';
+import {
+  formatQuotaMetric,
+  isCodexResetCreditEligible,
+  orderCodexResetCredits,
+  quotaPayloadSummary,
+  resolveSelectedCodexResetCredit,
+} from '../../src/pages/quota/quotaFormat.ts';
 import { siblingCapacityWindows } from '../../src/pages/quota/quotaWindowSelection.ts';
 
 const t = ((key: string, params?: Record<string, unknown>) => params ? `${key}(${Object.values(params).join(',')})` : key) as TFunc;
@@ -117,4 +133,97 @@ test('orderCodexResetCredits excludes spent credits and orders soonest-expiring 
     ['c-early', 'c-tie-a', 'c-tie-b', 'c-late', 'c-undated'],
   );
   assert.deepEqual(orderCodexResetCredits(undefined), []);
+});
+
+test('resolveSelectedCodexResetCredit defaults to earliest eligible card, preserves valid picks, and falls back when expired or gone', () => {
+  const nowMS = 2000;
+  const ordered = orderCodexResetCredits([
+    { id: 'c-expired', status: 'available', expires_at_ms: 1500 },
+    { id: 'c-blank-id', status: 'available', expires_at_ms: 2100 },
+    { id: '  ', status: 'available', expires_at_ms: 2050 },
+    { id: 'c-later', status: 'available', expires_at_ms: 5000 },
+    { id: 'c-soonest', status: ' available ', expires_at_ms: 3000 },
+    { id: 'c-undated', status: 'available' },
+  ]);
+
+  assert.equal(isCodexResetCreditEligible({ id: 'c-expired', status: 'available', expires_at_ms: 1500 }, nowMS), false);
+  assert.equal(isCodexResetCreditEligible({ id: '  ', status: 'available', expires_at_ms: 5000 }, nowMS), false);
+  assert.equal(isCodexResetCreditEligible({ id: 'c-soonest', status: ' available ', expires_at_ms: 3000 }, nowMS), true);
+  assert.equal(isCodexResetCreditEligible({ id: 'c-undated', status: 'available' }, nowMS), true);
+
+  // Auto-defaults to earliest unexpired credit, skipping expired and blank-ID entries.
+  const initial = resolveSelectedCodexResetCredit(ordered, null, nowMS);
+  assert.equal(initial.defaultCredit?.id, 'c-blank-id');
+  assert.equal(initial.selectedCredit?.id, 'c-blank-id');
+  assert.equal(initial.eligibleCount, 4);
+
+  // Keeps explicit pick while still eligible.
+  const picked = resolveSelectedCodexResetCredit(ordered, 'c-later', nowMS);
+  assert.equal(picked.defaultCredit?.id, 'c-blank-id');
+  assert.equal(picked.selectedCredit?.id, 'c-later');
+
+  // Falls back to earliest eligible card if the picked card is expired or removed.
+  const expiredPick = resolveSelectedCodexResetCredit(ordered, 'c-expired', nowMS);
+  assert.equal(expiredPick.selectedCredit?.id, 'c-blank-id');
+  const gonePick = resolveSelectedCodexResetCredit(ordered, 'c-spent', nowMS);
+  assert.equal(gonePick.selectedCredit?.id, 'c-blank-id');
+
+  // Returns null when every listed card is expired.
+  const noneEligible = resolveSelectedCodexResetCredit(
+    [{ id: 'c-old', status: 'available', expires_at_ms: 1000 }],
+    'c-old',
+    nowMS,
+  );
+  assert.equal(noneEligible.defaultCredit, null);
+  assert.equal(noneEligible.selectedCredit, null);
+  assert.equal(noneEligible.eligibleCount, 0);
+});
+
+test('subscription cycle helpers require verified active start and expiry boundaries', () => {
+  const now = Date.UTC(2026, 10, 15, 12, 0);
+  const start = Date.UTC(2026, 10, 1, 12, 0);
+  const end = Date.UTC(2026, 11, 1, 12, 0);
+  const nextEnd = Date.UTC(2027, 0, 1, 12, 0);
+
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_at_ms: end, expires_source: 'live_subscription' }, now), true);
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_at_ms: end }, now), true);
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_at_ms: end, expires_source: 'credential_snapshot' }, now), false);
+  assert.equal(hasActiveSubscriptionPeriod({ expires_at_ms: end, expires_source: 'live_subscription' }, now), false);
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_source: 'live_subscription' }, now), false);
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_at_ms: end, expires_source: 'live_subscription' }, end), false);
+  assert.equal(hasActiveSubscriptionPeriod({ starts_at_ms: start, expires_at_ms: end, expires_source: 'live_subscription' }, start - 1), false);
+  assert.equal(hasActiveSubscriptionPeriod(undefined, now), false);
+
+  const livePlan = { starts_at_ms: start, expires_at_ms: end, expires_source: 'live_subscription' as const };
+  const periodKey = activeSubscriptionPeriodKey(livePlan, now);
+  assert.ok(periodKey);
+  // Advancing the clock within the same verified period keeps the cache key stable.
+  assert.equal(activeSubscriptionPeriodKey(livePlan, now + 60_000), periodKey);
+  // Rolling expiry forward (Codex renewal), rolling both bounds, or changing cadence produces a new key.
+  assert.notEqual(activeSubscriptionPeriodKey({ ...livePlan, expires_at_ms: nextEnd }, end + 1_000), periodKey);
+  assert.notEqual(activeSubscriptionPeriodKey({ ...livePlan, starts_at_ms: end, expires_at_ms: nextEnd }, end + 1_000), periodKey);
+  assert.notEqual(activeSubscriptionPeriodKey({ ...livePlan, billing_period: 'monthly' }, now), periodKey);
+  assert.equal(activeSubscriptionPeriodKey({ ...livePlan, expires_source: 'credential_snapshot' }, now), null);
+  assert.equal(activeSubscriptionPeriodKey(livePlan, end), null);
+  assert.equal(activeSubscriptionPeriodKey(livePlan, start - 1), null);
+  assert.equal(activeSubscriptionPeriodKey(undefined, now), null);
+
+  assert.equal(quotaSubscriptionPeriodKey({ auth_index: 'codex-1', observed_at_ms: now, status: 'healthy', plan: livePlan }, now), periodKey);
+  assert.equal(quotaSubscriptionPeriodKey({ auth_index: 'codex-1', observed_at_ms: now, status: 'idle', plan: livePlan }, now), null);
+  assert.equal(quotaSubscriptionPeriodKey({ auth_index: 'codex-1', observed_at_ms: now, status: 'error', plan: livePlan }, now), null);
+  assert.equal(quotaSubscriptionPeriodKey({ auth_index: 'codex-1', observed_at_ms: 0, status: 'healthy', plan: livePlan }, now), null);
+  assert.equal(quotaSubscriptionPeriodKey({ auth_index: '', observed_at_ms: now, status: 'healthy', plan: livePlan }, now), null);
+  assert.equal(quotaSubscriptionPeriodKey(undefined, now), null);
+
+  assert.equal(supportsSubscriptionCycleTab(undefined, true), true);
+  assert.equal(supportsSubscriptionCycleTab({ scope: 'standard' }, true), true);
+  assert.equal(supportsSubscriptionCycleTab({ scope: 'standard' }, false), false);
+  assert.equal(supportsSubscriptionCycleTab({ scope: 'model' }, true), false);
+  assert.equal(supportsSubscriptionCycleTab({ scope: 'group' }, true), false);
+  assert.equal(supportsSubscriptionCycleTab({ scope: 'code_review' }, true), false);
+
+  assert.equal(subscriptionProjectionNote('insufficient_elapsed', t), 'quota.subscription_reason_insufficient_elapsed');
+  assert.equal(subscriptionProjectionNote('no_traffic', t), 'quota.capacity_reason_no_traffic');
+  assert.equal(subscriptionProjectionNote('usage_unavailable', t), 'quota.capacity_reason_usage_unavailable');
+  assert.equal(subscriptionProjectionNote(undefined, t), null);
 });

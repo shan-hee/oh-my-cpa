@@ -279,30 +279,52 @@ func formatResetInstant(resetAtMS int64, nowMS int64) string {
 }
 
 // RawCodexSubscriptionPayload is the response of the subscription endpoint
-// (GET https://chatgpt.com/backend-api/subscriptions?account_id=...), which
-// reports the current billing window rather than the window frozen into the
-// credential's id_token.
+// (GET https://chatgpt.com/backend-api/subscriptions?account_id=...). Upstream
+// keeps active_start fixed at the original subscription start across renewals
+// while advancing active_until by one billing_period each cycle.
 type RawCodexSubscriptionPayload struct {
-	PlanType    string `json:"plan_type"`
-	ActiveStart string `json:"active_start"`
-	ActiveUntil string `json:"active_until"`
-	ShouldRenew *bool  `json:"will_renew"`
+	PlanType      string `json:"plan_type"`
+	ActiveStart   string `json:"active_start"`
+	ActiveUntil   string `json:"active_until"`
+	BillingPeriod string `json:"billing_period"`
+	ShouldRenew   *bool  `json:"will_renew"`
 }
 
-// ParseCodexSubscription reads the authoritative subscription window. Only
-// active_until is consumed: upstream's separate entitlement payload also carries
-// an expires_at that trails the renewal instant, and conflating the two would
-// report a different date than the plan's own renewal.
-func ParseCodexSubscription(raw []byte) (untilMS int64, shouldRenew *bool, ok bool) {
+// CodexSubscription is the parsed subscription state from Codex's live
+// subscription endpoint. StartAtMS is omitted when absent or not strictly
+// before UntilAtMS; BillingPeriod is normalized to a BillingPeriod constant or
+// empty when omitted/unrecognized.
+type CodexSubscription struct {
+	StartAtMS     *int64
+	UntilAtMS     int64
+	BillingPeriod string
+	ShouldRenew   *bool
+}
+
+// ParseCodexSubscription reads the authoritative subscription state. Only
+// active_start, active_until, billing_period and will_renew are consumed:
+// upstream's separate entitlement payload also carries an expires_at that
+// trails the renewal instant, and conflating the two would report a different
+// date than the plan's own renewal.
+func ParseCodexSubscription(raw []byte) (CodexSubscription, bool) {
 	var payload RawCodexSubscriptionPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return 0, nil, false
+		return CodexSubscription{}, false
 	}
 	until, parsed := parseCreditInstantToMS(payload.ActiveUntil)
 	if !parsed || until <= 0 {
-		return 0, nil, false
+		return CodexSubscription{}, false
 	}
-	return until, payload.ShouldRenew, true
+	var startAtMS *int64
+	if start, ok := parseCreditInstantToMS(payload.ActiveStart); ok && start > 0 && start < until {
+		startAtMS = &start
+	}
+	return CodexSubscription{
+		StartAtMS:     startAtMS,
+		UntilAtMS:     until,
+		BillingPeriod: NormalizeBillingPeriod(payload.BillingPeriod),
+		ShouldRenew:   payload.ShouldRenew,
+	}, true
 }
 
 func resolveCodexPlanTier(planType string) (tier string, label string) {

@@ -79,6 +79,7 @@ export interface RequestLogTabProps {
   hasRequestLog: boolean;
   /** The pane stays mounted once visited; only the visible one reads the file. */
   isActive: boolean;
+  missingAction?: React.ReactNode;
 }
 
 /**
@@ -87,7 +88,7 @@ export interface RequestLogTabProps {
  * Every read is audited and quotes request content, so the file is fetched only while the tab is
  * showing, saved from that same copy, and dropped when the pane goes away.
  */
-export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId, hasRequestLog, isActive }) => {
+export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId, hasRequestLog, isActive, missingAction }) => {
   const t = useT();
   const isDemo = isDemoMode();
   const isAvailable = hasRequestLog && Boolean(requestId) && !isDemo;
@@ -114,7 +115,14 @@ export const RequestLogTab: React.FC<RequestLogTabProps> = ({ eventId, requestId
   if (query.isPending) return <ParagraphPlaceholder rows={10} />;
   if (query.isError) {
     return apiErrorCode(query.error) === 'request_log_not_found'
-      ? <Notice tone="warning" title={t('logs.viewer_missing')} description={t('logs.viewer_missing_desc')} />
+      ? (
+        <Notice
+          tone="warning"
+          title={t('logs.viewer_missing')}
+          description={t('logs.viewer_missing_desc')}
+          action={missingAction}
+        />
+      )
       : <LoadFailure title={t('logs.viewer_failed')} error={query.error} onRetry={() => void query.refetch()} />;
   }
 

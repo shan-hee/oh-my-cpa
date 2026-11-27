@@ -56,7 +56,7 @@ import {
 import { ClientAPIKeyItem, ClientKeyUsageItem, ProviderErrorRule, ProviderItem, SaveProviderPayload } from '../types/providers';
 import { GatewayModelItem } from '../types/gatewayModels';
 import { OAuthProviderItem, StartOAuthResponse, OAuthStatusResponse, OAuthCallbackResponse, OAuthCancelResponse, SIWCBindingStart, SIWCBindingStatus } from '../types/oauth';
-import { QuotaOverviewResponse, CredentialQuotaDetailResponse, QuotaItem, QuotaCapacityHistory } from '../types/quota';
+import { QuotaOverviewResponse, CredentialQuotaDetailResponse, QuotaItem, QuotaCapacityHistory, QuotaSubscriptionCycleHistory } from '../types/quota';
 import {
   SystemInfoResponse,
   SystemReleasesResponse,
@@ -1594,10 +1594,15 @@ export const api = {
     });
   },
 
-  async redeemCodexResetCredit(authIndex: string): Promise<{ status: string; quota: QuotaItem; cooldown_cleared?: boolean; cooldown_error?: string }> {
-    return request<{ status: string; quota: QuotaItem; cooldown_cleared?: boolean; cooldown_error?: string }>('/management/quota/redeem-credit', {
+  async redeemCodexResetCredit(
+    authIndex: string,
+    creditId?: string,
+  ): Promise<{ status: string; credit_id?: string; quota: QuotaItem; cooldown_cleared?: boolean; cooldown_error?: string }> {
+    const trimmedCreditId = creditId?.trim();
+    const payload = trimmedCreditId ? { auth_index: authIndex, credit_id: trimmedCreditId } : { auth_index: authIndex };
+    return request<{ status: string; credit_id?: string; quota: QuotaItem; cooldown_cleared?: boolean; cooldown_error?: string }>('/management/quota/redeem-credit', {
       method: 'POST',
-      body: JSON.stringify({ auth_index: authIndex }),
+      body: JSON.stringify(payload),
     });
   },
 
@@ -1609,6 +1614,12 @@ export const api = {
 
   async getQuotaCapacityHistory(authIndex: string, windowId: string): Promise<QuotaCapacityHistory> {
     return request<QuotaCapacityHistory>(`/management/quota/${encodeURIComponent(authIndex)}/capacity?window=${encodeURIComponent(windowId)}`, {
+      method: 'GET',
+    });
+  },
+
+  async getQuotaSubscriptionCycle(authIndex: string): Promise<QuotaSubscriptionCycleHistory> {
+    return request<QuotaSubscriptionCycleHistory>(`/management/quota/${encodeURIComponent(authIndex)}/subscription-cycle`, {
       method: 'GET',
     });
   },
